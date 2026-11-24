@@ -210,9 +210,11 @@ export class Sound {
 
   /** Continuous loops: plane engine / freefall wind. level 0 stops. */
   loop(name: 'plane' | 'wind', level: number) {
-    if (!this.ctx || this.ctx.state !== 'running') return;
+    if (!this.ctx) return;
     const c = this.ctx;
     let l = this.loops[name];
+    // Stopping must work even while the context is suspended/interrupted (iOS).
+    if (level > 0.001 && c.state !== 'running') return;
     if (level <= 0.001) {
       if (l) {
         l.gain.gain.setTargetAtTime(0, c.currentTime, 0.2);

@@ -7,10 +7,11 @@ use crate::player::*;
 use crate::rng::Rng;
 use crate::world::*;
 
-pub const PROTO: u16 = 3;
+pub const PROTO: u16 = 4;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
+pub const CMDQ_CAP: usize = 8;
 
 pub const C_INPUT: u8 = 2;
 pub const C_START: u8 = 4;
@@ -34,6 +35,21 @@ pub const E_END: u8 = 9;
 pub const E_PICK: u8 = 10;
 pub const E_THROW: u8 = 11;
 pub const E_LAND: u8 = 12;
+/// Per-player resync of every item in one 128 m chunk.
+pub const E_ICHUNK: u8 = 13;
+pub const ICH: usize = 8;
+const ICW: f32 = MAP / ICH as f32;
+/// Items are only synced for chunks this close to the viewer.
+pub const ITEM_SYNC_R: f32 = 190.0;
+/// Players closer than this are always sent; farther ones need line of sight.
+const ALWAYS_SEND_R: f32 = 40.0;
+
+#[inline]
+pub fn item_chunk(x: f32, z: f32) -> usize {
+    let cx = clampf((x / ICW).floor(), 0.0, ICH as f32 - 1.0) as usize;
+    let cz = clampf((z / ICW).floor(), 0.0, ICH as f32 - 1.0) as usize;
+    cz * ICH + cx
+}
 
 pub const KILLER_ZONE: u8 = 255;
 
@@ -100,9 +116,15 @@ pub struct Player {
     pub place: u8,
     pub killer: u8,
     pub death_tick: u32,
+    /// Highest command sequence received (ordering / dedupe).
     pub last_seq: u32,
-    pub tokens: f32,
-    pub last_cmd_tick: u32,
+    /// Highest command sequence actually simulated (sent back as the ack).
+    pub acked_seq: u32,
+    /// Commands waiting to be simulated, one per tick.
+    pub cmdq: std::collections::VecDeque<Cmd>,
+    /// Server-time budget: +1 per tick (capped), -1 per simulated command.
+    pub cmd_budget: u8,
+    pub cmds_applied: u32,
     pub last_cmd: Cmd,
     pub spect: u8,
     pub brain: crate::bot::Brain,
@@ -111,6 +133,11 @@ pub struct Player {
     pub zone_acc: f32,
     pub need_welcome: bool,
     pub snap_round: u32,
+    /// Item chunk versions this player's client has been sent.
+    pub item_ver: Vec<u32>,
+    /// Last tick each other player was visible to this viewer / was checked.
+    pub seen_tick: [u32; MAX_PLAYERS],
+    pub vis_check: [u32; MAX_PLAYERS],
 }
 
 impl Player {
@@ -234,19 +261,50 @@ pub struct Match {
     pub winner: u8,
     pub out: Vec<u8>,
     pub ended_flag: bool,
+    pub chunk_ver: Vec<u32>,
+}
+
+fn bad_name_char(ch: char) -> bool {
+    let c = ch as u32;
+    ch.is_control()
+        || matches!(ch, '<' | '>' | '&' | '"' | '\'' | '`' | '\\' | '\u{FFFD}')
+        || (0x0300..=0x036F).contains(&c) // combining diacritics (zalgo)
+        || (0x1AB0..=0x1AFF).contains(&c)
+        || (0x1DC0..=0x1DFF).contains(&c)
+        || (0x20D0..=0x20FF).contains(&c)
+        || (0xFE20..=0xFE2F).contains(&c)
+        || (0x200B..=0x200F).contains(&c) // zero-width, LRM/RLM
+        || (0x2028..=0x202E).contains(&c) // separators, bidi embeddings/overrides
+        || (0x2060..=0x206F).contains(&c) // word joiner, bidi isolates, invisible ops
+        || (0xFE00..=0xFE0F).contains(&c) // variation selectors
+        || (0xFFF0..=0xFFFF).contains(&c)
+        || (0xE0000..=0xE01EF).contains(&c) // tags, variation selectors supplement
+        || matches!(c, 0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180E | 0x2800 | 0x3164 | 0xFEFF | 0xFFA0)
 }
 
 fn sanitize_name(raw: &[u8], fallback: &str) -> String {
     let s = String::from_utf8_lossy(raw);
     let mut out = String::new();
+    let mut count = 0;
+    let mut last_space = true;
     for ch in s.chars() {
-        if ch.is_control() || ch == '<' || ch == '>' || ch == '&' || ch == '"' || ch == '\'' || ch == '\u{FFFD}' {
+        if bad_name_char(ch) {
             continue;
         }
-        if out.chars().count() >= 14 {
+        let space = ch.is_whitespace();
+        if space {
+            if last_space {
+                continue;
+            }
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+        last_space = space;
+        count += 1;
+        if count >= 14 {
             break;
         }
-        out.push(ch);
     }
     let t = out.trim().to_string();
     if t.is_empty() {
@@ -257,12 +315,14 @@ fn sanitize_name(raw: &[u8], fallback: &str) -> String {
 }
 
 impl Match {
-    pub fn new(seed: u32, slots: usize, flags: u32) -> Match {
+    /// `seed` is public (clients regenerate the island from it); `secret` seeds
+    /// everything players must not be able to predict (spread, bots, loot rolls).
+    pub fn new(seed: u32, slots: usize, flags: u32, secret: u32) -> Match {
         let w = World::generate(seed);
         let slots = slots.clamp(2, MAX_PLAYERS);
         let mut m = Match {
             w,
-            rng: Rng::new(seed as u64 * 977 + 3),
+            rng: Rng::new(((secret as u64) << 32) ^ (seed as u64).wrapping_mul(0x9E37_79B9) ^ 0x5EED),
             tick: 0,
             phase: PH_LOBBY,
             lobby_t: if flags & FLAG_OFFLINE != 0 {
@@ -290,6 +350,7 @@ impl Match {
             winner: 255,
             out: Vec::with_capacity(16384),
             ended_flag: false,
+            chunk_ver: vec![1; ICH * ICH],
         };
         m.spawn_loot();
         m.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, nx: MAP * 0.5, nz: MAP * 0.5, nr: 780.0, timer: ZONES[0].wait, ..Default::default() };
@@ -358,24 +419,16 @@ impl Match {
             self.items.push(it);
             (self.items.len() - 1) as u16
         };
-        if self.phase != PH_LOBBY || self.tick > 0 {
-            self.ev_item(id);
-        }
+        self.ev_item(id);
         Some(id)
     }
 
+    /// Items are not broadcast (that would leak where players loot); clients get
+    /// whole-chunk resyncs for nearby chunks whose version changed.
     fn ev_item(&mut self, id: u16) {
         let it = self.items[id as usize];
-        let start = self.ev_begin();
-        let mut w = Wr::new(&mut self.ev);
-        w.u8(E_ITEM);
-        w.u16(id);
-        w.u8(it.kind);
-        w.u16(it.amount);
-        w.f32(it.pos.x);
-        w.f32(it.pos.y);
-        w.f32(it.pos.z);
-        self.ev_end(start, 255, None);
+        let c = item_chunk(it.pos.x, it.pos.z);
+        self.chunk_ver[c] = self.chunk_ver[c].wrapping_add(1);
     }
 
     fn del_item(&mut self, id: u16) {
@@ -383,11 +436,8 @@ impl Match {
             if it.alive {
                 it.alive = false;
                 self.free_items.push(id);
-                let start = self.ev_begin();
-                let mut w = Wr::new(&mut self.ev);
-                w.u8(E_IDEL);
-                w.u16(id);
-                self.ev_end(start, 255, None);
+                let c = item_chunk(it.pos.x, it.pos.z);
+                self.chunk_ver[c] = self.chunk_ver[c].wrapping_add(1);
             }
         }
     }
@@ -446,7 +496,13 @@ impl Match {
             return None;
         }
         let i = (0..self.slots).find(|&i| !self.players[i].used)?;
-        let name = sanitize_name(raw_name, "Player");
+        let base = sanitize_name(raw_name, "Player");
+        let mut name = base.clone();
+        let mut k = 2;
+        while self.players.iter().any(|p| p.used && p.name.to_lowercase() == name.to_lowercase()) && k < 40 {
+            name = format!("{}#{}", base, k);
+            k += 1;
+        }
         let color = self.rng.below(12) as u8;
         let p = &mut self.players[i];
         *p = Player::default();
@@ -458,7 +514,6 @@ impl Match {
         p.need_welcome = true;
         p.reset_combat();
         p.ms.mode = MODE_PLANE;
-        p.tokens = 8.0;
         self.ev_pinfo(i, false);
         Some(i as u8)
     }
@@ -473,13 +528,24 @@ impl Match {
             self.players[i] = Player::default();
         } else {
             // AI takes over the abandoned character.
+            let seed = self.rng.u32();
+            let pl = self.plane;
             let p = &mut self.players[i];
             p.connected = false;
             p.human = false;
             p.bot = true;
-            let seed = self.rng.u32();
+            p.cmdq.clear();
             p.brain = crate::bot::Brain::new(seed, 0.45);
-            p.brain.jump_t = self.plane.t;
+            p.brain.yaw = p.yaw;
+            if p.ms.mode == MODE_PLANE && pl.active {
+                let (lx, lz, jt) = crate::bot::pick_landing(&self.w, &pl, &mut p.brain);
+                p.brain.land = (lx, lz);
+                p.brain.jump_t = jt.max(pl.t);
+            } else {
+                let f = fwd(p.yaw);
+                p.brain.land = (clampf(p.ms.pos.x + f.x * 60.0, 40.0, MAP - 40.0), clampf(p.ms.pos.z + f.z * 60.0, 40.0, MAP - 40.0));
+                p.brain.jump_t = pl.t;
+            }
             self.ev_pinfo(i, false);
         }
     }
@@ -595,24 +661,25 @@ impl Match {
                         return;
                     }
                     let c = Cmd::from_quant(seq, view, mx, mz, yaw, pitch, buttons);
+                    let phase = self.phase;
                     let p = &mut self.players[i];
                     if seq <= p.last_seq {
                         continue;
                     }
-                    if p.tokens < 1.0 {
-                        continue; // rate limit: drop excess commands (speed-hack guard)
-                    }
-                    p.tokens -= 1.0;
                     p.last_seq = seq;
-                    p.last_cmd_tick = self.tick;
-                    if self.phase == PH_PLAY {
-                        self.apply_cmd(i, c);
+                    if phase == PH_PLAY {
+                        // Simulated one per tick in step(): arrival timing can never
+                        // speed a player up, freeze gravity or hide positions between ticks.
+                        if p.cmdq.len() >= CMDQ_CAP {
+                            p.cmdq.pop_front();
+                        }
+                        p.cmdq.push_back(c);
                     } else {
-                        let p = &mut self.players[i];
                         p.yaw = c.yaw;
                         p.pitch = c.pitch;
+                        p.acked_seq = seq;
+                        p.last_cmd = c;
                     }
-                    self.players[i].last_cmd = c;
                 }
             }
             C_START => {
@@ -776,7 +843,9 @@ impl Match {
     // ------------------------------------------------------------------
     fn rewound(&self, j: usize, view: u32) -> Option<HistE> {
         let now = self.tick as f32;
-        let vt = clampf(view as f32 / 256.0, now - 10.0, now);
+        // Clients render ~4.5 ticks behind + latency + command queueing;
+        // 15 ticks (500 ms) covers RTTs up to ~250 ms.
+        let vt = clampf(view as f32 / 256.0, now - 15.0, now);
         let t0 = vt.floor();
         let frac = vt - t0;
         let t0u = t0 as u32;
@@ -839,8 +908,10 @@ impl Match {
     fn shoot(&mut self, i: usize, wk: u8, view: u32) {
         let p = &self.players[i];
         let def = WD[wk as usize];
-        let (o, d0) = aim_ray(p.ms.pos, p.yaw, p.pitch, p.ms.crouch, p.ads);
+        let (o, d0) = aim_ray_safe(&self.w, p.ms.pos, p.yaw, p.pitch, p.ms.crouch, p.ads);
         let muz = muzzle(p.ms.pos, p.yaw, p.pitch, p.ms.crouch);
+        // The eye is on the body axis, so it is never inside a wall.
+        let eye = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
         let speed = p.ms.vel.len_xz();
         let mut spread = if p.ads { def.ads } else { def.hip };
         if speed > 1.0 {
@@ -864,16 +935,16 @@ impl Match {
             let ph = self.ray_players(i, o, d, tw, view);
             let end_t = ph.map_or(tw, |h| h.1);
             let target = o + d * end_t;
-            // obstruction between the gun and the aim point
-            let md = target - muz;
+            // obstruction between the shooter's eye and the aim point
+            let md = target - eye;
             let ml = md.len();
             let mut end = target;
             let mut hit_kind = if ph.is_some() { 1u8 } else if wh.is_some() { 3 } else { 0 };
             let mut victim = ph;
             if ml > 0.3 {
                 let dd = md * (1.0 / ml);
-                if let Some(h) = self.w.raycast(muz, dd, ml - 0.2) {
-                    end = muz + dd * h.0;
+                if let Some(h) = self.w.raycast(eye, dd, ml - 0.2) {
+                    end = eye + dd * h.0;
                     victim = None;
                     hit_kind = 3;
                 }
@@ -930,6 +1001,9 @@ impl Match {
             if to.norm().dot(d) < 0.6 {
                 continue;
             }
+            if self.w.blocked(head, q.ms.pos + V3::new(0.0, 1.0, 0.0)) {
+                continue;
+            }
             if best.map_or(true, |b| dist < b.1) {
                 best = Some((j, dist));
             }
@@ -949,7 +1023,15 @@ impl Match {
         p.nade_cd = 1.0;
         p.heal_t = 0.0;
         let d = dir_from(c.yaw, clampf(c.pitch + 0.25, -1.2, 1.3));
-        let pos = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0) + right(c.yaw) * 0.25 + d * 0.5;
+        let eye = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
+        let want = eye + right(c.yaw) * 0.25 + d * 0.5;
+        let off = want - eye;
+        let ol = off.len();
+        let pos = match self.w.raycast(eye, off * (1.0 / ol), ol + 0.15) {
+            Some((t, _, _)) => eye + off * ((t - 0.15).max(0.0) / ol),
+            None => want,
+        };
+        let p = &self.players[i];
         let vel = d * 19.0 + V3::new(p.ms.vel.x * 0.5, 0.0, p.ms.vel.z * 0.5);
         self.nade_seq = self.nade_seq.wrapping_add(1);
         let id = self.nade_seq;
@@ -1297,6 +1379,9 @@ impl Match {
             if d > 2.6 || (it.pos.y - pos.y).abs() > 1.8 {
                 continue;
             }
+            if self.w.blocked(pos + V3::new(0.0, 0.9, 0.0), it.pos + V3::new(0.0, 0.25, 0.0)) {
+                continue;
+            }
             // prefer items in front and weapons
             let facing = if d > 0.01 { (dx * f.x + dz * f.z) / d } else { 1.0 };
             let score = d - facing * 0.6 - if is_weapon(it.kind) { 0.5 } else { 0.0 };
@@ -1327,7 +1412,10 @@ impl Match {
                 }
                 let dx = it.pos.x - pos.x;
                 let dz = it.pos.z - pos.z;
-                if dx * dx + dz * dz < 1.6 * 1.6 && (it.pos.y - pos.y).abs() < 1.6 {
+                if dx * dx + dz * dz < 1.6 * 1.6
+                    && (it.pos.y - pos.y).abs() < 1.6
+                    && !self.w.blocked(pos + V3::new(0.0, 0.9, 0.0), it.pos + V3::new(0.0, 0.25, 0.0))
+                {
                     cands[n] = id as u16;
                     n += 1;
                 }
@@ -1487,11 +1575,6 @@ impl Match {
     /// Advance one fixed tick. Returns bit 1 = snapshot due, bit 2 = match over.
     pub fn step(&mut self) -> u32 {
         self.tick = self.tick.wrapping_add(1);
-        for p in self.players.iter_mut() {
-            if p.used && p.human {
-                p.tokens = (p.tokens + 1.04).min(10.0);
-            }
-        }
         match self.phase {
             PH_LOBBY => {
                 if self.human_count() > 0 {
@@ -1528,18 +1611,38 @@ impl Match {
                         self.apply_cmd(i, c);
                     }
                 }
-                // humans that stopped sending commands keep falling / standing
+                // Humans: queued commands are simulated against a server-time
+                // budget (+1 per tick, max 3), at most two per tick. Total
+                // simulated commands can never exceed elapsed ticks + 3, so
+                // flooding gives no speed and bursts cannot teleport.
                 for i in 0..MAX_PLAYERS {
-                    let p = &self.players[i];
-                    if p.used && p.human && p.alive && p.ms.mode != MODE_PLANE && self.tick.wrapping_sub(p.last_cmd_tick) > 8 {
+                    if !(self.players[i].used && self.players[i].human) {
+                        continue;
+                    }
+                    {
+                        let p = &mut self.players[i];
+                        p.cmd_budget = (p.cmd_budget + 1).min(3);
+                    }
+                    let mut applied = 0;
+                    while applied < 2 && self.players[i].cmd_budget >= 1 {
+                        let Some(c) = self.players[i].cmdq.pop_front() else { break };
+                        let p = &mut self.players[i];
+                        p.cmd_budget -= 1;
+                        p.acked_seq = c.seq;
+                        p.last_cmd = c;
+                        p.cmds_applied = p.cmds_applied.wrapping_add(1);
+                        self.apply_cmd(i, c);
+                        applied += 1;
+                    }
+                    let p = &mut self.players[i];
+                    if applied == 0 && p.alive && p.ms.mode != MODE_PLANE {
+                        // Input is late: gravity and held stance only. No movement,
+                        // edge actions or firing, so starving the server never helps.
                         let mut c = p.last_cmd;
                         c.mx = 0.0;
                         c.mz = 0.0;
-                        c.buttons &= B_CROUCH;
-                        let mult = p.speed_mult();
-                        let w = &self.w;
-                        let p = &mut self.players[i];
-                        step_move(w, &mut p.ms, &c, mult, DT);
+                        c.buttons &= B_CROUCH | B_ADS;
+                        self.apply_cmd(i, c);
                     }
                 }
                 self.update_timers();
@@ -1618,7 +1721,10 @@ impl Match {
             w.f32(it.pos.z);
         }
         if (pid as usize) < MAX_PLAYERS {
-            self.players[pid as usize].need_welcome = false;
+            let v = self.chunk_ver.clone();
+            let p = &mut self.players[pid as usize];
+            p.need_welcome = false;
+            p.item_ver = v;
         }
         &self.out
     }
@@ -1640,7 +1746,7 @@ impl Match {
         let mut w = Wr::new(&mut self.out);
         w.u8(S_SNAP);
         w.u32(self.tick);
-        w.u32(me.last_seq);
+        w.u32(me.acked_seq);
         w.u8(self.phase);
         w.f32(match self.phase {
             PH_LOBBY => self.lobby_t,
@@ -1709,10 +1815,16 @@ impl Match {
         w.f32(pl.t);
         w.f32(pl.enter_t);
         w.f32(pl.exit_t);
-        // ---- players
-        let count_pos = w.len();
-        w.u8(0);
-        let mut count = 0u8;
+        // ---- players (line-of-sight culled to limit wallhack/radar leaks)
+        let tick = self.tick;
+        let spect = if me.alive { 255usize } else { me.spect as usize };
+        let (ceye, cskip) = if spect < MAX_PLAYERS && self.players[spect].used {
+            let t = &self.players[spect];
+            (t.ms.pos + V3::new(0.0, eye_h(t.ms.crouch), 0.0), spect)
+        } else {
+            (me.ms.pos + V3::new(0.0, eye_h(me.ms.crouch), 0.0), i)
+        };
+        let mut send = [false; MAX_PLAYERS];
         for j in 0..MAX_PLAYERS {
             if j == i {
                 continue;
@@ -1721,12 +1833,44 @@ impl Match {
             if !q.used || q.ms.mode == MODE_PLANE {
                 continue;
             }
-            if !q.alive && self.tick.wrapping_sub(q.death_tick) > 30 * 12 {
+            if !q.alive && tick.wrapping_sub(q.death_tick) > 30 * 12 {
                 continue;
             }
-            if dist_xz(q.ms.pos.x, q.ms.pos.z, center.x, center.z) > INTEREST && j != me.spect as usize {
+            if j == spect {
+                send[j] = true;
                 continue;
             }
+            let d = dist_xz(q.ms.pos.x, q.ms.pos.z, center.x, center.z);
+            if d > INTEREST {
+                continue;
+            }
+            if d < ALWAYS_SEND_R || j == cskip {
+                send[j] = true;
+                continue;
+            }
+            let pv = &self.players[i];
+            if tick.wrapping_sub(pv.vis_check[j]) >= 3 {
+                let head = q.ms.pos + V3::new(0.0, eye_h(q.ms.crouch) + 0.1, 0.0);
+                let chest = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+                let visible = !self.w.blocked(ceye, head) || !self.w.blocked(ceye, chest);
+                let pv = &mut self.players[i];
+                pv.vis_check[j] = tick;
+                if visible {
+                    pv.seen_tick[j] = tick;
+                }
+            }
+            let seen = self.players[i].seen_tick[j];
+            send[j] = seen != 0 && tick.wrapping_sub(seen) <= 30;
+        }
+        let mut w = Wr::new(&mut self.out);
+        let count_pos = w.len();
+        w.u8(0);
+        let mut count = 0u8;
+        for j in 0..MAX_PLAYERS {
+            if !send[j] {
+                continue;
+            }
+            let q = &self.players[j];
             w.u8(j as u8);
             w.u8(q.ms.mode);
             let fl = (q.alive as u8)
@@ -1745,15 +1889,16 @@ impl Match {
             w.i16(q_pitch(q.pitch));
             w.u8(q.weapon());
             w.u8(q.vest | (q.helm << 2));
-            w.u8(q.health.clamp(0.0, 100.0) as u8);
+            // exact health only for the player being spectated
+            w.u8(if j == spect { q.health.clamp(0.0, 100.0) as u8 } else { 0 });
             count += 1;
         }
         self.out[count_pos] = count;
         // ---- grenades
         let mut w = Wr::new(&mut self.out);
-        let nn = self.nades.len().min(40);
+        let nn = self.nades.iter().filter(|n| dist_xz(n.pos.x, n.pos.z, center.x, center.z) < INTEREST).count().min(40);
         w.u8(nn as u8);
-        for n in self.nades.iter().take(nn) {
+        for n in self.nades.iter().filter(|n| dist_xz(n.pos.x, n.pos.z, center.x, center.z) < INTEREST).take(nn) {
             w.u16(n.id);
             w.f32(n.pos.x);
             w.f32(n.pos.y);
@@ -1774,6 +1919,45 @@ impl Match {
             let l = e.len as usize;
             self.out.extend_from_slice(&self.ev[s..s + l]);
             ecount += 1;
+        }
+        // item chunk resyncs (nearest first, a few per snapshot)
+        if self.players[i].item_ver.len() == ICH * ICH {
+            let mut todo: Vec<(f32, usize)> = Vec::new();
+            for c in 0..ICH * ICH {
+                if self.players[i].item_ver[c] == self.chunk_ver[c] {
+                    continue;
+                }
+                let x0 = (c % ICH) as f32 * ICW;
+                let z0 = (c / ICH) as f32 * ICW;
+                let dx = (x0 - center.x).max(0.0).max(center.x - (x0 + ICW));
+                let dz = (z0 - center.z).max(0.0).max(center.z - (z0 + ICW));
+                let d = (dx * dx + dz * dz).sqrt();
+                if d <= ITEM_SYNC_R {
+                    todo.push((d, c));
+                }
+            }
+            todo.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for &(_, c) in todo.iter().take(4) {
+                let ids: Vec<usize> = (0..self.items.len())
+                    .filter(|&k| self.items[k].alive && item_chunk(self.items[k].pos.x, self.items[k].pos.z) == c)
+                    .collect();
+                let mut w = Wr::new(&mut self.out);
+                w.u8(E_ICHUNK);
+                w.u8(c as u8);
+                w.u16(ids.len() as u16);
+                for &k in &ids {
+                    let it = &self.items[k];
+                    w.u16(k as u16);
+                    w.u8(it.kind);
+                    w.u16(it.amount);
+                    w.f32(it.pos.x);
+                    w.f32(it.pos.y);
+                    w.f32(it.pos.z);
+                }
+                let v = self.chunk_ver[c];
+                self.players[i].item_ver[c] = v;
+                ecount += 1;
+            }
         }
         self.out[cpos..cpos + 2].copy_from_slice(&ecount.to_le_bytes());
         &self.out

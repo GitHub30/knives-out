@@ -235,7 +235,30 @@ pub fn aim_ray(pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool) -> (V3, V
     (cam + d * t0, d)
 }
 
-/// Approximate muzzle position used for the obstruction test.
+/// Server-side aim ray: like `aim_ray`, but the shoulder offset is clamped by
+/// raycasts from the head so the origin can never start inside a wall the
+/// player is hugging (shots through walls).
+pub fn aim_ray_safe(w: &World, pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool) -> (V3, V3) {
+    let head = pos + V3::new(0.0, eye_h(crouch), 0.0);
+    let d = dir_from(yaw, pitch);
+    let r = right(yaw);
+    let side_max = if ads { 0.38 } else { 0.55 };
+    let side = match w.raycast(head, r, side_max + 0.2) {
+        Some((t, _, _)) => clampf(t - 0.2, 0.0, side_max),
+        None => side_max,
+    };
+    let sh = head + r * side;
+    let up = match w.raycast(sh, V3::UP, 0.28 + 0.15) {
+        Some((t, _, _)) => clampf(t - 0.15, 0.0, 0.28),
+        None => 0.28,
+    };
+    let back = if ads { 1.3 } else { 2.7 };
+    let cam = sh + V3::UP * up - d * back;
+    let t0 = (head - cam).dot(d).max(0.0);
+    (cam + d * t0, d)
+}
+
+/// Approximate muzzle position (visual start of tracers).
 pub fn muzzle(pos: V3, yaw: f32, pitch: f32, crouch: bool) -> V3 {
     let head = pos + V3::new(0.0, eye_h(crouch) - 0.12, 0.0);
     head + right(yaw) * 0.22 + dir_from(yaw, pitch) * 0.55

@@ -66,7 +66,8 @@ function saveName(n: string) {
   }
 }
 
-const isTouch = () => matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 1;
+// Primary pointer decides: touchscreen laptops with a mouse keep desktop controls.
+const isTouch = () => matchMedia('(pointer: coarse)').matches;
 
 function pickQuality(s: Settings): Quality {
   if (s.quality !== 'auto') return QUALITY_PRESETS[s.quality];
@@ -181,6 +182,13 @@ async function enterFullscreen() {
 
 async function startGame(kind: 'offline' | 'online', room?: string) {
   lastMode = { kind, room };
+  // Tear down any previous match first so a failed connect never leaves it running.
+  game?.destroy();
+  game = null;
+  show('pause', false);
+  show('result', false);
+  show('lobby', false);
+  hud.openMap(false);
   sound.unlock();
   sound.ui('click');
   const name = cleanName();
@@ -204,7 +212,6 @@ async function startGame(kind: 'offline' | 'online', room?: string) {
     errorBox(`接続に失敗しました: ${(e as Error).message}`);
     return;
   }
-  game?.destroy();
   input.adsToggleMode = settings.adsToggle;
   touch.lookScale = settings.touchSens;
   const g = new Game({
@@ -254,7 +261,13 @@ async function startGame(kind: 'offline' | 'online', room?: string) {
 function showResult(r: MatchResult) {
   const won = r.won;
   $('result-title').textContent = won ? '🏆 チャンピオン！' : `#${r.place} / ${r.total}`;
-  $('result-sub').textContent = won ? '最後の生存者になった！' : r.killerName ? `${r.killerName} に倒された` : '安全地帯の外で倒れた';
+  $('result-sub').textContent = won
+    ? '最後の生存者になった！'
+    : r.final && r.winnerName
+      ? `試合終了 — 勝者: ${r.winnerName}`
+      : r.killerName
+        ? `${r.killerName} に倒された`
+        : '安全地帯の外で倒れた';
   $('result-kills').textContent = String(r.kills);
   $('result-dmg').textContent = String(r.damage);
   $('result-time').textContent = `${Math.floor(r.time / 60)}:${String(Math.floor(r.time % 60)).padStart(2, '0')}`;
@@ -262,7 +275,7 @@ function showResult(r: MatchResult) {
   show('result', true);
   input.unlock();
   touch.releaseAll();
-  show('result-spect', !won && !!game?.latest && game.latest.phase === 1);
+  show('result-spect', !won && !r.final && !!game?.latest && game.latest.phase === 1);
 }
 
 function quitToMenu() {
@@ -393,8 +406,8 @@ async function boot() {
   $('btn-online').addEventListener('click', () => void startGame('online'));
   $('btn-room').addEventListener('click', () => {
     const code = ($('room-code') as HTMLInputElement).value.trim().toUpperCase();
-    if (!/^[A-Z0-9]{3,12}$/.test(code)) {
-      errorBox('ルームコードは英数字 3〜12 文字で入力してください');
+    if (!/^[A-Z0-9]{6,12}$/.test(code)) {
+      errorBox('ルームコードは英数字 6〜12 文字で入力してください');
       return;
     }
     void startGame('online', code);

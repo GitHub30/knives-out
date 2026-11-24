@@ -38,6 +38,9 @@ export interface MatchResult {
   won: boolean;
   time: number;
   killerName: string | null;
+  /** Set when the whole match is over. */
+  winnerName?: string | null;
+  final?: boolean;
 }
 
 interface Anim {
@@ -334,6 +337,10 @@ export class Game {
       case 'idel':
         this.items.delete(e.id);
         break;
+      case 'ichunk':
+        for (const [id, it] of this.items) if (P.itemChunk(it.x, it.z) === e.chunk) this.items.delete(id);
+        for (const it of e.items) this.items.set(it.id, it);
+        break;
       case 'shot': {
         const mine = e.shooter === this.myId;
         if (!mine) {
@@ -432,23 +439,26 @@ export class Game {
       this.d.hud.showBanner('🏆 チャンピオン！ 最後の生存者', 6, 'win');
       this.d.sound.ui('win');
     }
-    if (!this.resultSent) {
-      this.resultSent = true;
-      setTimeout(
-        () =>
-          this.running &&
-          this.d.onResult({
-            place: won ? 1 : s.self.place || 2,
-            total: s.total,
-            kills: s.self.kills,
-            damage: s.self.dmg,
-            won,
-            time: (performance.now() - this.matchStartTime) / 1000,
-            killerName: s.self.killer === 255 || won ? null : this.nameOf(s.self.killer),
-          }),
-        won ? 2500 : 500,
-      );
-    }
+    // Always show the final card, also for players who were already
+    // eliminated and chose to spectate.
+    this.resultSent = true;
+    const winnerName = s.winner !== 255 ? this.nameOf(s.winner) : null;
+    setTimeout(
+      () =>
+        this.running &&
+        this.d.onResult({
+          place: won ? 1 : s.self.place || 2,
+          total: s.total,
+          kills: s.self.kills,
+          damage: s.self.dmg,
+          won,
+          time: (performance.now() - this.matchStartTime) / 1000,
+          killerName: s.self.killer === 255 || won ? null : this.nameOf(s.self.killer),
+          winnerName,
+          final: true,
+        }),
+      won ? 2500 : 900,
+    );
   }
 
   private send(data: Uint8Array<ArrayBuffer>) {
@@ -909,7 +919,11 @@ export class Game {
     if (e.menu) {
       if (this.d.hud.mapOpen) this.toggleMap(false);
       else if (this.d.transport.kind === 'offline') this.setPaused(!this.paused);
-      else this.d.onPause(true);
+      else {
+        this.d.input.unlock();
+        this.d.touch.releaseAll();
+        this.d.onPause(true);
+      }
     }
     if (e.map) this.toggleMap(!this.d.hud.mapOpen);
     if (!this.paused) this.mergeEdges(e);
@@ -931,8 +945,10 @@ export class Game {
       this.pitch = clamp(this.pitch - r * 0.55, -1.45, 1.45);
     }
 
-    // commands at 30 Hz
-    this.cmdAcc += dt;
+    // commands at 30 Hz (none while the offline match is paused: the local
+    // server is frozen, so predicting ahead would only snap back later)
+    if (this.paused) this.cmdAcc = 0;
+    else this.cmdAcc += dt;
     let n = 0;
     while (this.cmdAcc >= DT && n < 4) {
       this.cmdAcc -= DT;

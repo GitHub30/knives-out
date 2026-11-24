@@ -32,6 +32,7 @@ export class Input {
   pointerLocked = false;
   enabled = false;
   adsToggleMode = false;
+  private expectUnlock = false;
 
   private canvas: HTMLElement;
 
@@ -44,8 +45,11 @@ export class Input {
       this.mouseFire = false;
       this.mouseAds = false;
     });
-    canvas.addEventListener('mousedown', (e) => {
+    document.addEventListener('mousedown', (e) => {
       if (!this.enabled || e.button > 2) return;
+      const t = e.target as HTMLElement | null;
+      // only presses on the play area (canvas or the HUD/touch layers), not on buttons/menus
+      if (t && t !== canvas && t.id !== 'touch' && t.id !== 'hud' && t.id !== 'ui') return;
       if (!this.pointerLocked) {
         this.lock();
         return;
@@ -78,11 +82,15 @@ export class Input {
       { passive: false },
     );
     document.addEventListener('pointerlockchange', () => {
+      const was = this.pointerLocked;
       this.pointerLocked = document.pointerLockElement === this.canvas;
       if (!this.pointerLocked) {
         this.mouseFire = false;
         this.mouseAds = false;
+        // Browsers swallow Esc to release pointer lock: treat that as "menu".
+        if (was && this.enabled && !this.expectUnlock) this.edges.menu = true;
       }
+      this.expectUnlock = false;
     });
   }
 
@@ -97,7 +105,10 @@ export class Input {
   }
 
   unlock() {
-    if (document.pointerLockElement) document.exitPointerLock();
+    if (document.pointerLockElement) {
+      this.expectUnlock = true;
+      document.exitPointerLock();
+    }
   }
 
   private onKey(e: KeyboardEvent, down: boolean) {
@@ -127,7 +138,6 @@ export class Input {
           this.edges.nade = true;
           break;
         case 'KeyC':
-        case 'ControlLeft':
           this.crouch = !this.crouch;
           break;
         case 'Digit1':

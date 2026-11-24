@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 3;
+export const PROTO = 4;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -30,6 +30,14 @@ export const B_SPECT = 1 << 7;
 export const B_NADE = 1 << 12;
 
 export const KILLER_ZONE = 255;
+export const ITEM_CHUNKS = 8;
+export const MAP_SIZE = 1024;
+export function itemChunk(x: number, z: number): number {
+  const w = MAP_SIZE / ITEM_CHUNKS;
+  const cx = Math.min(ITEM_CHUNKS - 1, Math.max(0, Math.floor(x / w)));
+  const cz = Math.min(ITEM_CHUNKS - 1, Math.max(0, Math.floor(z / w)));
+  return cz * ITEM_CHUNKS + cx;
+}
 
 class Reader {
   private v: DataView;
@@ -204,7 +212,8 @@ export type GameEvent =
   | { t: 'end'; winner: number }
   | { t: 'pick'; kind: number; amount: number }
   | { t: 'throw'; id: number }
-  | { t: 'land'; id: number };
+  | { t: 'land'; id: number }
+  | { t: 'ichunk'; chunk: number; items: ItemInfo[] };
 
 export interface Snapshot {
   tick: number;
@@ -421,6 +430,14 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
       case 12:
         events.push({ t: 'land', id: r.u8() });
         break;
+      case 13: {
+        const chunk = r.u8();
+        const n = r.u16();
+        const items: ItemInfo[] = [];
+        for (let k = 0; k < n && !r.bad; k++) items.push(readItem(r));
+        events.push({ t: 'ichunk', chunk, items });
+        break;
+      }
       default:
         r.bad = true;
     }

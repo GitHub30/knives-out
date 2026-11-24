@@ -1165,3 +1165,24 @@ kbd {
     bottom: calc(96px + var(--safe-b));
   }
 }
+
+/* player names are user input: isolate their direction so bidi overrides cannot reorder the UI */
+.kf-a,
+.kf-v,
+.spect-name,
+.banner {
+  unicode-bidi: isolate;
+}
+
+/* small phones: scale the touch cluster down and nudge the weapon bar left */
+@media (pointer: coarse) and (max-width: 720px) {
+  #touch {
+    --u: 0.85px;
+  }
+  .hud-bottom {
+    left: 44%;
+  }
+  .slot {
+    min-width: 62px;
+  }
+}
