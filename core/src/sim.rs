@@ -1,0 +1,1787 @@
+//! Authoritative match simulation + wire protocol. One `Match` per room.
+
+use crate::defs::*;
+use crate::math::*;
+use crate::net::*;
+use crate::player::*;
+use crate::rng::Rng;
+use crate::world::*;
+
+pub const PROTO: u16 = 3;
+pub const HIST: usize = 32;
+pub const MAX_ITEMS: usize = 4000;
+pub const INTEREST: f32 = 700.0;
+
+pub const C_INPUT: u8 = 2;
+pub const C_START: u8 = 4;
+
+pub const S_WELCOME: u8 = 0x81;
+pub const S_SNAP: u8 = 0x82;
+
+pub const PH_LOBBY: u8 = 0;
+pub const PH_PLAY: u8 = 1;
+pub const PH_END: u8 = 2;
+
+pub const E_SHOT: u8 = 1;
+pub const E_HIT: u8 = 2;
+pub const E_HURT: u8 = 3;
+pub const E_KILL: u8 = 4;
+pub const E_ITEM: u8 = 5;
+pub const E_IDEL: u8 = 6;
+pub const E_PINFO: u8 = 7;
+pub const E_BOOM: u8 = 8;
+pub const E_END: u8 = 9;
+pub const E_PICK: u8 = 10;
+pub const E_THROW: u8 = 11;
+pub const E_LAND: u8 = 12;
+
+pub const KILLER_ZONE: u8 = 255;
+
+pub const FLAG_OFFLINE: u32 = 1;
+pub const FLAG_PRIVATE: u32 = 2;
+
+#[derive(Clone, Copy, Default)]
+pub struct HistE {
+    pub pos: V3,
+    pub crouch: bool,
+    pub alive: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Item {
+    pub kind: u8,
+    pub amount: u16,
+    pub pos: V3,
+    pub alive: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Nade {
+    pub pos: V3,
+    pub vel: V3,
+    pub fuse: f32,
+    pub owner: u8,
+    pub id: u16,
+}
+
+#[derive(Clone, Default)]
+pub struct Player {
+    pub used: bool,
+    pub bot: bool,
+    pub human: bool,
+    pub connected: bool,
+    pub name: String,
+    pub color: u8,
+    pub ms: MoveState,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub alive: bool,
+    pub health: f32,
+    pub vest: u8,
+    pub vest_dur: f32,
+    pub helm: u8,
+    pub helm_dur: f32,
+    pub slots: [(u8, u16); 2],
+    pub cur: u8,
+    pub ammo: [u16; NUM_AMMO],
+    pub heals: [u8; 3],
+    pub nades: u8,
+    pub reload_t: f32,
+    pub heal_t: f32,
+    pub heal_kind: u8,
+    pub fire_cd: f32,
+    pub switch_t: f32,
+    pub boost: f32,
+    pub nade_cd: f32,
+    pub ads: bool,
+    pub firing_t: f32,
+    pub kills: u16,
+    pub dmg_dealt: f32,
+    pub place: u8,
+    pub killer: u8,
+    pub death_tick: u32,
+    pub last_seq: u32,
+    pub tokens: f32,
+    pub last_cmd_tick: u32,
+    pub last_cmd: Cmd,
+    pub spect: u8,
+    pub brain: crate::bot::Brain,
+    pub hurt_by: u8,
+    pub hurt_t: f32,
+    pub zone_acc: f32,
+    pub need_welcome: bool,
+    pub snap_round: u32,
+}
+
+impl Player {
+    pub fn weapon(&self) -> u8 {
+        if self.cur < 2 {
+            self.slots[self.cur as usize].0
+        } else {
+            W_FISTS
+        }
+    }
+    pub fn speed_mult(&self) -> f32 {
+        let mut m = WD[self.weapon() as usize].speed;
+        if self.heal_t > 0.0 {
+            m *= 0.55;
+        }
+        if self.boost > 0.0 {
+            m *= 1.06;
+        }
+        m
+    }
+    fn reset_combat(&mut self) {
+        self.health = 100.0;
+        self.alive = true;
+        self.vest = 0;
+        self.vest_dur = 0.0;
+        self.helm = 0;
+        self.helm_dur = 0.0;
+        self.slots = [(0, 0); 2];
+        self.cur = 2;
+        self.ammo = [0; NUM_AMMO];
+        self.heals = [0; 3];
+        self.nades = 0;
+        self.reload_t = 0.0;
+        self.heal_t = 0.0;
+        self.heal_kind = 0;
+        self.fire_cd = 0.0;
+        self.switch_t = 0.0;
+        self.boost = 0.0;
+        self.kills = 0;
+        self.dmg_dealt = 0.0;
+        self.place = 0;
+        self.killer = 255;
+        self.spect = 255;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Zone {
+    pub stage: u8,
+    pub shrinking: bool,
+    pub done: bool,
+    pub timer: f32,
+    pub cx: f32,
+    pub cz: f32,
+    pub r: f32,
+    pub sx: f32,
+    pub sz: f32,
+    pub sr: f32,
+    pub nx: f32,
+    pub nz: f32,
+    pub nr: f32,
+}
+
+impl Zone {
+    pub fn dps(&self) -> f32 {
+        ZONES[(self.stage as usize).min(ZONES.len() - 1)].dps
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Plane {
+    pub sx: f32,
+    pub sz: f32,
+    pub dx: f32,
+    pub dz: f32,
+    pub t: f32,
+    pub enter_t: f32,
+    pub exit_t: f32,
+    pub active: bool,
+}
+
+impl Plane {
+    pub fn pos(&self) -> V3 {
+        V3::new(self.sx + self.dx * self.t, PLANE_ALT, self.sz + self.dz * self.t)
+    }
+    pub fn can_jump(&self) -> bool {
+        self.active && self.t >= self.enter_t && self.t <= self.exit_t
+    }
+}
+
+struct EvRec {
+    to: u8,
+    start: u32,
+    len: u16,
+    x: f32,
+    z: f32,
+    filt: bool,
+}
+
+pub struct Match {
+    pub w: World,
+    pub rng: Rng,
+    pub tick: u32,
+    pub phase: u8,
+    pub lobby_t: f32,
+    pub end_t: f32,
+    pub match_t: f32,
+    pub flags: u32,
+    pub slots: usize,
+    pub snap_every: u32,
+    pub players: Vec<Player>,
+    pub items: Vec<Item>,
+    free_items: Vec<u16>,
+    pub nades: Vec<Nade>,
+    nade_seq: u16,
+    pub zone: Zone,
+    pub plane: Plane,
+    ev: Vec<u8>,
+    evs: Vec<EvRec>,
+    pub hist: Vec<[HistE; MAX_PLAYERS]>,
+    pub winner: u8,
+    pub out: Vec<u8>,
+    pub ended_flag: bool,
+}
+
+fn sanitize_name(raw: &[u8], fallback: &str) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch.is_control() || ch == '<' || ch == '>' || ch == '&' || ch == '"' || ch == '\'' || ch == '\u{FFFD}' {
+            continue;
+        }
+        if out.chars().count() >= 14 {
+            break;
+        }
+        out.push(ch);
+    }
+    let t = out.trim().to_string();
+    if t.is_empty() {
+        fallback.to_string()
+    } else {
+        t
+    }
+}
+
+impl Match {
+    pub fn new(seed: u32, slots: usize, flags: u32) -> Match {
+        let w = World::generate(seed);
+        let slots = slots.clamp(2, MAX_PLAYERS);
+        let mut m = Match {
+            w,
+            rng: Rng::new(seed as u64 * 977 + 3),
+            tick: 0,
+            phase: PH_LOBBY,
+            lobby_t: if flags & FLAG_OFFLINE != 0 {
+                0.0
+            } else if flags & FLAG_PRIVATE != 0 {
+                90.0
+            } else {
+                25.0
+            },
+            end_t: 0.0,
+            match_t: 0.0,
+            flags,
+            slots,
+            snap_every: if flags & FLAG_OFFLINE != 0 { 1 } else { 2 },
+            players: vec![Player::default(); MAX_PLAYERS],
+            items: Vec::new(),
+            free_items: Vec::new(),
+            nades: Vec::new(),
+            nade_seq: 0,
+            zone: Zone::default(),
+            plane: Plane::default(),
+            ev: Vec::with_capacity(8192),
+            evs: Vec::with_capacity(512),
+            hist: vec![[HistE::default(); MAX_PLAYERS]; HIST],
+            winner: 255,
+            out: Vec::with_capacity(16384),
+            ended_flag: false,
+        };
+        m.spawn_loot();
+        m.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, nx: MAP * 0.5, nz: MAP * 0.5, nr: 780.0, timer: ZONES[0].wait, ..Default::default() };
+        m
+    }
+
+    // ------------------------------------------------------------------
+    // Items
+    // ------------------------------------------------------------------
+    fn spawn_loot(&mut self) {
+        let spots = self.w.spots.clone();
+        for s in spots {
+            if !self.rng.chance(0.72) {
+                continue;
+            }
+            let tier = s.tier.min(2) as usize;
+            let cat = self.rng.weighted(&[30, 24, 20, 11, 9, 6]);
+            match cat {
+                0 => {
+                    let wt: [[u32; 6]; 3] = [[34, 30, 10, 24, 2, 0], [8, 26, 30, 18, 13, 5], [2, 12, 34, 10, 24, 18]];
+                    let wk = 1 + self.rng.weighted(&wt[tier]) as u8;
+                    self.add_item(wk, 0, s.pos);
+                    let a = WD[wk as usize].ammo as usize;
+                    let n = 1 + self.rng.below(2);
+                    for k in 0..n {
+                        let off = V3::new(0.5 + 0.35 * k as f32, 0.0, 0.35);
+                        self.add_item(IK_AMMO + a as u8, AMMO_STACK[a], s.pos + off);
+                    }
+                }
+                1 => {
+                    let a = self.rng.weighted(&[30, 34, 18, 10]);
+                    self.add_item(IK_AMMO + a as u8, AMMO_STACK[a], s.pos);
+                }
+                2 => {
+                    let k = self.rng.weighted(&[60, 22, 18]);
+                    let amt = if k == 0 { 3 + self.rng.below(3) as u16 } else { 1 };
+                    self.add_item(IK_BANDAGE + k as u8, amt, s.pos);
+                }
+                3 => {
+                    let wt: [[u32; 3]; 3] = [[70, 26, 4], [45, 42, 13], [25, 45, 30]];
+                    let lv = self.rng.weighted(&wt[tier]) as u8;
+                    self.add_item(IK_VEST + lv, 100, s.pos);
+                }
+                4 => {
+                    let wt: [[u32; 3]; 3] = [[70, 26, 4], [45, 42, 13], [25, 45, 30]];
+                    let lv = self.rng.weighted(&wt[tier]) as u8;
+                    self.add_item(IK_HELM + lv, 100, s.pos);
+                }
+                _ => {
+                    let amt = 1 + self.rng.below(2) as u16;
+                    self.add_item(IK_NADE, amt, s.pos);
+                }
+            }
+        }
+    }
+
+    fn add_item(&mut self, kind: u8, amount: u16, pos: V3) -> Option<u16> {
+        let it = Item { kind, amount, pos, alive: true };
+        let id = if let Some(id) = self.free_items.pop() {
+            self.items[id as usize] = it;
+            id
+        } else {
+            if self.items.len() >= MAX_ITEMS {
+                return None;
+            }
+            self.items.push(it);
+            (self.items.len() - 1) as u16
+        };
+        if self.phase != PH_LOBBY || self.tick > 0 {
+            self.ev_item(id);
+        }
+        Some(id)
+    }
+
+    fn ev_item(&mut self, id: u16) {
+        let it = self.items[id as usize];
+        let start = self.ev_begin();
+        let mut w = Wr::new(&mut self.ev);
+        w.u8(E_ITEM);
+        w.u16(id);
+        w.u8(it.kind);
+        w.u16(it.amount);
+        w.f32(it.pos.x);
+        w.f32(it.pos.y);
+        w.f32(it.pos.z);
+        self.ev_end(start, 255, None);
+    }
+
+    fn del_item(&mut self, id: u16) {
+        if let Some(it) = self.items.get_mut(id as usize) {
+            if it.alive {
+                it.alive = false;
+                self.free_items.push(id);
+                let start = self.ev_begin();
+                let mut w = Wr::new(&mut self.ev);
+                w.u8(E_IDEL);
+                w.u16(id);
+                self.ev_end(start, 255, None);
+            }
+        }
+    }
+
+    fn drop_item_near(&mut self, kind: u8, amount: u16, base: V3, k: usize) {
+        let a = k as f32 * 2.399 + self.rng.range(0.0, 0.4);
+        let rr = 0.6 + 0.28 * (k as f32).sqrt();
+        let x = clampf(base.x + a.cos() * rr, 2.0, MAP - 2.0);
+        let z = clampf(base.z + a.sin() * rr, 2.0, MAP - 2.0);
+        let y = self.w.ground_below(x, z, base.y + 0.3, 0.2).max(WATER - 1.2);
+        self.add_item(kind, amount, V3::new(x, y + 0.05, z));
+    }
+
+    // ------------------------------------------------------------------
+    // Events
+    // ------------------------------------------------------------------
+    fn ev_begin(&self) -> u32 {
+        self.ev.len() as u32
+    }
+    fn ev_end(&mut self, start: u32, to: u8, at: Option<V3>) {
+        let len = (self.ev.len() as u32 - start) as u16;
+        let (x, z, filt) = match at {
+            Some(p) => (p.x, p.z, true),
+            None => (0.0, 0.0, false),
+        };
+        self.evs.push(EvRec { to, start, len, x, z, filt });
+    }
+    fn ev_pinfo(&mut self, i: usize, left: bool) {
+        let p = &self.players[i];
+        let name = p.name.as_bytes().to_vec();
+        let flags = (p.bot as u8) | if left { 2 } else { 0 };
+        let color = p.color;
+        let start = self.ev_begin();
+        let mut w = Wr::new(&mut self.ev);
+        w.u8(E_PINFO);
+        w.u8(i as u8);
+        w.u8(flags);
+        w.u8(color);
+        w.u8(name.len() as u8);
+        w.bytes(&name);
+        self.ev_end(start, 255, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Players
+    // ------------------------------------------------------------------
+    pub fn human_count(&self) -> usize {
+        self.players.iter().filter(|p| p.used && p.human && p.connected).count()
+    }
+    pub fn alive_count(&self) -> usize {
+        self.players.iter().filter(|p| p.used && p.alive).count()
+    }
+
+    pub fn add_human(&mut self, raw_name: &[u8]) -> Option<u8> {
+        if self.phase != PH_LOBBY {
+            return None;
+        }
+        let i = (0..self.slots).find(|&i| !self.players[i].used)?;
+        let name = sanitize_name(raw_name, "Player");
+        let color = self.rng.below(12) as u8;
+        let p = &mut self.players[i];
+        *p = Player::default();
+        p.used = true;
+        p.human = true;
+        p.connected = true;
+        p.name = name;
+        p.color = color;
+        p.need_welcome = true;
+        p.reset_combat();
+        p.ms.mode = MODE_PLANE;
+        p.tokens = 8.0;
+        self.ev_pinfo(i, false);
+        Some(i as u8)
+    }
+
+    pub fn remove_human(&mut self, pid: u8) {
+        let i = pid as usize;
+        if i >= MAX_PLAYERS || !self.players[i].used || !self.players[i].human {
+            return;
+        }
+        if self.phase == PH_LOBBY {
+            self.ev_pinfo(i, true);
+            self.players[i] = Player::default();
+        } else {
+            // AI takes over the abandoned character.
+            let p = &mut self.players[i];
+            p.connected = false;
+            p.human = false;
+            p.bot = true;
+            let seed = self.rng.u32();
+            p.brain = crate::bot::Brain::new(seed, 0.45);
+            p.brain.jump_t = self.plane.t;
+            self.ev_pinfo(i, false);
+        }
+    }
+
+    fn start_match(&mut self) {
+        self.phase = PH_PLAY;
+        self.match_t = 0.0;
+        // fill with bots
+        let mut names: Vec<usize> = (0..BOT_NAMES.len()).collect();
+        for i in (1..names.len()).rev() {
+            let j = self.rng.below(i as u32 + 1) as usize;
+            names.swap(i, j);
+        }
+        let taken: Vec<String> = self.players.iter().filter(|p| p.used).map(|p| p.name.clone()).collect();
+        let mut ni = 0;
+        for i in 0..self.slots {
+            if self.players[i].used {
+                continue;
+            }
+            let mut name = String::new();
+            while ni < names.len() {
+                let cand = BOT_NAMES[names[ni]];
+                ni += 1;
+                if !taken.iter().any(|t| t == cand) {
+                    name = cand.to_string();
+                    break;
+                }
+            }
+            if name.is_empty() {
+                name = format!("Bot{}", i);
+            }
+            let skill = self.rng.range(0.15, 0.85);
+            let seed = self.rng.u32();
+            let color = self.rng.below(12) as u8;
+            let p = &mut self.players[i];
+            *p = Player::default();
+            p.used = true;
+            p.bot = true;
+            p.name = name;
+            p.color = color;
+            p.brain = crate::bot::Brain::new(seed, skill);
+            p.reset_combat();
+            self.ev_pinfo(i, false);
+        }
+        // plane path
+        let a = self.rng.range(0.0, TAU);
+        let (dx, dz) = (a.cos(), a.sin());
+        let cx = MAP * 0.5 + self.rng.range(-170.0, 170.0);
+        let cz = MAP * 0.5 + self.rng.range(-170.0, 170.0);
+        let half = 820.0;
+        let (sx, sz) = (cx - dx * half, cz - dz * half);
+        // compute entry/exit of the playable square [30, MAP-30]
+        let mut enter = f32::MAX;
+        let mut exit = 0.0f32;
+        let mut t = 0.0;
+        while t <= 2.0 * half {
+            let x = sx + dx * t;
+            let z = sz + dz * t;
+            if x > 40.0 && z > 40.0 && x < MAP - 40.0 && z < MAP - 40.0 {
+                enter = enter.min(t);
+                exit = exit.max(t);
+            }
+            t += 5.0;
+        }
+        if enter > exit {
+            enter = half - 100.0;
+            exit = half + 100.0;
+        }
+        self.plane = Plane { sx, sz, dx, dz, t: (enter - 260.0).max(0.0), enter_t: enter, exit_t: exit, active: true };
+        self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
+        self.pick_next_zone();
+        let ppos = self.plane.pos();
+        for i in 0..self.slots {
+            let pl = self.plane;
+            let p = &mut self.players[i];
+            if !p.used {
+                continue;
+            }
+            p.reset_combat();
+            p.ms = MoveState { pos: ppos, mode: MODE_PLANE, ..Default::default() };
+            p.yaw = yaw_to(dx, dz);
+            if p.bot {
+                let (lx, lz, jt) = crate::bot::pick_landing(&self.w, &pl, &mut p.brain);
+                p.brain.land = (lx, lz);
+                p.brain.jump_t = jt;
+            }
+        }
+        self.record_hist();
+    }
+
+    // ------------------------------------------------------------------
+    // Input
+    // ------------------------------------------------------------------
+    pub fn on_message(&mut self, pid: u8, data: &[u8]) {
+        let i = pid as usize;
+        if i >= MAX_PLAYERS || !self.players[i].used || !self.players[i].human || data.is_empty() {
+            return;
+        }
+        let mut r = Rd::new(data);
+        match r.u8() {
+            C_INPUT => {
+                // A message may carry several commands: u8 count, then 17 bytes each.
+                let n = r.u8().min(8);
+                for _ in 0..n {
+                    let seq = r.u32();
+                    let view = r.u32();
+                    let mx = r.i8();
+                    let mz = r.i8();
+                    let yaw = r.u16();
+                    let pitch = r.i16();
+                    let buttons = r.u16();
+                    if r.bad {
+                        return;
+                    }
+                    let c = Cmd::from_quant(seq, view, mx, mz, yaw, pitch, buttons);
+                    let p = &mut self.players[i];
+                    if seq <= p.last_seq {
+                        continue;
+                    }
+                    if p.tokens < 1.0 {
+                        continue; // rate limit: drop excess commands (speed-hack guard)
+                    }
+                    p.tokens -= 1.0;
+                    p.last_seq = seq;
+                    p.last_cmd_tick = self.tick;
+                    if self.phase == PH_PLAY {
+                        self.apply_cmd(i, c);
+                    } else {
+                        let p = &mut self.players[i];
+                        p.yaw = c.yaw;
+                        p.pitch = c.pitch;
+                    }
+                    self.players[i].last_cmd = c;
+                }
+            }
+            C_START => {
+                if self.phase == PH_LOBBY && self.flags & FLAG_PRIVATE != 0 {
+                    let host = (0..MAX_PLAYERS).find(|&k| self.players[k].used && self.players[k].human);
+                    if host == Some(i) {
+                        self.lobby_t = self.lobby_t.min(3.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_cmd(&mut self, i: usize, c: Cmd) {
+        let tick = self.tick;
+        {
+            let p = &mut self.players[i];
+            p.yaw = wrap_angle(c.yaw);
+            p.pitch = clampf(c.pitch, -PITCH_LIMIT, PITCH_LIMIT);
+        }
+        if !self.players[i].alive {
+            if c.has(B_SPECT) {
+                self.cycle_spect(i);
+            }
+            return;
+        }
+        let mode = self.players[i].ms.mode;
+        if mode == MODE_PLANE {
+            if c.has(B_JUMP) && self.plane.can_jump() {
+                self.eject(i);
+            }
+            return;
+        }
+        let mult = self.players[i].speed_mult();
+        let w = &self.w;
+        let p = &mut self.players[i];
+        let ev = step_move(w, &mut p.ms, &c, mult, DT);
+        if ev & EV_LANDED != 0 && mode != MODE_GROUND {
+            let pos = p.ms.pos;
+            let start = self.ev_begin();
+            let mut wr = Wr::new(&mut self.ev);
+            wr.u8(E_LAND);
+            wr.u8(i as u8);
+            self.ev_end(start, 255, Some(pos));
+        }
+        let p = &mut self.players[i];
+        if p.ms.mode != MODE_GROUND {
+            p.ads = false;
+            return;
+        }
+        p.ads = c.has(B_ADS) && !p.ms.in_water;
+        // weapon slot request (edge): 0 none, 1 slot A, 2 slot B, 3 fists
+        let req = c.slot();
+        if req > 0 {
+            let want = req - 1;
+            if want != p.cur {
+                p.cur = want;
+                p.reload_t = 0.0;
+                p.heal_t = 0.0;
+                p.switch_t = 0.35;
+            }
+        }
+        let wk2 = p.weapon();
+        if c.has(B_RELOAD) {
+            Self::start_reload(p);
+        }
+        let hk = c.heal();
+        if hk > 0 && p.heal_t <= 0.0 {
+            let k = (hk - 1) as usize;
+            let ok = p.heals[k] > 0 && match k {
+                0 => p.health < 75.0,
+                1 => p.health < 100.0,
+                _ => true,
+            };
+            if ok {
+                p.heal_t = HEAL_TIME[k];
+                p.heal_kind = hk;
+                p.reload_t = 0.0;
+            }
+        }
+        if c.has(B_PICKUP) {
+            self.manual_pickup(i);
+        }
+        if c.has(B_NADE) {
+            self.throw_nade(i, &c);
+        }
+        let p = &mut self.players[i];
+        if c.has(B_FIRE) && !p.ms.in_water && !(c.has(B_SPRINT) && c.mz > 0.3 && !c.has(B_ADS)) {
+            p.heal_t = 0.0;
+            if p.switch_t <= 0.0 && p.reload_t <= 0.0 {
+                if wk2 == W_FISTS {
+                    if p.fire_cd <= 0.0 {
+                        p.fire_cd += WD[0].interval;
+                        p.firing_t = 0.3;
+                        self.melee(i, tick);
+                    }
+                } else {
+                    let s = p.cur as usize;
+                    let def = &WD[wk2 as usize];
+                    let mut shots = 0;
+                    while p.fire_cd <= 0.0 && p.slots[s].1 > 0 && shots < 3 {
+                        p.fire_cd += def.interval;
+                        p.slots[s].1 -= 1;
+                        shots += 1;
+                    }
+                    if shots > 0 {
+                        p.firing_t = 0.25;
+                    }
+                    let empty = p.slots[s].1 == 0;
+                    for _ in 0..shots {
+                        self.shoot(i, wk2, c.view);
+                    }
+                    if empty {
+                        Self::start_reload(&mut self.players[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_reload(p: &mut Player) {
+        if p.cur >= 2 || p.reload_t > 0.0 || p.switch_t > 0.0 {
+            return;
+        }
+        let (wk, mag) = p.slots[p.cur as usize];
+        if wk == 0 {
+            return;
+        }
+        let def = &WD[wk as usize];
+        if mag >= def.mag || p.ammo[def.ammo as usize] == 0 {
+            return;
+        }
+        p.reload_t = def.reload;
+        p.heal_t = 0.0;
+    }
+
+    fn cycle_spect(&mut self, i: usize) {
+        let start = self.players[i].spect as usize;
+        for k in 1..=MAX_PLAYERS {
+            let j = (start.wrapping_add(k)) % MAX_PLAYERS;
+            if j != i && self.players[j].used && self.players[j].alive {
+                self.players[i].spect = j as u8;
+                return;
+            }
+        }
+    }
+
+    fn eject(&mut self, i: usize) {
+        let pp = self.plane.pos();
+        let (dx, dz) = (self.plane.dx, self.plane.dz);
+        let p = &mut self.players[i];
+        p.ms.mode = MODE_FALL;
+        p.ms.pos = pp - V3::new(dx, 0.0, dz) * 4.0 - V3::new(0.0, 3.0, 0.0);
+        p.ms.vel = V3::new(dx * 20.0, -5.0, dz * 20.0);
+        p.ms.airtime = 0.0;
+    }
+
+    // ------------------------------------------------------------------
+    // Combat
+    // ------------------------------------------------------------------
+    fn rewound(&self, j: usize, view: u32) -> Option<HistE> {
+        let now = self.tick as f32;
+        let vt = clampf(view as f32 / 256.0, now - 10.0, now);
+        let t0 = vt.floor();
+        let frac = vt - t0;
+        let t0u = t0 as u32;
+        if self.tick >= HIST as u32 && t0u + (HIST as u32) <= self.tick {
+            return None;
+        }
+        let a = self.hist[t0u as usize % HIST][j];
+        let b = if t0u < self.tick { self.hist[(t0u as usize + 1) % HIST][j] } else { a };
+        if !a.alive && !b.alive {
+            return None;
+        }
+        Some(HistE { pos: a.pos.lerp(b.pos, frac), crouch: if frac < 0.5 { a.crouch } else { b.crouch }, alive: true })
+    }
+
+    /// Returns (victim, distance, headshot).
+    fn ray_players(&self, shooter: usize, o: V3, d: V3, maxt: f32, view: u32) -> Option<(usize, f32, bool)> {
+        let mut best: Option<(usize, f32, bool)> = None;
+        let mut lim = maxt;
+        for j in 0..MAX_PLAYERS {
+            if j == shooter {
+                continue;
+            }
+            let q = &self.players[j];
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
+                continue;
+            }
+            let h = if self.players[shooter].bot { HistE { pos: q.ms.pos, crouch: q.ms.crouch, alive: true } } else {
+                match self.rewound(j, view) {
+                    Some(h) => h,
+                    None => continue,
+                }
+            };
+            let p = h.pos;
+            // cheap reject
+            let to = p - o;
+            let along = to.dot(d);
+            if along < -2.0 || along > lim + 2.0 {
+                continue;
+            }
+            let perp2 = (to - d * along).len2();
+            if perp2 > 4.0 {
+                continue;
+            }
+            let k = if h.crouch { 0.68 } else { 1.0 };
+            let head_c = p + V3::new(0.0, eye_h(h.crouch) + 0.04, 0.0);
+            if let Some(t) = ray_sphere(o, d, head_c, 0.2, lim) {
+                lim = t;
+                best = Some((j, t, true));
+            }
+            if let Some(t) = ray_capsule(o, d, p.x, p.z, p.y + 0.35, p.y + 1.38 * k, 0.33, lim) {
+                if t < lim {
+                    lim = t;
+                    best = Some((j, t, false));
+                }
+            }
+        }
+        best
+    }
+
+    fn shoot(&mut self, i: usize, wk: u8, view: u32) {
+        let p = &self.players[i];
+        let def = WD[wk as usize];
+        let (o, d0) = aim_ray(p.ms.pos, p.yaw, p.pitch, p.ms.crouch, p.ads);
+        let muz = muzzle(p.ms.pos, p.yaw, p.pitch, p.ms.crouch);
+        let speed = p.ms.vel.len_xz();
+        let mut spread = if p.ads { def.ads } else { def.hip };
+        if speed > 1.0 {
+            spread *= 1.7;
+        }
+        if !p.ms.on_ground {
+            spread *= 2.5;
+        }
+        if p.ms.crouch {
+            spread *= 0.7;
+        }
+        let r = right(p.yaw);
+        let up = r.cross(d0).norm();
+        let view = if p.bot { self.tick * 256 } else { view };
+        for _ in 0..def.pellets {
+            let a = self.rng.range(0.0, TAU);
+            let rad = spread * self.rng.f().sqrt();
+            let d = (d0 + r * (a.cos() * rad) + up * (a.sin() * rad)).norm();
+            let wh = self.w.raycast(o, d, def.range);
+            let tw = wh.map_or(def.range, |h| h.0);
+            let ph = self.ray_players(i, o, d, tw, view);
+            let end_t = ph.map_or(tw, |h| h.1);
+            let target = o + d * end_t;
+            // obstruction between the gun and the aim point
+            let md = target - muz;
+            let ml = md.len();
+            let mut end = target;
+            let mut hit_kind = if ph.is_some() { 1u8 } else if wh.is_some() { 3 } else { 0 };
+            let mut victim = ph;
+            if ml > 0.3 {
+                let dd = md * (1.0 / ml);
+                if let Some(h) = self.w.raycast(muz, dd, ml - 0.2) {
+                    end = muz + dd * h.0;
+                    victim = None;
+                    hit_kind = 3;
+                }
+            }
+            if let Some((j, dist, head)) = victim {
+                let fall = if dist <= def.f0 {
+                    1.0
+                } else if dist >= def.f1 {
+                    def.fmin
+                } else {
+                    lerpf(1.0, def.fmin, (dist - def.f0) / (def.f1 - def.f0))
+                };
+                let mut dmg = def.dmg * fall;
+                if head {
+                    dmg *= def.head;
+                    hit_kind = 2;
+                }
+                self.damage(j, i as u8, dmg, head, wk, self.players[i].ms.pos);
+            }
+            let start = self.ev_begin();
+            let mut w = Wr::new(&mut self.ev);
+            w.u8(E_SHOT);
+            w.u8(i as u8);
+            w.u8(wk);
+            w.f32(muz.x);
+            w.f32(muz.y);
+            w.f32(muz.z);
+            w.f32(end.x);
+            w.f32(end.y);
+            w.f32(end.z);
+            w.u8(hit_kind);
+            self.ev_end(start, 255, Some(muz));
+        }
+    }
+
+    fn melee(&mut self, i: usize, _tick: u32) {
+        let p = &self.players[i];
+        let head = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch) - 0.3, 0.0);
+        let d = dir_from(p.yaw, p.pitch * 0.5);
+        let mut best: Option<(usize, f32)> = None;
+        for j in 0..MAX_PLAYERS {
+            if j == i {
+                continue;
+            }
+            let q = &self.players[j];
+            if !q.used || !q.alive || q.ms.mode != MODE_GROUND {
+                continue;
+            }
+            let to = q.ms.pos + V3::new(0.0, 1.0, 0.0) - head;
+            let dist = to.len();
+            if dist > 2.0 {
+                continue;
+            }
+            if to.norm().dot(d) < 0.6 {
+                continue;
+            }
+            if best.map_or(true, |b| dist < b.1) {
+                best = Some((j, dist));
+            }
+        }
+        if let Some((j, _)) = best {
+            let pos = self.players[i].ms.pos;
+            self.damage(j, i as u8, WD[0].dmg, false, W_FISTS, pos);
+        }
+    }
+
+    fn throw_nade(&mut self, i: usize, c: &Cmd) {
+        let p = &mut self.players[i];
+        if p.nades == 0 || p.nade_cd > 0.0 {
+            return;
+        }
+        p.nades -= 1;
+        p.nade_cd = 1.0;
+        p.heal_t = 0.0;
+        let d = dir_from(c.yaw, clampf(c.pitch + 0.25, -1.2, 1.3));
+        let pos = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0) + right(c.yaw) * 0.25 + d * 0.5;
+        let vel = d * 19.0 + V3::new(p.ms.vel.x * 0.5, 0.0, p.ms.vel.z * 0.5);
+        self.nade_seq = self.nade_seq.wrapping_add(1);
+        let id = self.nade_seq;
+        self.nades.push(Nade { pos, vel, fuse: 3.2, owner: i as u8, id });
+        let start = self.ev_begin();
+        let mut w = Wr::new(&mut self.ev);
+        w.u8(E_THROW);
+        w.u8(i as u8);
+        self.ev_end(start, 255, Some(pos));
+    }
+
+    fn update_nades(&mut self) {
+        let mut k = 0;
+        while k < self.nades.len() {
+            let mut n = self.nades[k];
+            n.fuse -= DT;
+            n.vel.y -= 20.0 * DT;
+            let step = n.vel * DT;
+            let l = step.len();
+            if l > 1e-5 {
+                let d = step * (1.0 / l);
+                if let Some((t, nrm, _)) = self.w.raycast(n.pos, d, l + 0.12) {
+                    n.pos += d * (t - 0.1).max(0.0);
+                    let vn = nrm * n.vel.dot(nrm);
+                    n.vel = (n.vel - vn * 1.0) * 0.6 - vn * 0.35;
+                    if n.vel.len() < 0.8 {
+                        n.vel = V3::ZERO;
+                    }
+                } else {
+                    n.pos += step;
+                }
+            }
+            let g = self.w.height(n.pos.x, n.pos.z);
+            if n.pos.y < g + 0.08 {
+                n.pos.y = g + 0.08;
+                if n.vel.y < 0.0 {
+                    n.vel.y = -n.vel.y * 0.3;
+                }
+                n.vel.x *= 0.8;
+                n.vel.z *= 0.8;
+            }
+            n.pos.x = clampf(n.pos.x, 1.0, MAP - 1.0);
+            n.pos.z = clampf(n.pos.z, 1.0, MAP - 1.0);
+            if n.fuse <= 0.0 {
+                self.nades.swap_remove(k);
+                self.explode(n);
+                continue;
+            }
+            self.nades[k] = n;
+            k += 1;
+        }
+    }
+
+    fn explode(&mut self, n: Nade) {
+        let start = self.ev_begin();
+        let mut w = Wr::new(&mut self.ev);
+        w.u8(E_BOOM);
+        w.f32(n.pos.x);
+        w.f32(n.pos.y);
+        w.f32(n.pos.z);
+        self.ev_end(start, 255, Some(n.pos));
+        let radius = 7.5;
+        for j in 0..MAX_PLAYERS {
+            let q = &self.players[j];
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
+                continue;
+            }
+            let c = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+            let d = (c - n.pos).len();
+            if d > radius {
+                continue;
+            }
+            if self.w.blocked(n.pos + V3::new(0.0, 0.3, 0.0), c) {
+                continue;
+            }
+            let k = 1.0 - d / radius;
+            let dmg = 115.0 * k.powf(1.4);
+            if dmg > 1.0 {
+                self.damage(j, n.owner, dmg, false, 200, n.pos);
+            }
+        }
+    }
+
+    /// Apply damage. attacker 255 = zone. weapon 200 = grenade.
+    pub fn damage(&mut self, j: usize, attacker: u8, raw: f32, head: bool, weapon: u8, src: V3) {
+        if !self.players[j].alive || raw <= 0.0 || self.phase != PH_PLAY {
+            return;
+        }
+        let mut dmg = raw;
+        let mut armor_hit = false;
+        {
+            let q = &mut self.players[j];
+            if attacker != KILLER_ZONE && weapon != 200 {
+                if head && q.helm > 0 {
+                    let red = ARMOR_RED[q.helm as usize];
+                    dmg *= 1.0 - red;
+                    q.helm_dur -= raw * 0.6;
+                    armor_hit = true;
+                    if q.helm_dur <= 0.0 {
+                        q.helm = 0;
+                        q.helm_dur = 0.0;
+                    }
+                } else if !head && q.vest > 0 {
+                    let red = ARMOR_RED[q.vest as usize];
+                    dmg *= 1.0 - red;
+                    q.vest_dur -= raw * 0.6;
+                    armor_hit = true;
+                    if q.vest_dur <= 0.0 {
+                        q.vest = 0;
+                        q.vest_dur = 0.0;
+                    }
+                }
+            }
+            q.health -= dmg;
+            if attacker != KILLER_ZONE {
+                q.hurt_by = attacker;
+                q.hurt_t = 4.0;
+            }
+            q.heal_t = 0.0;
+        }
+        let killed = self.players[j].health <= 0.0;
+        if (attacker as usize) < MAX_PLAYERS && attacker as usize != j {
+            let a = &mut self.players[attacker as usize];
+            a.dmg_dealt += dmg;
+            let start = self.ev_begin();
+            let mut w = Wr::new(&mut self.ev);
+            w.u8(E_HIT);
+            w.u8(j as u8);
+            w.u8(dmg.round().clamp(1.0, 255.0) as u8);
+            w.u8((head as u8) | if killed { 2 } else { 0 } | if armor_hit { 4 } else { 0 });
+            self.ev_end(start, attacker, None);
+        }
+        {
+            let start = self.ev_begin();
+            let mut w = Wr::new(&mut self.ev);
+            w.u8(E_HURT);
+            w.u8(attacker);
+            w.f32(src.x);
+            w.f32(src.z);
+            w.u8(dmg.round().clamp(1.0, 255.0) as u8);
+            self.ev_end(start, j as u8, None);
+        }
+        if killed {
+            self.kill(j, attacker, weapon, head);
+        }
+    }
+
+    fn kill(&mut self, j: usize, attacker: u8, weapon: u8, head: bool) {
+        let place = self.alive_count() as u8;
+        let tick = self.tick;
+        let pos;
+        {
+            let q = &mut self.players[j];
+            q.alive = false;
+            q.health = 0.0;
+            q.place = place;
+            q.killer = attacker;
+            q.death_tick = tick;
+            q.ms.mode = MODE_DEAD;
+            q.ms.vel = V3::ZERO;
+            q.reload_t = 0.0;
+            q.heal_t = 0.0;
+            q.spect = if (attacker as usize) < MAX_PLAYERS && attacker as usize != j { attacker } else { 255 };
+            pos = q.ms.pos;
+        }
+        if (attacker as usize) < MAX_PLAYERS && attacker as usize != j {
+            self.players[attacker as usize].kills += 1;
+        }
+        {
+            let start = self.ev_begin();
+            let mut w = Wr::new(&mut self.ev);
+            w.u8(E_KILL);
+            w.u8(attacker);
+            w.u8(j as u8);
+            w.u8(weapon);
+            w.u8(head as u8);
+            self.ev_end(start, 255, None);
+        }
+        // drop loot
+        let q = self.players[j].clone();
+        let mut k = 0;
+        for s in 0..2 {
+            if q.slots[s].0 != 0 {
+                self.drop_item_near(q.slots[s].0, q.slots[s].1, pos, k);
+                k += 1;
+            }
+        }
+        for a in 0..NUM_AMMO {
+            let mut left = q.ammo[a];
+            while left > 0 && k < 24 {
+                let take = left.min(AMMO_STACK[a] * 2);
+                self.drop_item_near(IK_AMMO + a as u8, take, pos, k);
+                left -= take;
+                k += 1;
+            }
+        }
+        for h in 0..3 {
+            if q.heals[h] > 0 {
+                self.drop_item_near(IK_BANDAGE + h as u8, q.heals[h] as u16, pos, k);
+                k += 1;
+            }
+        }
+        if q.vest > 0 {
+            self.drop_item_near(IK_VEST + q.vest - 1, q.vest_dur.max(1.0) as u16, pos, k);
+            k += 1;
+        }
+        if q.helm > 0 {
+            self.drop_item_near(IK_HELM + q.helm - 1, q.helm_dur.max(1.0) as u16, pos, k);
+            k += 1;
+        }
+        if q.nades > 0 {
+            self.drop_item_near(IK_NADE, q.nades as u16, pos, k);
+        }
+        let p = &mut self.players[j];
+        p.slots = [(0, 0); 2];
+        p.ammo = [0; NUM_AMMO];
+        p.heals = [0; 3];
+        p.nades = 0;
+        p.vest = 0;
+        p.helm = 0;
+        // spectators of the victim follow the killer
+        for s in 0..MAX_PLAYERS {
+            if s != j && self.players[s].used && !self.players[s].alive && self.players[s].spect as usize == j {
+                self.players[s].spect = attacker;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Pickups
+    // ------------------------------------------------------------------
+    /// Try to take an item. Returns true if the item was consumed (fully or partially).
+    fn try_take(&mut self, i: usize, id: u16, manual: bool) -> bool {
+        let it = self.items[id as usize];
+        if !it.alive {
+            return false;
+        }
+        let p = &mut self.players[i];
+        let kind = it.kind;
+        let mut remaining = it.amount;
+        let mut took = 0u16;
+        let mut drop: Option<(u8, u16)> = None;
+        if is_weapon(kind) {
+            let empty = (0..2).find(|&s| p.slots[s].0 == 0);
+            if let Some(s) = empty {
+                p.slots[s] = (kind, it.amount);
+                if p.cur == 2 {
+                    p.cur = s as u8;
+                    p.switch_t = 0.35;
+                }
+                took = 1;
+                remaining = 0;
+            } else if manual {
+                let s = if p.cur < 2 { p.cur as usize } else { 0 };
+                drop = Some(p.slots[s]);
+                p.slots[s] = (kind, it.amount);
+                p.cur = s as u8;
+                p.reload_t = 0.0;
+                p.switch_t = 0.35;
+                took = 1;
+                remaining = 0;
+            }
+        } else if (IK_AMMO..IK_AMMO + NUM_AMMO as u8).contains(&kind) {
+            let a = (kind - IK_AMMO) as usize;
+            let space = AMMO_CAP[a].saturating_sub(p.ammo[a]);
+            let t = space.min(remaining);
+            p.ammo[a] += t;
+            remaining -= t;
+            took = t;
+        } else if (IK_BANDAGE..=IK_DRINK).contains(&kind) {
+            let h = (kind - IK_BANDAGE) as usize;
+            let space = HEAL_CAP[h].saturating_sub(p.heals[h]) as u16;
+            let t = space.min(remaining);
+            p.heals[h] += t as u8;
+            remaining -= t;
+            took = t;
+        } else if (IK_VEST..IK_VEST + 3).contains(&kind) {
+            let lv = kind - IK_VEST + 1;
+            if lv > p.vest || (manual && lv == p.vest && it.amount as f32 > p.vest_dur + 1.0) {
+                if p.vest > 0 {
+                    drop = Some((IK_VEST + p.vest - 1, p.vest_dur.max(1.0) as u16));
+                }
+                p.vest = lv;
+                p.vest_dur = it.amount.min(100) as f32;
+                took = 1;
+                remaining = 0;
+            }
+        } else if (IK_HELM..IK_HELM + 3).contains(&kind) {
+            let lv = kind - IK_HELM + 1;
+            if lv > p.helm || (manual && lv == p.helm && it.amount as f32 > p.helm_dur + 1.0) {
+                if p.helm > 0 {
+                    drop = Some((IK_HELM + p.helm - 1, p.helm_dur.max(1.0) as u16));
+                }
+                p.helm = lv;
+                p.helm_dur = it.amount.min(100) as f32;
+                took = 1;
+                remaining = 0;
+            }
+        } else if kind == IK_NADE {
+            let space = NADE_CAP.saturating_sub(p.nades) as u16;
+            let t = space.min(remaining);
+            p.nades += t as u8;
+            remaining -= t;
+            took = t;
+        }
+        if took == 0 {
+            return false;
+        }
+        let pos = p.ms.pos;
+        {
+            let start = self.ev_begin();
+            let mut w = Wr::new(&mut self.ev);
+            w.u8(E_PICK);
+            w.u8(kind);
+            w.u16(took);
+            self.ev_end(start, i as u8, None);
+        }
+        if remaining == 0 {
+            self.del_item(id);
+        } else {
+            self.items[id as usize].amount = remaining;
+            self.ev_item(id);
+        }
+        if let Some((k, a)) = drop {
+            if k != 0 {
+                let pp = V3::new(pos.x, pos.y, pos.z);
+                self.drop_item_near(k, a, pp, 3 + (self.tick % 5) as usize);
+            }
+        }
+        true
+    }
+
+    fn manual_pickup(&mut self, i: usize) {
+        let p = &self.players[i];
+        let pos = p.ms.pos;
+        let f = fwd(p.yaw);
+        let mut best: Option<(u16, f32)> = None;
+        for (id, it) in self.items.iter().enumerate() {
+            if !it.alive {
+                continue;
+            }
+            let dx = it.pos.x - pos.x;
+            let dz = it.pos.z - pos.z;
+            let d = (dx * dx + dz * dz).sqrt();
+            if d > 2.6 || (it.pos.y - pos.y).abs() > 1.8 {
+                continue;
+            }
+            // prefer items in front and weapons
+            let facing = if d > 0.01 { (dx * f.x + dz * f.z) / d } else { 1.0 };
+            let score = d - facing * 0.6 - if is_weapon(it.kind) { 0.5 } else { 0.0 };
+            if best.map_or(true, |b| score < b.1) {
+                best = Some((id as u16, score));
+            }
+        }
+        if let Some((id, _)) = best {
+            self.try_take(i, id, true);
+        }
+    }
+
+    fn auto_pickups(&mut self) {
+        for i in 0..MAX_PLAYERS {
+            let p = &self.players[i];
+            if !p.used || !p.alive || p.ms.mode != MODE_GROUND {
+                continue;
+            }
+            if (self.tick + i as u32) % 3 != 0 {
+                continue;
+            }
+            let pos = p.ms.pos;
+            let mut cands: [u16; 8] = [0; 8];
+            let mut n = 0;
+            for (id, it) in self.items.iter().enumerate() {
+                if !it.alive || n >= 8 {
+                    continue;
+                }
+                let dx = it.pos.x - pos.x;
+                let dz = it.pos.z - pos.z;
+                if dx * dx + dz * dz < 1.6 * 1.6 && (it.pos.y - pos.y).abs() < 1.6 {
+                    cands[n] = id as u16;
+                    n += 1;
+                }
+            }
+            for &id in cands.iter().take(n) {
+                self.try_take(i, id, false);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Tick
+    // ------------------------------------------------------------------
+    fn record_hist(&mut self) {
+        let slot = self.tick as usize % HIST;
+        for j in 0..MAX_PLAYERS {
+            let p = &self.players[j];
+            self.hist[slot][j] = HistE { pos: p.ms.pos, crouch: p.ms.crouch, alive: p.used && p.alive };
+        }
+    }
+
+    fn update_zone(&mut self) {
+        let z = &mut self.zone;
+        if z.done {
+            return;
+        }
+        z.timer -= DT;
+        let st = &ZONES[(z.stage as usize).min(ZONES.len() - 1)];
+        if !z.shrinking {
+            if z.timer <= 0.0 {
+                z.shrinking = true;
+                z.timer = st.shrink;
+                z.sx = z.cx;
+                z.sz = z.cz;
+                z.sr = z.r;
+            }
+        } else {
+            let k = clampf(1.0 - z.timer / st.shrink, 0.0, 1.0);
+            z.cx = lerpf(z.sx, z.nx, k);
+            z.cz = lerpf(z.sz, z.nz, k);
+            z.r = lerpf(z.sr, z.nr, k);
+            if z.timer <= 0.0 {
+                z.cx = z.nx;
+                z.cz = z.nz;
+                z.r = z.nr;
+                z.stage += 1;
+                z.shrinking = false;
+                if (z.stage as usize) >= ZONES.len() {
+                    z.done = true;
+                    z.stage = (ZONES.len() - 1) as u8;
+                } else {
+                    z.timer = ZONES[z.stage as usize].wait;
+                    self.pick_next_zone();
+                }
+            }
+        }
+    }
+
+    fn pick_next_zone(&mut self) {
+        let stage = (self.zone.stage as usize).min(ZONES.len() - 1);
+        let nr = ZONES[stage].r;
+        let (cx, cz, r) = (self.zone.cx, self.zone.cz, self.zone.r);
+        let max_off = if stage == 0 { 260.0 } else { (r - nr).max(0.0) * 0.92 };
+        let mut best = (cx, cz);
+        for attempt in 0..40 {
+            let a = self.rng.range(0.0, TAU);
+            let d = self.rng.f().sqrt() * max_off;
+            let (x, z) = (cx + a.cos() * d, cz + a.sin() * d);
+            if stage == 0 && dist_xz(x, z, MAP * 0.5, MAP * 0.5) > 300.0 {
+                continue;
+            }
+            let land = self.w.height(x, z) > 1.5;
+            best = (clampf(x, 60.0, MAP - 60.0), clampf(z, 60.0, MAP - 60.0));
+            if land || attempt > 30 {
+                break;
+            }
+        }
+        self.zone.nx = best.0;
+        self.zone.nz = best.1;
+        self.zone.nr = nr;
+    }
+
+    fn zone_damage(&mut self) {
+        let (cx, cz, r) = (self.zone.cx, self.zone.cz, self.zone.r);
+        let dps = self.zone.dps();
+        for j in 0..MAX_PLAYERS {
+            let p = &mut self.players[j];
+            if !p.used || !p.alive || p.ms.mode == MODE_PLANE {
+                continue;
+            }
+            if dist_xz(p.ms.pos.x, p.ms.pos.z, cx, cz) > r {
+                p.zone_acc += dps * DT;
+            }
+            if p.zone_acc >= 1.0 {
+                let d = p.zone_acc.floor();
+                p.zone_acc -= d;
+                let pos = p.ms.pos;
+                self.damage(j, KILLER_ZONE, d, false, 255, pos);
+            }
+        }
+    }
+
+    fn update_timers(&mut self) {
+        for i in 0..MAX_PLAYERS {
+            let p = &mut self.players[i];
+            if !p.used || !p.alive {
+                continue;
+            }
+            p.fire_cd = (p.fire_cd - DT).max(-DT);
+            p.switch_t = (p.switch_t - DT).max(0.0);
+            p.nade_cd = (p.nade_cd - DT).max(0.0);
+            p.firing_t = (p.firing_t - DT).max(0.0);
+            p.hurt_t = (p.hurt_t - DT).max(0.0);
+            if p.reload_t > 0.0 {
+                p.reload_t -= DT;
+                if p.reload_t <= 0.0 {
+                    p.reload_t = 0.0;
+                    if p.cur < 2 {
+                        let s = p.cur as usize;
+                        let wk = p.slots[s].0;
+                        if wk != 0 {
+                            let def = &WD[wk as usize];
+                            let a = def.ammo as usize;
+                            let need = def.mag.saturating_sub(p.slots[s].1);
+                            let take = need.min(p.ammo[a]);
+                            p.slots[s].1 += take;
+                            p.ammo[a] -= take;
+                        }
+                    }
+                }
+            }
+            if p.heal_t > 0.0 {
+                p.heal_t -= DT;
+                if p.heal_t <= 0.0 {
+                    p.heal_t = 0.0;
+                    let k = (p.heal_kind.max(1) - 1) as usize;
+                    if p.heals[k] > 0 {
+                        p.heals[k] -= 1;
+                        match k {
+                            0 => p.health = (p.health + 15.0).min(75.0f32.max(p.health)),
+                            1 => p.health = 100.0,
+                            _ => p.boost = (p.boost + 40.0).min(100.0),
+                        }
+                    }
+                    p.heal_kind = 0;
+                }
+            }
+            if p.boost > 0.0 {
+                let rate = 40.0 / 30.0;
+                let b = (rate * DT).min(p.boost);
+                p.boost -= b;
+                p.health = (p.health + b * 0.5).min(100.0);
+            }
+        }
+    }
+
+    /// Advance one fixed tick. Returns bit 1 = snapshot due, bit 2 = match over.
+    pub fn step(&mut self) -> u32 {
+        self.tick = self.tick.wrapping_add(1);
+        for p in self.players.iter_mut() {
+            if p.used && p.human {
+                p.tokens = (p.tokens + 1.04).min(10.0);
+            }
+        }
+        match self.phase {
+            PH_LOBBY => {
+                if self.human_count() > 0 {
+                    self.lobby_t -= DT;
+                    let humans = self.players.iter().filter(|p| p.used).count();
+                    if self.lobby_t <= 0.0 || humans >= self.slots {
+                        self.start_match();
+                    }
+                }
+            }
+            PH_PLAY => {
+                self.match_t += DT;
+                // plane
+                if self.plane.active {
+                    self.plane.t += PLANE_SPEED * DT;
+                    let pp = self.plane.pos();
+                    let force = self.plane.t > self.plane.exit_t;
+                    for i in 0..MAX_PLAYERS {
+                        if self.players[i].used && self.players[i].ms.mode == MODE_PLANE {
+                            self.players[i].ms.pos = pp;
+                            if force {
+                                self.eject(i);
+                            }
+                        }
+                    }
+                    if force {
+                        self.plane.active = false;
+                    }
+                }
+                // bots
+                for i in 0..MAX_PLAYERS {
+                    if self.players[i].used && self.players[i].bot && self.players[i].alive {
+                        let c = crate::bot::think(self, i);
+                        self.apply_cmd(i, c);
+                    }
+                }
+                // humans that stopped sending commands keep falling / standing
+                for i in 0..MAX_PLAYERS {
+                    let p = &self.players[i];
+                    if p.used && p.human && p.alive && p.ms.mode != MODE_PLANE && self.tick.wrapping_sub(p.last_cmd_tick) > 8 {
+                        let mut c = p.last_cmd;
+                        c.mx = 0.0;
+                        c.mz = 0.0;
+                        c.buttons &= B_CROUCH;
+                        let mult = p.speed_mult();
+                        let w = &self.w;
+                        let p = &mut self.players[i];
+                        step_move(w, &mut p.ms, &c, mult, DT);
+                    }
+                }
+                self.update_timers();
+                self.auto_pickups();
+                self.update_nades();
+                self.update_zone();
+                self.zone_damage();
+                self.record_hist();
+                if self.alive_count() <= 1 {
+                    self.phase = PH_END;
+                    self.end_t = 12.0;
+                    self.winner = (0..MAX_PLAYERS).find(|&k| self.players[k].used && self.players[k].alive).map_or(255, |k| k as u8);
+                    if (self.winner as usize) < MAX_PLAYERS {
+                        self.players[self.winner as usize].place = 1;
+                    }
+                    let start = self.ev_begin();
+                    let mut w = Wr::new(&mut self.ev);
+                    w.u8(E_END);
+                    w.u8(self.winner);
+                    self.ev_end(start, 255, None);
+                }
+            }
+            _ => {
+                self.end_t -= DT;
+                if self.end_t <= 0.0 {
+                    self.ended_flag = true;
+                }
+            }
+        }
+        let mut r = 0;
+        if self.tick % self.snap_every == 0 {
+            r |= 1;
+        }
+        if self.ended_flag {
+            r |= 2;
+        }
+        r
+    }
+
+    // ------------------------------------------------------------------
+    // Output
+    // ------------------------------------------------------------------
+    pub fn welcome(&mut self, pid: u8) -> &[u8] {
+        self.out.clear();
+        let mut w = Wr::new(&mut self.out);
+        w.u8(S_WELCOME);
+        w.u16(PROTO);
+        w.u8(pid);
+        w.u32(self.w.seed);
+        w.u32(self.w.checksum);
+        w.u8(TICK_HZ as u8);
+        w.u8(self.snap_every as u8);
+        w.u8(self.slots as u8);
+        w.u8(self.flags as u8);
+        w.f32(self.lobby_t);
+        let used: Vec<usize> = (0..MAX_PLAYERS).filter(|&k| self.players[k].used).collect();
+        w.u8(used.len() as u8);
+        for &k in &used {
+            let p = &self.players[k];
+            w.u8(k as u8);
+            w.u8(p.bot as u8);
+            w.u8(p.color);
+            let nb = p.name.as_bytes();
+            w.u8(nb.len() as u8);
+            w.bytes(nb);
+        }
+        let alive: Vec<usize> = (0..self.items.len()).filter(|&k| self.items[k].alive).collect();
+        w.u16(alive.len() as u16);
+        for &k in &alive {
+            let it = &self.items[k];
+            w.u16(k as u16);
+            w.u8(it.kind);
+            w.u16(it.amount);
+            w.f32(it.pos.x);
+            w.f32(it.pos.y);
+            w.f32(it.pos.z);
+        }
+        if (pid as usize) < MAX_PLAYERS {
+            self.players[pid as usize].need_welcome = false;
+        }
+        &self.out
+    }
+
+    pub fn snapshot(&mut self, pid: u8) -> &[u8] {
+        self.out.clear();
+        let i = pid as usize;
+        if i >= MAX_PLAYERS || !self.players[i].used {
+            return &self.out;
+        }
+        let me = self.players[i].clone();
+        // interest center: me, or who I spectate
+        let mut center = me.ms.pos;
+        if !me.alive && (me.spect as usize) < MAX_PLAYERS && self.players[me.spect as usize].used {
+            center = self.players[me.spect as usize].ms.pos;
+        }
+        let alive = self.alive_count() as u8;
+        let total = self.players.iter().filter(|p| p.used).count() as u8;
+        let mut w = Wr::new(&mut self.out);
+        w.u8(S_SNAP);
+        w.u32(self.tick);
+        w.u32(me.last_seq);
+        w.u8(self.phase);
+        w.f32(match self.phase {
+            PH_LOBBY => self.lobby_t,
+            PH_PLAY => self.match_t,
+            _ => self.end_t,
+        });
+        w.u8(alive);
+        w.u8(total);
+        w.u8(self.winner);
+        // ---- self
+        w.u8(me.ms.mode);
+        w.u8((me.alive as u8) | ((me.ms.on_ground as u8) << 1) | ((me.ms.crouch as u8) << 2) | ((me.ms.in_water as u8) << 3) | ((me.ads as u8) << 4));
+        w.f32(me.ms.pos.x);
+        w.f32(me.ms.pos.y);
+        w.f32(me.ms.pos.z);
+        w.f32(me.ms.vel.x);
+        w.f32(me.ms.vel.y);
+        w.f32(me.ms.vel.z);
+        w.f32(me.ms.airtime);
+        w.f32(me.health);
+        w.u8(me.vest);
+        w.u8(me.vest_dur.clamp(0.0, 255.0) as u8);
+        w.u8(me.helm);
+        w.u8(me.helm_dur.clamp(0.0, 255.0) as u8);
+        w.u8(me.cur);
+        for s in 0..2 {
+            w.u8(me.slots[s].0);
+            w.u16(me.slots[s].1);
+        }
+        for a in 0..NUM_AMMO {
+            w.u16(me.ammo[a]);
+        }
+        for h in 0..3 {
+            w.u8(me.heals[h]);
+        }
+        w.u8(me.nades);
+        w.f32(me.reload_t);
+        w.f32(me.heal_t);
+        w.u8(me.heal_kind);
+        w.f32(me.boost);
+        w.f32(me.switch_t);
+        w.u16(me.kills);
+        w.u16(me.dmg_dealt.min(65535.0) as u16);
+        w.u8(me.spect);
+        w.u8(me.place);
+        w.u8(me.killer);
+        // ---- zone
+        let z = self.zone;
+        w.u8(z.stage);
+        w.u8((z.shrinking as u8) | ((z.done as u8) << 1));
+        w.f32(z.timer);
+        w.f32(z.cx);
+        w.f32(z.cz);
+        w.f32(z.r);
+        w.f32(z.nx);
+        w.f32(z.nz);
+        w.f32(z.nr);
+        w.f32(z.dps());
+        // ---- plane
+        let pl = self.plane;
+        w.u8(pl.active as u8 | ((pl.can_jump() as u8) << 1));
+        w.f32(pl.sx);
+        w.f32(pl.sz);
+        w.f32(pl.dx);
+        w.f32(pl.dz);
+        w.f32(pl.t);
+        w.f32(pl.enter_t);
+        w.f32(pl.exit_t);
+        // ---- players
+        let count_pos = w.len();
+        w.u8(0);
+        let mut count = 0u8;
+        for j in 0..MAX_PLAYERS {
+            if j == i {
+                continue;
+            }
+            let q = &self.players[j];
+            if !q.used || q.ms.mode == MODE_PLANE {
+                continue;
+            }
+            if !q.alive && self.tick.wrapping_sub(q.death_tick) > 30 * 12 {
+                continue;
+            }
+            if dist_xz(q.ms.pos.x, q.ms.pos.z, center.x, center.z) > INTEREST && j != me.spect as usize {
+                continue;
+            }
+            w.u8(j as u8);
+            w.u8(q.ms.mode);
+            let fl = (q.alive as u8)
+                | ((q.ms.crouch as u8) << 1)
+                | ((q.ads as u8) << 2)
+                | (((q.firing_t > 0.0) as u8) << 3)
+                | (((q.heal_t > 0.0) as u8) << 4)
+                | (((q.reload_t > 0.0) as u8) << 5)
+                | ((q.ms.in_water as u8) << 6)
+                | ((q.ms.on_ground as u8) << 7);
+            w.u8(fl);
+            w.f32(q.ms.pos.x);
+            w.f32(q.ms.pos.y);
+            w.f32(q.ms.pos.z);
+            w.u16(q_yaw(q.yaw));
+            w.i16(q_pitch(q.pitch));
+            w.u8(q.weapon());
+            w.u8(q.vest | (q.helm << 2));
+            w.u8(q.health.clamp(0.0, 100.0) as u8);
+            count += 1;
+        }
+        self.out[count_pos] = count;
+        // ---- grenades
+        let mut w = Wr::new(&mut self.out);
+        let nn = self.nades.len().min(40);
+        w.u8(nn as u8);
+        for n in self.nades.iter().take(nn) {
+            w.u16(n.id);
+            w.f32(n.pos.x);
+            w.f32(n.pos.y);
+            w.f32(n.pos.z);
+        }
+        // ---- events
+        let cpos = w.len();
+        w.u16(0);
+        let mut ecount = 0u16;
+        for e in &self.evs {
+            if e.to != 255 && e.to as usize != i {
+                continue;
+            }
+            if e.filt && dist_xz(e.x, e.z, center.x, center.z) > INTEREST {
+                continue;
+            }
+            let s = e.start as usize;
+            let l = e.len as usize;
+            self.out.extend_from_slice(&self.ev[s..s + l]);
+            ecount += 1;
+        }
+        self.out[cpos..cpos + 2].copy_from_slice(&ecount.to_le_bytes());
+        &self.out
+    }
+
+    /// Clear events after a snapshot round has been sent to everyone.
+    pub fn flush(&mut self) {
+        self.ev.clear();
+        self.evs.clear();
+    }
+}

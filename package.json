@@ -1,0 +1,22 @@
+{
+  "name": "zonefall",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Browser battle royale: Rust/WebAssembly simulation + raw WebGPU renderer + Cloudflare Durable Objects multiplayer",
+  "type": "module",
+  "scripts": {
+    "wasm": "cargo build --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml && node scripts/copy-wasm.mjs",
+    "dev": "npm run wasm && vite",
+    "build": "npm run wasm && tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "test": "cargo test --release --manifest-path core/Cargo.toml",
+    "typecheck:server": "npm --prefix server run typecheck",
+    "server:dev": "npm run wasm && npm run build && npm --prefix server run dev",
+    "server:deploy": "npm run build && npm --prefix server run deploy"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.74",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}

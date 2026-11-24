@@ -1,0 +1,27 @@
+name = "zonefall-server"
+main = "src/index.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+preview_urls = false
+
+[assets]
+directory = "../dist"
+binding = "ASSETS"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[durable_objects.bindings]]
+name = "LOBBY"
+class_name = "Lobby"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room", "Lobby"]
+
+[vars]
+ALLOWED_ORIGINS = "https://github30.github.io,http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
+
+[observability]
+enabled = true

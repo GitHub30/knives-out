@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss://zonefall-server.6u.workers.dev ws://localhost:* ws://127.0.0.1:*; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'" />
+    <meta name="theme-color" content="#0d1620" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="description" content="ZONEFALL — ブラウザで遊べるバトルロイヤル。Rust/WebAssembly のシミュレーションと WebGPU レンダラ、Cloudflare Durable Objects によるオンライン対戦。" />
+    <title>ZONEFALL — Battle Royale</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='none' stroke='%23ffb703' stroke-width='6'/%3E%3Ccircle cx='38' cy='28' r='9' fill='%2348cae4'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="view" tabindex="0"></canvas>
+      <div id="ui">
+        <section id="menu" class="screen hidden">
+          <div class="menu-card">
+            <h1 class="logo">ZONE<span>FALL</span></h1>
+            <p class="tagline">降下・略奪・生存。最後の一人を目指すバトルロイヤル</p>
+            <label class="field">
+              <span>プレイヤー名</span>
+              <input id="name" maxlength="14" autocomplete="off" spellcheck="false" placeholder="名前を入力" />
+            </label>
+            <div class="menu-buttons">
+              <button id="btn-solo" class="btn primary big">ソロ（ボット戦）</button>
+              <button id="btn-online" class="btn big">オンライン対戦</button>
+              <div class="room-row">
+                <input id="room-code" maxlength="12" autocomplete="off" spellcheck="false" placeholder="ルームコード" />
+                <button id="btn-room-new" class="btn small ghost" title="ランダムなコードを生成">生成</button>
+                <button id="btn-room" class="btn small">参加</button>
+              </div>
+              <div class="row2">
+                <button id="btn-settings" class="btn ghost">設定</button>
+                <button id="btn-help" class="btn ghost">操作方法</button>
+              </div>
+            </div>
+            <p class="tech">Rust → WebAssembly シミュレーション ・ WebGPU レンダラ ・ Cloudflare Durable Objects</p>
+          </div>
+        </section>
+
+        <section id="loading" class="screen hidden">
+          <div class="spinner"></div>
+          <p id="loading-msg">読み込み中…</p>
+        </section>
+
+        <section id="lobby" class="overlay hidden">
+          <div class="card">
+            <h2>マッチング中</h2>
+            <p id="lobby-room" class="muted"></p>
+            <p class="lobby-count" id="lobby-count">1 / 30</p>
+            <p id="lobby-time" class="muted"></p>
+            <div class="row2">
+              <button id="lobby-start" class="btn primary hidden">今すぐ開始（ホスト）</button>
+              <button id="lobby-leave" class="btn ghost">退出</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="pause" class="overlay hidden">
+          <div class="card">
+            <h2 id="pause-title">一時停止中</h2>
+            <div class="col">
+              <button id="btn-resume" class="btn primary">再開</button>
+              <button id="btn-pause-settings" class="btn">設定</button>
+              <button id="btn-quit" class="btn ghost">メニューに戻る</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="result" class="overlay hidden">
+          <div class="card result-card">
+            <h2 id="result-title">#1</h2>
+            <p id="result-sub" class="muted"></p>
+            <div class="stats">
+              <div><b id="result-kills">0</b><span>キル</span></div>
+              <div><b id="result-dmg">0</b><span>ダメージ</span></div>
+              <div><b id="result-time">0:00</b><span>生存時間</span></div>
+            </div>
+            <div class="col">
+              <button id="btn-again" class="btn primary">もう一度</button>
+              <button id="result-spect" class="btn">観戦する</button>
+              <button id="btn-menu" class="btn ghost">メニューへ</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="settings" class="overlay hidden">
+          <div class="card wide">
+            <h2>設定</h2>
+            <div class="settings-grid">
+              <label>マウス感度 <output id="s-sens-v"></output><input id="s-sens" type="range" min="0.2" max="3" step="0.05" /></label>
+              <label>スコープ時感度 <output id="s-ads-v"></output><input id="s-ads" type="range" min="0.3" max="1.5" step="0.05" /></label>
+              <label>タッチ視点感度 <output id="s-touch-v"></output><input id="s-touch" type="range" min="0.5" max="3.5" step="0.05" /></label>
+              <label>音量 <output id="s-vol-v"></output><input id="s-vol" type="range" min="0" max="1" step="0.05" /></label>
+              <label>ソロの参加人数 <output id="s-bots-v"></output><input id="s-bots" type="range" min="5" max="31" step="1" /></label>
+              <label>画質
+                <select id="s-quality">
+                  <option value="auto">自動</option>
+                  <option value="low">低（影なし）</option>
+                  <option value="medium">中</option>
+                  <option value="high">高（MSAA）</option>
+                </select>
+              </label>
+              <label>タッチ操作UI
+                <select id="s-touchui">
+                  <option value="auto">自動</option>
+                  <option value="on">常に表示</option>
+                  <option value="off">非表示</option>
+                </select>
+              </label>
+              <label class="check"><input id="s-autofire" type="checkbox" /> オート射撃（スマホ）</label>
+              <label class="check"><input id="s-adstoggle" type="checkbox" /> 右クリックのスコープを切替式に</label>
+              <label class="check"><input id="s-invert" type="checkbox" /> 上下反転</label>
+              <label class="check"><input id="s-fps" type="checkbox" /> FPS / Ping を表示</label>
+            </div>
+            <button class="btn primary" data-close="settings">閉じる</button>
+          </div>
+        </section>
+
+        <section id="help" class="overlay hidden">
+          <div class="card wide">
+            <h2>操作方法</h2>
+            <div class="help-cols">
+              <div>
+                <h3>PC</h3>
+                <ul>
+                  <li><kbd>W A S D</kbd> 移動 ／ <kbd>Shift</kbd> ダッシュ</li>
+                  <li><kbd>マウス</kbd> 視点 ／ <kbd>左クリック</kbd> 射撃 ／ <kbd>右クリック</kbd> スコープ</li>
+                  <li><kbd>Space</kbd> ジャンプ・飛行機から降下・パラシュート</li>
+                  <li><kbd>C</kbd> しゃがみ ／ <kbd>R</kbd> リロード ／ <kbd>F</kbd> 拾う</li>
+                  <li><kbd>1</kbd><kbd>2</kbd> 武器 ／ <kbd>3</kbd> 素手 ／ <kbd>ホイール</kbd> 切替</li>
+                  <li><kbd>4</kbd> 包帯 <kbd>5</kbd> 救急キット <kbd>6</kbd> ドリンク ／ <kbd>H</kbd> 自動回復</li>
+                  <li><kbd>G</kbd> グレネード ／ <kbd>M</kbd> マップ ／ <kbd>Esc</kbd> メニュー</li>
+                </ul>
+              </div>
+              <div>
+                <h3>スマホ（横持ち）</h3>
+                <ul>
+                  <li>画面左をドラッグ：移動スティック。上に大きく引いて離すとオートラン</li>
+                  <li>画面右をスワイプ：視点移動</li>
+                  <li>射撃ボタンは押したままドラッグで照準できます（左右両方にあります）</li>
+                  <li>スコープ・ジャンプ・しゃがみ・リロード・回復・グレネードは右側のボタン</li>
+                  <li>オート射撃（設定）：照準に敵が重なると自動で撃ちます</li>
+                </ul>
+              </div>
+            </div>
+            <h3>ルール</h3>
+            <p class="muted">飛行機から好きな場所に降下し、建物で武器・防具・回復アイテムを集めましょう。安全地帯（青い壁）の外にいるとダメージを受けます。最後の一人まで生き残れば勝利です。</p>
+            <button class="btn primary" data-close="help">閉じる</button>
+          </div>
+        </section>
+
+        <section id="error" class="overlay hidden">
+          <div class="card">
+            <h2>エラー</h2>
+            <p id="error-msg"></p>
+            <button id="error-ok" class="btn primary">OK</button>
+          </div>
+        </section>
+
+        <section id="nogpu" class="overlay hidden">
+          <div class="card">
+            <h2>WebGPU が利用できません</h2>
+            <p>このゲームは WebGPU で描画しています。Chrome / Edge の最新版、Safari 26 以降、Android 版 Chrome などでお試しください。</p>
+            <p id="nogpu-detail" class="muted"></p>
+          </div>
+        </section>
+
+        <div id="rotate">
+          <div class="rotate-icon">📱↻</div>
+          <p>端末を横向きにしてください</p>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

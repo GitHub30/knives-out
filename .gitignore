@@ -1,0 +1,12 @@
+node_modules/
+dist/
+core/target/
+public/core.wasm
+server/.wrangler/
+.wrangler/
+*.log
+.DS_Store
+.env
+.dev.vars
+server/src/core.wasm
+server/node_modules/

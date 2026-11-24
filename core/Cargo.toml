@@ -1,0 +1,19 @@
+[package]
+name = "zonefall-core"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic battle-royale simulation core (shared by browser client, offline worker and Cloudflare Durable Object server)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
