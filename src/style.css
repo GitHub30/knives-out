@@ -954,35 +954,41 @@ kbd {
 .tbtn.disabled {
   opacity: 0.4;
 }
+#touch {
+  --u: 1px;
+}
+@media (min-height: 560px) and (min-width: 900px) {
+  #touch {
+    --u: 1.3px;
+  }
+}
 .tb-fire {
-  width: 96px;
-  height: 96px;
-  right: calc(4vw + var(--safe-r));
-  bottom: calc(16vh + var(--safe-b));
+  width: calc(92 * var(--u));
+  height: calc(92 * var(--u));
+  right: calc(22 * var(--u) + var(--safe-r));
+  bottom: calc(64 * var(--u) + var(--safe-b));
   border-color: rgba(255, 120, 90, 0.8);
   background: rgba(200, 60, 40, 0.28);
 }
 .tb-fireL {
-  width: 66px;
-  height: 66px;
-  left: calc(3vw + var(--safe-l));
+  width: calc(64 * var(--u));
+  height: calc(64 * var(--u));
+  left: calc(22 * var(--u) + var(--safe-l));
   top: 30vh;
   border-color: rgba(255, 120, 90, 0.8);
   background: rgba(200, 60, 40, 0.24);
 }
-.tb-ads {
-  right: calc(4vw + 108px + var(--safe-r));
-  bottom: calc(30vh + var(--safe-b));
-}
 .tb-jump {
-  right: calc(3vw + var(--safe-r));
-  bottom: calc(16vh + 112px + var(--safe-b));
+  width: calc(56 * var(--u));
+  height: calc(56 * var(--u));
+  right: calc(30 * var(--u) + var(--safe-r));
+  bottom: calc(162 * var(--u) + var(--safe-b));
 }
 .tb-jump.big {
-  width: 96px;
-  height: 96px;
-  right: calc(4vw + var(--safe-r));
-  bottom: calc(16vh + var(--safe-b));
+  width: calc(92 * var(--u));
+  height: calc(92 * var(--u));
+  right: calc(22 * var(--u) + var(--safe-r));
+  bottom: calc(64 * var(--u) + var(--safe-b));
   border-color: var(--accent);
   background: rgba(255, 183, 3, 0.25);
 }
@@ -994,36 +1000,44 @@ kbd {
   font-weight: 800;
   text-shadow: 0 1px 3px #000;
 }
+.tb-ads {
+  width: calc(58 * var(--u));
+  height: calc(58 * var(--u));
+  right: calc(128 * var(--u) + var(--safe-r));
+  bottom: calc(140 * var(--u) + var(--safe-b));
+}
 .tb-crouch {
-  right: calc(4vw + 118px + var(--safe-r));
-  bottom: calc(5vh + var(--safe-b));
+  width: calc(54 * var(--u));
+  height: calc(54 * var(--u));
+  right: calc(128 * var(--u) + var(--safe-r));
+  bottom: calc(16 * var(--u) + var(--safe-b));
 }
 .tb-reload {
-  width: 50px;
-  height: 50px;
-  right: calc(4vw + 190px + var(--safe-r));
-  bottom: calc(13vh + var(--safe-b));
+  width: calc(50 * var(--u));
+  height: calc(50 * var(--u));
+  right: calc(196 * var(--u) + var(--safe-r));
+  bottom: calc(70 * var(--u) + var(--safe-b));
 }
 .tb-nade {
-  width: 48px;
-  height: 48px;
-  right: calc(4vw + 186px + var(--safe-r));
-  bottom: calc(30vh + 18px + var(--safe-b));
+  width: calc(46 * var(--u));
+  height: calc(46 * var(--u));
+  right: calc(200 * var(--u) + var(--safe-r));
+  bottom: calc(136 * var(--u) + var(--safe-b));
 }
 .tb-heal {
-  width: 50px;
-  height: 50px;
-  right: calc(4vw + 112px + var(--safe-r));
-  bottom: calc(30vh + 76px + var(--safe-b));
+  width: calc(48 * var(--u));
+  height: calc(48 * var(--u));
+  right: calc(150 * var(--u) + var(--safe-r));
+  bottom: calc(210 * var(--u) + var(--safe-b));
 }
 .tb-pickup {
   width: auto;
   min-width: 120px;
-  height: 46px;
+  height: calc(46 * var(--u));
   border-radius: 23px;
   padding: 0 16px;
-  right: 34vw;
-  bottom: 40vh;
+  right: calc(262 * var(--u) + var(--safe-r));
+  bottom: calc(190 * var(--u) + var(--safe-b));
   border-color: var(--accent2);
   background: rgba(30, 110, 140, 0.45);
 }
@@ -1040,10 +1054,10 @@ kbd {
   font-size: 12px;
 }
 .tb-map {
-  width: 44px;
-  height: 44px;
-  right: calc(12px + var(--safe-r));
-  top: calc(150px + var(--safe-t));
+  width: 42px;
+  height: 42px;
+  right: calc(134px + var(--safe-r));
+  top: calc(12px + var(--safe-t));
 }
 .tb-menu {
   width: 40px;
@@ -1105,12 +1119,8 @@ kbd {
     left: calc(60px + var(--safe-l));
   }
   .minimap {
-    width: 124px;
-    height: 124px;
-  }
-  .killfeed {
-    top: calc(196px + var(--safe-t));
-    font-size: 11px;
+    width: 112px;
+    height: 112px;
   }
   .compass {
     width: min(260px, 32vw);
@@ -1139,7 +1149,19 @@ kbd {
   .toast {
     bottom: calc(86px + var(--safe-b));
   }
-  .tb-map {
-    top: calc(142px + var(--safe-t));
+  .killfeed {
+    top: calc(70px + var(--safe-t));
+    right: auto;
+    left: 50%;
+    transform: translateX(-50%);
+    align-items: center;
+    font-size: 11px;
+  }
+  .kf:nth-last-child(n + 4) {
+    display: none;
+  }
+  .spect {
+    top: auto;
+    bottom: calc(96px + var(--safe-b));
   }
 }
