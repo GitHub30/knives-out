@@ -377,6 +377,11 @@ async function boot() {
     };
     requestAnimationFrame(countFrames);
     (window as unknown as { __zfFrames: () => number }).__zfFrames = () => frames;
+    // Test hooks for the end-to-end prediction / input harnesses.
+    Object.defineProperty(window, '__game', { get: () => game });
+    Object.defineProperty(window, '__input', { get: () => input });
+    Object.defineProperty(window, '__hud', { get: () => hud });
+    Object.defineProperty(window, '__settings', { get: () => settings });
     (window as unknown as { __zfCapture: () => Promise<string> }).__zfCapture = async () => {
       const img = await renderer.capture();
       const c = document.createElement('canvas');

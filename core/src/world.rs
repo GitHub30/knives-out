@@ -488,6 +488,18 @@ impl World {
 
     /// True if a loot spot at (x,y,z) would sit inside or right against a box
     /// (checks boxes from index `from`, the grid is not built yet).
+    /// True if a small item at (x, y, z) keeps `m` metres from every solid
+    /// box (walls, crates, containers, props).
+    pub fn item_spot_clear(&self, x: f32, y: f32, z: f32, m: f32) -> bool {
+        let mut clear = true;
+        self.for_boxes(x - m, z - m, x + m, z + m, |b| {
+            if b.kind != BK_FLOOR && x > b.min.x - m && x < b.max.x + m && z > b.min.z - m && z < b.max.z + m && y > b.min.y - 0.2 && y < b.max.y + 0.2 {
+                clear = false;
+            }
+        });
+        clear
+    }
+
     fn spot_blocked(&self, x: f32, y: f32, z: f32, from: usize) -> bool {
         let m = 0.35;
         self.boxes[from..].iter().any(|b| {
@@ -949,7 +961,7 @@ impl World {
             if p.x < -60.0 || p.z < -60.0 || p.x > MAP + 60.0 || p.z > MAP + 60.0 {
                 return None;
             }
-            let step = (above * 0.3).max(0.5);
+            let step = (above * 0.45).max(0.6);
             let nt = (t + step).min(maxt);
             let q = o + d * nt;
             if q.y - self.height(q.x, q.z) < 0.0 {

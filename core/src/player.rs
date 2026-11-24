@@ -139,7 +139,15 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             }
         }
         MODE_GROUND => {
-            s.crouch = c.has(B_CROUCH) && !s.in_water;
+            let want_crouch = c.has(B_CROUCH) && !s.in_water;
+            if s.crouch && !want_crouch && !s.in_water {
+                // stand up only with headroom (never into a roof or lintel)
+                let stand = body_h(false);
+                let blocked = w.ceiling(s.pos.x, s.pos.z, s.pos.y, body_h(true), P_RADIUS).map_or(false, |cy| cy < s.pos.y + stand);
+                s.crouch = blocked;
+            } else {
+                s.crouch = want_crouch;
+            }
             let ads = c.has(B_ADS);
             let sprint = c.has(B_SPRINT) && c.mz > 0.3 && !ads && !s.crouch;
             let mut speed: f32 = if s.crouch {
@@ -185,6 +193,7 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             w.collide_body(&mut np, P_RADIUS, hgt);
             let g = w.ground_below(np.x, np.z, prev.y.max(np.y), P_RADIUS);
             let was_ground = s.on_ground;
+            let (free_y, free_vy, ev0) = (np.y, s.vel.y, ev);
             if np.y <= g {
                 np.y = g;
                 if s.vel.y < 0.0 {
@@ -202,7 +211,22 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             }
             if np.y > prev.y + 0.01 {
                 // stepped or jumped up: the taller body may now touch something
+                let (bx, bz) = (np.x, np.z);
                 w.collide_body(&mut np, P_RADIUS, hgt);
+                if s.on_ground && (np.x != bx || np.z != bz) {
+                    // Pushed back off the step it just snapped onto (a window
+                    // sill): redo the ground test where the body really is,
+                    // instead of standing in mid-air.
+                    let g2 = w.ground_below(np.x, np.z, prev.y.max(free_y), P_RADIUS);
+                    if free_y <= g2 || (was_ground && free_vy <= 0.0 && free_y - g2 < 0.6) {
+                        np.y = g2;
+                    } else {
+                        np.y = free_y;
+                        s.vel.y = free_vy;
+                        s.on_ground = false;
+                        ev = ev0;
+                    }
+                }
             }
             // deep water: float at the surface
             if g < WATER - 1.2 {

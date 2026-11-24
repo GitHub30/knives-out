@@ -151,6 +151,8 @@ export class Game {
   private matchStartTime = 0;
   private welcomeWait: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private visHandler = () => this.onVisibility();
+  /** Keep-alive that also runs in background tabs (rAF stops there). */
+  private keepAlive: ReturnType<typeof setInterval> | null = null;
 
   constructor(deps: GameDeps) {
     this.d = deps;
@@ -166,6 +168,12 @@ export class Game {
       this.welcomeWait?.reject(new Error(reason));
     };
     document.addEventListener('visibilitychange', this.visHandler);
+    this.keepAlive = setInterval(() => {
+      if (this.running && performance.now() - this.pingSent > 9000) {
+        this.pingSent = performance.now();
+        this.send(P.encodePing(this.pingSent >>> 0));
+      }
+    }, 10000);
     return new Promise<void>((resolve, reject) => {
       this.welcomeWait = { resolve, reject };
       setTimeout(() => reject(new Error('サーバーからの応答がありません')), 15000);
@@ -175,6 +183,8 @@ export class Game {
   destroy() {
     this.running = false;
     cancelAnimationFrame(this.raf);
+    if (this.keepAlive) clearInterval(this.keepAlive);
+    this.keepAlive = null;
     document.removeEventListener('visibilitychange', this.visHandler);
     this.d.transport.close();
     this.d.sound.loop('plane', 0);
@@ -344,8 +354,16 @@ export class Game {
       case 'shot': {
         const mine = e.shooter === this.myId;
         if (!mine) {
-          this.spawnTracer(e.from, e.to, e.weapon);
-          this.spawnFlash(e.from);
+          if (e.shooter === 255) {
+            // a shooter we cannot see: the server only sends a coarse origin,
+            // so draw just the last part of the tracer and no muzzle flash
+            const k = 0.6;
+            const mid: V3 = [lerp(e.from[0], e.to[0], k), lerp(e.from[1], e.to[1], k), lerp(e.from[2], e.to[2], k)];
+            this.spawnTracer(mid, e.to, e.weapon);
+          } else {
+            this.spawnTracer(e.from, e.to, e.weapon);
+            this.spawnFlash(e.from);
+          }
           const d = Math.hypot(e.from[0] - this.camEye[0], e.from[1] - this.camEye[1], e.from[2] - this.camEye[2]);
           snd.shot(e.weapon, d, this.panOf(e.from));
           if (d < 260) this.markers.push({ x: e.from[0], z: e.from[2], t: this.time });
@@ -434,7 +452,8 @@ export class Game {
 
   private finish(s: P.Snapshot) {
     this.ended = true;
-    const won = s.winner === this.myId && s.self.alive;
+    // the server names a dead winner only when the last players died together
+    const won = s.winner === this.myId;
     if (won) {
       this.d.hud.showBanner('🏆 チャンピオン！ 最後の生存者', 6, 'win');
       this.d.sound.ui('win');
@@ -926,6 +945,14 @@ export class Game {
         this.d.touch.releaseAll();
         this.d.onPause(true);
       }
+    } else if (e.lockLost && !this.paused && !this.d.hud.mapOpen && !this.ended) {
+      // The browser released the mouse (Esc, tab switch): open the menu. A
+      // stale edge from a hidden tab must not un-pause the game on return.
+      if (this.d.transport.kind === 'offline') this.setPaused(true);
+      else {
+        this.d.touch.releaseAll();
+        this.d.onPause(true);
+      }
     }
     if (e.map) this.toggleMap(!this.d.hud.mapOpen);
     if (!this.paused) this.mergeEdges(e);
@@ -949,8 +976,7 @@ export class Game {
 
     // commands at 30 Hz (none while the offline match is paused: the local
     // server is frozen, so predicting ahead would only snap back later)
-    if (this.paused) this.cmdAcc = 0;
-    else this.cmdAcc += dt;
+    if (!this.paused) this.cmdAcc += dt;
     let n = 0;
     while (this.cmdAcc >= DT && n < 4) {
       this.cmdAcc -= DT;

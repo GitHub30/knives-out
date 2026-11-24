@@ -5,7 +5,7 @@
 interface SrvExports {
   memory: WebAssembly.Memory;
   in_ptr(): number;
-  srv_init(seed: number, slots: number, flags: number, secret: number): void;
+  srv_init(seed: number, slots: number, flags: number, s0: number, s1: number, s2: number, s3: number): void;
   srv_add(len: number): number;
   srv_msg(pid: number, len: number): void;
   srv_step(): number;
@@ -65,7 +65,8 @@ ctx.onmessage = async (e: MessageEvent) => {
     if (m.t === 'init') {
       const inst = await WebAssembly.instantiate(m.module as WebAssembly.Module, {});
       ex = inst.exports as unknown as SrvExports;
-      ex.srv_init(m.seed >>> 0, m.slots | 0, 1, crypto.getRandomValues(new Uint32Array(1))[0]);
+      const sec = crypto.getRandomValues(new Uint32Array(4));
+      ex.srv_init(m.seed >>> 0, m.slots | 0, 1, sec[0], sec[1], sec[2], sec[3]);
       const name = new TextEncoder().encode(String(m.name)).slice(0, 48);
       new Uint8Array(ex.memory.buffer, ex.in_ptr(), name.length).set(name);
       pid = ex.srv_add(name.length);

@@ -52,6 +52,9 @@ pub struct Brain {
     pub ignore_i: u8,
     /// Time spent standing next to the goal item without getting it.
     pub near_t: f32,
+    /// Closest the bot has got to its goal item, and time since it improved.
+    pub prog_d: f32,
+    pub prog_t: f32,
 }
 
 impl Brain {
@@ -292,6 +295,8 @@ fn plan_path(m: &Match, b: &mut Brain, from: V3, to: (f32, f32), kind: u8) {
     if !same {
         b.goal_t = 0.0;
         b.near_t = 0.0;
+        b.prog_d = f32::MAX;
+        b.prog_t = 0.0;
     }
     b.goal = to;
     b.goal_kind = kind;
@@ -387,20 +392,24 @@ fn choose_goal(m: &Match, i: usize, b: &mut Brain) {
 
 /// Returns true when the final waypoint is reached.
 fn follow(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd, face: Option<f32>) -> bool {
-    if b.path_i >= b.path_n {
-        return true;
-    }
     let p = &m.players[i];
     let pos = p.ms.pos;
-    let (wx, wz) = b.path[b.path_i as usize];
-    let dx = wx - pos.x;
-    let dz = wz - pos.z;
-    let d = (dx * dx + dz * dz).sqrt();
-    let last = b.path_i + 1 == b.path_n;
-    if d < if last { 1.0 } else { 0.8 } {
-        b.path_i += 1;
-        return b.path_i >= b.path_n;
-    }
+    // skip every waypoint already reached and steer toward the next one in
+    // the same tick (a re-plan must never produce a standing-still tick)
+    let (dx, dz, d) = loop {
+        if b.path_i >= b.path_n {
+            return true;
+        }
+        let (wx, wz) = b.path[b.path_i as usize];
+        let (dx, dz) = (wx - pos.x, wz - pos.z);
+        let d = (dx * dx + dz * dz).sqrt();
+        let last = b.path_i + 1 == b.path_n;
+        if d < if last { 1.0 } else { 0.8 } {
+            b.path_i += 1;
+            continue;
+        }
+        break (dx, dz, d);
+    };
     let mut want = yaw_to(dx, dz);
     if b.avoid_t > 0.0 {
         want += b.avoid;
@@ -481,7 +490,6 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     b.strafe_t -= DT;
     b.aim_t -= DT;
     b.heard_t -= DT;
-    b.goal_t += DT;
     b.think_t -= DT;
     b.avoid_t -= DT;
 
@@ -548,7 +556,35 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     }
 
     // ---- goals
-    if b.think_t <= 0.0 || b.path_i >= b.path_n || b.goal_t > 30.0 {
+    b.goal_t += DT;
+    // an item that stays out of reach (no progress for 6 s, or 30 s in all)
+    // is given up once, instead of being re-planned every tick
+    if b.goal_kind == 1 && b.path_i < b.path_n {
+        // remaining path length (walking around to a door is progress too)
+        let k0 = b.path_i as usize;
+        let mut d = dist_xz(b.path[k0].0, b.path[k0].1, pos.x, pos.z);
+        for k in k0 + 1..b.path_n as usize {
+            d += dist_xz(b.path[k].0, b.path[k].1, b.path[k - 1].0, b.path[k - 1].1);
+        }
+        if d < b.prog_d - 0.5 {
+            b.prog_d = d;
+            b.prog_t = 0.0;
+        } else {
+            b.prog_t += DT;
+        }
+    }
+    if b.goal_t > 30.0 || (b.goal_kind == 1 && b.prog_t > 6.0) {
+        if b.goal_kind == 1 {
+            b.ignore[b.ignore_i as usize % 8] = b.goal_item;
+            b.ignore_i = b.ignore_i.wrapping_add(1);
+        }
+        b.goal_kind = 0;
+        b.goal_t = 0.0;
+        b.near_t = 0.0;
+        b.prog_t = 0.0;
+        b.think_t = 0.0;
+    }
+    if b.think_t <= 0.0 || b.path_i >= b.path_n {
         b.think_t = 1.5 + b.rng.f();
         choose_goal(m, i, b);
     } else if b.goal_kind == 1 && !m.items.get(b.goal_item as usize).map_or(false, |it| it.alive) {
@@ -611,7 +647,7 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let q = &m.players[b.target as usize];
     let pos = p.ms.pos;
     let eye = pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
-    let aim_h = if b.skill > 0.7 && b.rng.chance(0.02) { 1.62 } else if q.ms.crouch { 0.85 } else { 1.2 };
+    let aim_h = if b.skill > 0.7 && b.rng.chance(0.02) { eye_h(q.ms.crouch) + 0.05 } else if q.ms.crouch { 0.85 } else { 1.2 };
     // lead the target a little based on skill
     let lead = q.ms.vel * (0.06 * b.skill);
     let tp = q.ms.pos + V3::new(0.0, aim_h, 0.0) + lead;
@@ -709,13 +745,47 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
         move_dir(c, c.yaw, z.cx - pos.x, z.cz - pos.z, 1.0);
     }
     // throw a grenade at targets behind light cover
-    if p.nades > 0 && (9.0..17.5).contains(&dist) && b.rng.chance(0.006) {
-        // range = v^2 sin(2a) / g with v = 19, g = 20; server adds +0.25 rad
-        let dh = dist_xz(q.ms.pos.x, q.ms.pos.z, pos.x, pos.z);
-        let k = clampf(20.0 * dh / (19.0 * 19.0), 0.0, 1.0);
-        let a = 0.5 * k.asin();
-        c.pitch = clampf(a - 0.25, -1.2, 1.2);
+    let dh = dist_xz(q.ms.pos.x, q.ms.pos.z, pos.x, pos.z);
+    if p.nades > 0 && (9.0..23.0).contains(&dh) && b.rng.chance(0.006) {
+        c.pitch = nade_pitch(dh);
         c.buttons &= !B_FIRE;
         c.buttons |= B_NADE;
     }
+}
+
+/// Where a grenade explodes (after its bounce and roll) by aim pitch on flat
+/// ground, measured with the simulation's own grenade physics.
+const NADE_TABLE: [(f32, f32); 16] = [
+    (8.0, -0.50),
+    (8.7, -0.40),
+    (10.1, -0.30),
+    (11.2, -0.25),
+    (11.9, -0.20),
+    (13.3, -0.15),
+    (14.6, -0.10),
+    (15.5, -0.05),
+    (16.8, 0.00),
+    (17.7, 0.05),
+    (19.1, 0.10),
+    (19.8, 0.15),
+    (20.7, 0.20),
+    (22.3, 0.25),
+    (23.4, 0.35),
+    (23.7, 0.40),
+];
+
+/// Aim pitch that makes a grenade explode `dist` metres away.
+pub fn nade_pitch(dist: f32) -> f32 {
+    let t = &NADE_TABLE;
+    if dist <= t[0].0 {
+        return t[0].1;
+    }
+    for k in 1..t.len() {
+        if dist <= t[k].0 {
+            let (d0, p0) = t[k - 1];
+            let (d1, p1) = t[k];
+            return p0 + (p1 - p0) * (dist - d0) / (d1 - d0);
+        }
+    }
+    t[t.len() - 1].1
 }

@@ -119,7 +119,9 @@ export function emitCharacter(I: Instances, c: CharState) {
   const moving = c.speed > 0.4 && c.onGround && !dead;
   const amp = moving ? Math.min(c.speed / 5, 1.35) * 0.62 : 0;
   const sprint = c.speed > 6.2;
-  let lean = crouch ? 0.35 : sprint ? 0.22 : 0.05;
+  // crouched: knees bent, back nearly upright so the head stays over the
+  // body axis where the server's head hitbox is
+  let lean = crouch ? 0.15 : sprint ? 0.22 : 0.05;
   if (dead || freefall || para) lean = 0;
 
   const hips = child(T0, [0, hipH, 0], qIdent());

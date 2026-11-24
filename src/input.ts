@@ -10,9 +10,11 @@ export interface Edges {
   slot: number; // -1 none, 0/1 weapon slot, 2 fists, 9 = cycle next, 8 = cycle prev
   map: boolean;
   menu: boolean;
+  /** The browser released pointer lock without the game asking (Esc, tab switch). */
+  lockLost: boolean;
 }
 
-const emptyEdges = (): Edges => ({ jump: false, reload: false, pickup: false, spect: false, nade: false, heal: 0, slot: -1, map: false, menu: false });
+const emptyEdges = (): Edges => ({ jump: false, reload: false, pickup: false, spect: false, nade: false, heal: 0, slot: -1, map: false, menu: false, lockLost: false });
 
 export class Input {
   // continuous state
@@ -87,8 +89,9 @@ export class Input {
       if (!this.pointerLocked) {
         this.mouseFire = false;
         this.mouseAds = false;
-        // Browsers swallow Esc to release pointer lock: treat that as "menu".
-        if (was && this.enabled && !this.expectUnlock) this.edges.menu = true;
+        // Browsers swallow Esc to release pointer lock: open the menu (never
+        // toggle it, the edge may only be read after a hidden tab returns).
+        if (was && this.enabled && !this.expectUnlock) this.edges.lockLost = true;
       }
       this.expectUnlock = false;
     });

@@ -75,10 +75,13 @@ pub extern "C" fn proto_version() -> u32 {
 // Server
 // ----------------------------------------------------------------------------
 
-/// `seed` is sent to clients; `secret` must stay on the server.
+/// `seed` is sent to clients; the four secret words (128 bits of server
+/// entropy: match RNG + combat RNG) must stay on the server.
 #[no_mangle]
-pub extern "C" fn srv_init(seed: u32, slots: u32, flags: u32, secret: u32) {
-    let m = sim::Match::new(seed, slots as usize, flags, secret);
+pub extern "C" fn srv_init(seed: u32, slots: u32, flags: u32, s0: u32, s1: u32, s2: u32, s3: u32) {
+    let secret = (s0 as u64) | ((s1 as u64) << 32);
+    let combat = (s2 as u64) | ((s3 as u64) << 32);
+    let m = sim::Match::with_secrets(seed, slots as usize, flags, secret, combat);
     unsafe {
         *addr_of_mut!(SERVER) = Some(Box::new(m));
     }
@@ -360,7 +363,7 @@ mod tests {
     #[test]
     fn full_bot_match_finishes() {
         for seed in [3u32, 11, 58] {
-            let mut m = Match::new(seed, 24, FLAG_OFFLINE, seed ^ 0xABCD);
+            let mut m = Match::new(seed, 24, FLAG_OFFLINE, (seed ^ 0xABCD) as u64);
             let pid = m.add_human(b"Tester").unwrap();
             let mut ticks = 0u32;
             let mut ended = false;

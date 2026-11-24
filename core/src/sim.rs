@@ -7,11 +7,29 @@ use crate::player::*;
 use crate::rng::Rng;
 use crate::world::*;
 
-pub const PROTO: u16 = 4;
+pub const PROTO: u16 = 5;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
 pub const CMDQ_CAP: usize = 8;
+/// Ticks of late input absorbed before the server simulates a player without it.
+pub const LAG_GRACE: u8 = 3;
+/// Late commands covered by idle steps must arrive within this many ticks.
+const DEBT_TTL: u8 = 10;
+const DEBT_MAX: u8 = 16;
+/// Idle steps keep the last movement input for this many ticks, then stop.
+const IDLE_REPEAT: u8 = 6;
+/// If the lag never returns to zero for this long, take one idle step.
+const DRIFT_T: u16 = 60;
+/// More than this many commands left queued for BACKLOG_T ticks: drop one.
+const BACKLOG_MAX: usize = 3;
+const BACKLOG_T: u8 = 30;
+/// Lag compensation: the most a shot may be rewound, and how far above the
+/// player's recent minimum rewind a single command may claim.
+pub const REWIND_MAX: f32 = 15.0;
+const REWIND_MARGIN: f32 = 4.0;
+/// Buttons that act on a single command (carried over when one is dropped).
+const EDGE_BUTTONS: u16 = B_JUMP | B_RELOAD | B_PICKUP | B_SPECT | B_NADE | B_FIRE;
 /// ADS with at least this zoom is a first-person scope.
 pub const SCOPE_ZOOM: f32 = 3.5;
 
@@ -45,6 +63,15 @@ const ICW: f32 = MAP / ICH as f32;
 pub const ITEM_SYNC_R: f32 = 190.0;
 /// Players closer than this are always sent; farther ones need line of sight.
 const ALWAYS_SEND_R: f32 = 40.0;
+/// Item changes are logged; each viewer gets a change once it is near it or
+/// can see the player who made it.
+const ILOG: usize = 1024;
+/// A chunk is only resynced to a viewer when it holds no change younger than
+/// this that the viewer was not allowed to see.
+const ITEM_QUIET: u32 = 300;
+/// Hidden shooters: shots farther than this are not sent, nearer ones only
+/// with a coarse position and no shooter id.
+const HIDDEN_SHOT_R: f32 = 330.0;
 
 #[inline]
 pub fn item_chunk(x: f32, z: f32) -> usize {
@@ -71,6 +98,16 @@ pub struct Item {
     pub amount: u16,
     pub pos: V3,
     pub alive: bool,
+}
+
+/// One item change (state after the change), with who caused it.
+#[derive(Clone, Copy, Default)]
+struct ILogE {
+    tick: u32,
+    id: u16,
+    actor: u8,
+    chunk: u8,
+    it: Item,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -124,10 +161,31 @@ pub struct Player {
     pub acked_seq: u32,
     /// Commands waiting to be simulated, one per tick.
     pub cmdq: std::collections::VecDeque<Cmd>,
-    /// Server-time budget: +1 per tick (capped), -1 per simulated command.
-    pub cmd_budget: u8,
+    /// Server ticks not yet simulated for this player (see `step_humans`).
+    /// Every simulated step costs one, so steps always stay within
+    /// [elapsed ticks - LAG_GRACE - 1, elapsed ticks].
+    pub lag: u8,
+    /// Idle steps taken while input was late: that many late commands that
+    /// arrive in the following burst are dropped instead of simulated.
+    pub debt: u8,
+    pub debt_ttl: u8,
+    /// Edge buttons of dropped commands, merged into the next simulated one.
+    pub carry: u16,
+    /// Consecutive idle steps (movement is only extrapolated briefly).
+    pub idle_run: u8,
+    /// Ticks the lag has stayed above zero (slow drift back to real time).
+    pub lag_hi_t: u16,
+    /// Ticks the queue has held more than BACKLOG_MAX commands.
+    pub backlog_t: u8,
+    /// Recent minimum of the rewind (ticks) this client claims for its view.
+    pub rew_floor: f32,
     pub cmds_applied: u32,
+    pub idle_steps: u32,
     pub last_cmd: Cmd,
+    /// Buttons of the previous simulated command (press-edge detection).
+    pub prev_buttons: u16,
+    pub pick_cd: f32,
+    pub spect_cd: f32,
     pub spect: u8,
     pub brain: crate::bot::Brain,
     pub hurt_by: u8,
@@ -137,6 +195,10 @@ pub struct Player {
     pub snap_round: u32,
     /// Item chunk versions this player's client has been sent.
     pub item_ver: Vec<u32>,
+    /// Item log entries already sent (bit per ring slot); entries before
+    /// `ilog_from` were covered by the welcome.
+    ilog_sent: [u64; ILOG / 64],
+    ilog_from: u32,
     /// Last tick each other player was visible to this viewer / was checked.
     pub seen_tick: [u32; MAX_PLAYERS],
     pub vis_check: [u32; MAX_PLAYERS],
@@ -237,11 +299,15 @@ struct EvRec {
     x: f32,
     z: f32,
     filt: bool,
+    /// E_SHOT: the shooter (hidden shooters are anonymised per viewer).
+    shooter: u8,
 }
 
 pub struct Match {
     pub w: World,
     pub rng: Rng,
+    /// Shot spread only (see `with_secrets`).
+    crng: Rng,
     pub tick: u32,
     pub phase: u8,
     pub lobby_t: f32,
@@ -264,47 +330,91 @@ pub struct Match {
     pub out: Vec<u8>,
     pub ended_flag: bool,
     pub chunk_ver: Vec<u32>,
+    /// Tick of the last item change per chunk.
+    chunk_tick: Vec<u32>,
+    ilog: Vec<ILogE>,
+    ilog_n: u32,
+    /// Player whose action is changing items right now (255 = none).
+    item_actor: u8,
     /// Alive count at the start of the current tick (shared placement).
     pub alive_start: usize,
 }
 
-fn bad_name_char(ch: char) -> bool {
-    let c = ch as u32;
-    ch.is_control()
-        || matches!(ch, '<' | '>' | '&' | '"' | '\'' | '`' | '\\' | '\u{FFFD}')
-        || (0x0300..=0x036F).contains(&c) // combining diacritics (zalgo)
-        || (0x1AB0..=0x1AFF).contains(&c)
-        || (0x1DC0..=0x1DFF).contains(&c)
-        || (0x20D0..=0x20FF).contains(&c)
-        || (0xFE20..=0xFE2F).contains(&c)
-        || (0x200B..=0x200F).contains(&c) // zero-width, LRM/RLM
-        || (0x2028..=0x202E).contains(&c) // separators, bidi embeddings/overrides
-        || (0x2060..=0x206F).contains(&c) // word joiner, bidi isolates, invisible ops
-        || (0xFE00..=0xFE0F).contains(&c) // variation selectors
-        || (0xFFF0..=0xFFFF).contains(&c)
-        || (0xE0000..=0xE01EF).contains(&c) // tags, variation selectors supplement
-        || matches!(c, 0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180E | 0x2800 | 0x3164 | 0xFEFF | 0xFFA0)
+/// Name characters: 0 = dropped, 1 = base character, 2 = combining mark,
+/// 3 = space. A whitelist of letters, digits, punctuation and symbols of
+/// common scripts: control, format, private-use, unassigned and invisible
+/// filler characters are all dropped.
+fn name_char_class(c: u32) -> u8 {
+    match c {
+        0x20 | 0xA0 | 0x2000..=0x200A | 0x205F | 0x3000 => 3,
+        0x22 | 0x26 | 0x27 | 0x3C | 0x3E | 0x5C | 0x60 => 0, // " & ' < > \ `
+        0x21..=0x7E => 1,
+        0xA1..=0xAC | 0xAE..=0x2AF => 1,          // Latin-1 (no soft hyphen), Latin ext., IPA
+        0x300..=0x36F => 2,                         // combining diacritics
+        0x370..=0x377 | 0x37A..=0x37F | 0x384..=0x38A | 0x38C | 0x38E..=0x3A1 | 0x3A3..=0x3FF => 1, // Greek
+        0x400..=0x482 | 0x48A..=0x52F => 1,         // Cyrillic
+        0x483..=0x489 => 2,
+        0x531..=0x556 | 0x561..=0x587 => 1,         // Armenian
+        0x591..=0x5BD | 0x5BF | 0x5C1..=0x5C2 | 0x5C4..=0x5C5 | 0x5C7 => 2, // Hebrew points
+        0x5D0..=0x5EA => 1,
+        0x620..=0x64A | 0x660..=0x669 | 0x671..=0x6D3 => 1, // Arabic
+        0x64B..=0x65F | 0x670 => 2,
+        0x900..=0x903 | 0x93A..=0x93C | 0x93E..=0x94F | 0x951..=0x957 | 0x962..=0x963 => 2, // Devanagari signs
+        0x904..=0x939 | 0x93D | 0x950 | 0x958..=0x961 | 0x964..=0x97F => 1,
+        0xE31 | 0xE34..=0xE3A | 0xE47..=0xE4E => 2, // Thai marks
+        0xE01..=0xE30 | 0xE32..=0xE33 | 0xE3F..=0xE46 | 0xE4F..=0xE5B => 1,
+        0x1E00..=0x1EFF => 1,                       // Latin extended additional (Vietnamese)
+        0x2010..=0x2027 | 0x2030..=0x205E => 1,     // punctuation (no separators / bidi / invisible)
+        0x2070..=0x2071 | 0x2074..=0x208E | 0x2090..=0x209C => 1,
+        0x20A0..=0x20C0 | 0x2100..=0x218B | 0x2190..=0x23FF | 0x2460..=0x27BF | 0x27C0..=0x2BFF => 1,
+        0x2E80..=0x2FDF => 1,                       // CJK radicals
+        0x302A..=0x302F | 0x3099..=0x309A => 2,
+        0x3001..=0x3029 | 0x3030..=0x303F => 1,     // CJK punctuation
+        0x3041..=0x3096 | 0x309B..=0x30FF => 1,     // kana
+        0x3105..=0x312F | 0x3131..=0x3163 | 0x3165..=0x318E | 0x3190..=0x31FF => 1, // (no Hangul filler)
+        0x3200..=0x4DBF | 0x4DC0..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F => 1,
+        0xFF01..=0xFF5E | 0xFF61..=0xFF9F | 0xFFE0..=0xFFEE => 1, // full/halfwidth (no halfwidth filler)
+        0x1F3FB..=0x1F3FF => 2,                     // emoji skin tones modify the previous emoji
+        0x1F000..=0x1FAFF => 1,                     // emoji and symbols
+        0x20000..=0x2FFFF => 1,                     // CJK extensions
+        _ => 0,
+    }
 }
+
+/// At most this many combining marks per base character (accents, Thai and
+/// Indic vowel signs), so names cannot stack marks into the rows above.
+const NAME_MARKS: u32 = 2;
 
 fn sanitize_name(raw: &[u8], fallback: &str) -> String {
     let s = String::from_utf8_lossy(raw);
     let mut out = String::new();
     let mut count = 0;
     let mut last_space = true;
+    let mut marks = NAME_MARKS; // no base character yet: no marks allowed
     for ch in s.chars() {
-        if bad_name_char(ch) {
-            continue;
-        }
-        let space = ch.is_whitespace();
-        if space {
-            if last_space {
+        match name_char_class(ch as u32) {
+            1 => {
+                out.push(ch);
+                last_space = false;
+                marks = 0;
+            }
+            2 => {
+                if marks < NAME_MARKS {
+                    out.push(ch);
+                    marks += 1;
+                }
                 continue;
             }
-            out.push(' ');
-        } else {
-            out.push(ch);
+            3 => {
+                if last_space {
+                    continue;
+                }
+                out.push(' ');
+                last_space = true;
+                marks = NAME_MARKS;
+            }
+            _ => continue,
         }
-        last_space = space;
         count += 1;
         if count >= 14 {
             break;
@@ -318,15 +428,65 @@ fn sanitize_name(raw: &[u8], fallback: &str) -> String {
     }
 }
 
+/// Comparison key for duplicate names: case-folded, fullwidth folded to
+/// ASCII, marks removed and common Cyrillic / Greek look-alikes mapped to
+/// Latin, so 'Kaze', 'Ｋａｚｅ' and 'Kаze' (Cyrillic a) count as the same name.
+pub fn name_key(name: &str) -> String {
+    let mut k = String::new();
+    for ch in name.chars() {
+        let c = ch as u32;
+        if name_char_class(c) == 2 {
+            continue;
+        }
+        let ch = if (0xFF01..=0xFF5E).contains(&c) { char::from_u32(c - 0xFEE0).unwrap_or(ch) } else { ch };
+        for lc in ch.to_lowercase() {
+            k.push(match lc {
+                'а' => 'a',
+                'в' | 'β' => 'b',
+                'е' | 'ё' | 'ε' => 'e',
+                'к' | 'κ' => 'k',
+                'м' => 'm',
+                'н' | 'һ' => 'h',
+                'о' | 'ο' => 'o',
+                'р' | 'ρ' => 'p',
+                'с' => 'c',
+                'т' | 'τ' => 't',
+                'у' => 'y',
+                'х' | 'χ' => 'x',
+                'і' | 'ι' => 'i',
+                'ј' => 'j',
+                'ѕ' => 's',
+                'ԁ' => 'd',
+                'α' => 'a',
+                'η' => 'n',
+                'ν' => 'v',
+                'υ' => 'u',
+                'ζ' => 'z',
+                _ => lc,
+            });
+        }
+    }
+    k
+}
+
 impl Match {
-    /// `seed` is public (clients regenerate the island from it); `secret` seeds
-    /// everything players must not be able to predict (spread, bots, loot rolls).
-    pub fn new(seed: u32, slots: usize, flags: u32, secret: u32) -> Match {
+    /// Offline / tests: both secret streams derived from one value.
+    pub fn new(seed: u32, slots: usize, flags: u32, secret: u64) -> Match {
+        let combat = secret.rotate_left(29) ^ 0xC2B2_AE3D_27D4_EB4F;
+        Match::with_secrets(seed, slots, flags, secret, combat)
+    }
+
+    /// `seed` is public (clients regenerate the island from it). `secret`
+    /// (64 bits of server entropy) seeds the match RNG: loot, plane, zone,
+    /// bots. `combat` seeds a separate stream for shot spread that never
+    /// feeds anything a client can observe directly.
+    pub fn with_secrets(seed: u32, slots: usize, flags: u32, secret: u64, combat: u64) -> Match {
         let w = World::generate(seed);
         let slots = slots.clamp(2, MAX_PLAYERS);
         let mut m = Match {
             w,
-            rng: Rng::new(((secret as u64) << 32) ^ (seed as u64).wrapping_mul(0x9E37_79B9) ^ 0x5EED),
+            rng: Rng::new(secret ^ (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED),
+            crng: Rng::new(combat ^ 0x6A09_E667_F3BC_C908),
             tick: 0,
             phase: PH_LOBBY,
             lobby_t: if flags & FLAG_OFFLINE != 0 {
@@ -355,6 +515,10 @@ impl Match {
             out: Vec::with_capacity(16384),
             ended_flag: false,
             chunk_ver: vec![1; ICH * ICH],
+            chunk_tick: vec![0; ICH * ICH],
+            ilog: vec![ILogE::default(); ILOG],
+            ilog_n: 0,
+            item_actor: 255,
             alive_start: 0,
         };
         m.spawn_loot();
@@ -381,8 +545,20 @@ impl Match {
                     let a = WD[wk as usize].ammo as usize;
                     let n = 1 + self.rng.below(2);
                     for k in 0..n {
-                        let off = V3::new(0.5 + 0.35 * k as f32, 0.0, 0.35);
-                        self.add_item(IK_AMMO + a as u8, AMMO_STACK[a], s.pos + off);
+                        // next to the weapon, on the first side that is clear of
+                        // walls / crates and reachable from the spot
+                        let d = 0.5 + 0.35 * k as f32;
+                        let mut pos = s.pos;
+                        for (ox, oz) in [(d, 0.35), (-d, 0.35), (d, -0.35), (-d, -0.35), (0.35, d), (-0.35, -d)] {
+                            let gy = self.w.ground_below(s.pos.x + ox, s.pos.z + oz, s.pos.y + 0.5, 0.2).max(WATER - 1.2);
+                            let q = V3::new(s.pos.x + ox, gy + 0.05, s.pos.z + oz);
+                            let up = V3::new(0.0, 0.25, 0.0);
+                            if (q.y - s.pos.y).abs() < 0.5 && self.w.item_spot_clear(q.x, q.y + 0.3, q.z, 0.3) && !self.w.blocked(s.pos + up, q + up) {
+                                pos = q;
+                                break;
+                            }
+                        }
+                        self.add_item(IK_AMMO + a as u8, AMMO_STACK[a], pos);
                     }
                 }
                 1 => {
@@ -414,36 +590,50 @@ impl Match {
 
     fn add_item(&mut self, kind: u8, amount: u16, pos: V3) -> Option<u16> {
         let it = Item { kind, amount, pos, alive: true };
-        let id = if let Some(id) = self.free_items.pop() {
+        // Fresh ids while there is room: a reused id would tie a change far
+        // away (hidden) to a new item near the viewer.
+        let id = if self.items.len() < MAX_ITEMS {
+            self.items.push(it);
+            (self.items.len() - 1) as u16
+        } else if !self.free_items.is_empty() {
+            let id = self.free_items.remove(0);
             self.items[id as usize] = it;
             id
         } else {
-            if self.items.len() >= MAX_ITEMS {
-                return None;
-            }
-            self.items.push(it);
-            (self.items.len() - 1) as u16
+            return None;
         };
         self.ev_item(id);
         Some(id)
     }
 
-    /// Items are not broadcast (that would leak where players loot); clients get
-    /// whole-chunk resyncs for nearby chunks whose version changed.
+    /// Item changes are never broadcast (that would leak where players loot).
+    /// They are logged; `snapshot` sends each one to the viewers allowed to
+    /// know it, and resyncs whole chunks only once they are quiet.
     fn ev_item(&mut self, id: u16) {
         let it = self.items[id as usize];
-        let c = item_chunk(it.pos.x, it.pos.z);
-        self.chunk_ver[c] = self.chunk_ver[c].wrapping_add(1);
+        self.log_item(id, it);
     }
 
     fn del_item(&mut self, id: u16) {
         if let Some(it) = self.items.get_mut(id as usize) {
             if it.alive {
                 it.alive = false;
+                let it = *it;
                 self.free_items.push(id);
-                let c = item_chunk(it.pos.x, it.pos.z);
-                self.chunk_ver[c] = self.chunk_ver[c].wrapping_add(1);
+                self.log_item(id, it);
             }
+        }
+    }
+
+    fn log_item(&mut self, id: u16, it: Item) {
+        let c = item_chunk(it.pos.x, it.pos.z);
+        self.chunk_ver[c] = self.chunk_ver[c].wrapping_add(1);
+        self.chunk_tick[c] = self.tick;
+        let k = self.ilog_n as usize % ILOG;
+        self.ilog[k] = ILogE { tick: self.tick, id, actor: self.item_actor, chunk: c as u8, it };
+        self.ilog_n = self.ilog_n.wrapping_add(1);
+        for p in self.players.iter_mut() {
+            p.ilog_sent[k / 64] &= !(1u64 << (k % 64));
         }
     }
 
@@ -480,7 +670,7 @@ impl Match {
             Some(p) => (p.x, p.z, true),
             None => (0.0, 0.0, false),
         };
-        self.evs.push(EvRec { to, start, len, x, z, filt });
+        self.evs.push(EvRec { to, start, len, x, z, filt, shooter: 255 });
     }
     fn ev_pinfo(&mut self, i: usize, left: bool) {
         let p = &self.players[i];
@@ -516,7 +706,7 @@ impl Match {
         let base = sanitize_name(raw_name, "Player");
         let mut name = base.clone();
         let mut k = 2;
-        while self.players.iter().any(|p| p.used && p.name.to_lowercase() == name.to_lowercase()) && k < 40 {
+        while self.players.iter().any(|p| p.used && name_key(&p.name) == name_key(&name)) && k < 40 {
             name = format!("{}#{}", base, k);
             k += 1;
         }
@@ -529,6 +719,7 @@ impl Match {
         p.name = name;
         p.color = color;
         p.need_welcome = true;
+        p.rew_floor = REWIND_MAX;
         p.reset_combat();
         p.ms.mode = MODE_PLANE;
         self.ev_pinfo(i, false);
@@ -576,7 +767,7 @@ impl Match {
             let j = self.rng.below(i as u32 + 1) as usize;
             names.swap(i, j);
         }
-        let taken: Vec<String> = self.players.iter().filter(|p| p.used).map(|p| p.name.clone()).collect();
+        let taken: Vec<String> = self.players.iter().filter(|p| p.used).map(|p| name_key(&p.name)).collect();
         let mut ni = 0;
         for i in 0..self.slots {
             if self.players[i].used {
@@ -586,7 +777,7 @@ impl Match {
             while ni < names.len() {
                 let cand = BOT_NAMES[names[ni]];
                 ni += 1;
-                if !taken.iter().any(|t| t == cand) {
+                if !taken.iter().any(|t| *t == name_key(cand)) {
                     name = cand.to_string();
                     break;
                 }
@@ -688,7 +879,11 @@ impl Match {
                         // Simulated one per tick in step(): arrival timing can never
                         // speed a player up, freeze gravity or hide positions between ticks.
                         if p.cmdq.len() >= CMDQ_CAP {
-                            p.cmdq.pop_front();
+                            if let Some(old) = p.cmdq.pop_front() {
+                                p.carry = Self::absorb(p.carry, old.buttons);
+                                p.acked_seq = old.seq;
+                                p.last_cmd = old;
+                            }
                         }
                         p.cmdq.push_back(c);
                     } else {
@@ -713,13 +908,19 @@ impl Match {
 
     fn apply_cmd(&mut self, i: usize, c: Cmd) {
         let tick = self.tick;
+        let human = self.players[i].human;
+        let prev = self.players[i].prev_buttons;
+        // Humans get one action per press: holding a button must not repeat it.
+        let pressed = |b: u16| c.has(b) && (!human || prev & b == 0);
+        let (pick, spect) = (pressed(B_PICKUP), pressed(B_SPECT));
         {
             let p = &mut self.players[i];
+            p.prev_buttons = c.buttons;
             p.yaw = wrap_angle(c.yaw);
             p.pitch = clampf(c.pitch, -PITCH_LIMIT, PITCH_LIMIT);
         }
         if !self.players[i].alive {
-            if c.has(B_SPECT) {
+            if spect && self.players[i].spect_cd <= 0.0 {
                 self.cycle_spect(i);
             }
             return;
@@ -741,7 +942,7 @@ impl Match {
             let mut wr = Wr::new(&mut self.ev);
             wr.u8(E_LAND);
             wr.u8(i as u8);
-            self.ev_end(start, 255, Some(pos));
+            self.ev_end(start, i as u8, Some(pos));
         }
         let p = &mut self.players[i];
         if p.ms.mode != MODE_GROUND {
@@ -778,7 +979,7 @@ impl Match {
                 p.reload_t = 0.0;
             }
         }
-        if c.has(B_PICKUP) {
+        if pick && self.players[i].pick_cd <= 0.0 {
             self.manual_pickup(i);
         }
         if c.has(B_NADE) {
@@ -839,9 +1040,22 @@ impl Match {
         for k in 1..=MAX_PLAYERS {
             let j = (start.wrapping_add(k)) % MAX_PLAYERS;
             if j != i && self.players[j].used && self.players[j].alive {
-                self.players[i].spect = j as u8;
+                self.set_spect(i, j as u8);
+                // switching is rate limited (cycling through everyone would be a radar)
+                self.players[i].spect_cd = 1.5;
                 return;
             }
+        }
+    }
+
+    /// Spectate another player. Visibility is recomputed from the new eye, so
+    /// the union of several players' views is never sent.
+    fn set_spect(&mut self, i: usize, j: u8) {
+        let p = &mut self.players[i];
+        if p.spect != j {
+            p.spect = j;
+            p.seen_tick = [0; MAX_PLAYERS];
+            p.vis_check = [0; MAX_PLAYERS];
         }
     }
 
@@ -861,8 +1075,10 @@ impl Match {
     fn rewound(&self, j: usize, view: u32) -> Option<HistE> {
         let now = self.tick as f32;
         // Clients render ~4.5 ticks behind + latency + command queueing;
-        // 15 ticks (500 ms) covers RTTs up to ~250 ms.
-        let vt = clampf(view as f32 / 256.0, now - 15.0, now);
+        // 15 ticks (500 ms) covers RTTs up to ~250 ms. Commands run before
+        // record_hist() writes this tick's slot, so tick - 1 is the newest
+        // recorded state (hist[tick % HIST] still holds tick - HIST).
+        let vt = clampf(view as f32 / 256.0, (now - REWIND_MAX).max(0.0), (now - 1.0).max(0.0));
         let t0 = vt.floor();
         let frac = vt - t0;
         let t0u = t0 as u32;
@@ -870,7 +1086,7 @@ impl Match {
             return None;
         }
         let a = self.hist[t0u as usize % HIST][j];
-        let b = if t0u < self.tick { self.hist[(t0u as usize + 1) % HIST][j] } else { a };
+        let b = if t0u + 1 < self.tick { self.hist[(t0u as usize + 1) % HIST][j] } else { a };
         if !a.alive && !b.alive {
             return None;
         }
@@ -878,7 +1094,7 @@ impl Match {
     }
 
     /// Returns (victim, distance, headshot).
-    fn ray_players(&self, shooter: usize, o: V3, d: V3, maxt: f32, view: u32) -> Option<(usize, f32, bool)> {
+    pub fn ray_players(&self, shooter: usize, o: V3, d: V3, maxt: f32, view: u32) -> Option<(usize, f32, bool)> {
         let mut best: Option<(usize, f32, bool)> = None;
         let mut lim = maxt;
         for j in 0..MAX_PLAYERS {
@@ -906,17 +1122,22 @@ impl Match {
             if perp2 > 4.0 {
                 continue;
             }
-            let head_c = p + V3::new(0.0, eye_h(h.crouch) + 0.04, 0.0);
-            if let Some(t) = ray_sphere(o, d, head_c, 0.2, lim) {
+            // head sphere around the rendered head; the body capsule reaches
+            // the shoulders. Head vs body is decided by where the ray enters:
+            // body below the neck (the rendered torso top), head above it.
+            let head_c = p + V3::new(0.0, eye_h(h.crouch) + if h.crouch { 0.1 } else { 0.06 }, 0.0);
+            let th = ray_sphere(o, d, head_c, 0.2, lim);
+            let tb = ray_capsule(o, d, p.x, p.z, p.y + 0.3, head_c.y - 0.3, 0.33, lim);
+            let neck = head_c.y - 0.1;
+            let hit = match (th, tb) {
+                (Some(th), Some(tb)) if tb < th && o.y + d.y * tb < neck => Some((tb, false)),
+                (Some(th), _) => Some((th, true)),
+                (None, Some(tb)) => Some((tb, false)),
+                (None, None) => None,
+            };
+            if let Some((t, head)) = hit {
                 lim = t;
-                best = Some((j, t, true));
-            }
-            // body capsule ends below the head sphere so head shots count
-            if let Some(t) = ray_capsule(o, d, p.x, p.z, p.y + 0.3, head_c.y - 0.53, 0.33, lim) {
-                if t < lim {
-                    lim = t;
-                    best = Some((j, t, false));
-                }
+                best = Some((j, t, head));
             }
         }
         best
@@ -945,8 +1166,8 @@ impl Match {
         let up = r.cross(d0).norm();
         let view = if p.bot { self.tick * 256 } else { view };
         for _ in 0..def.pellets {
-            let a = self.rng.range(0.0, TAU);
-            let rad = spread * self.rng.f().sqrt();
+            let a = self.crng.range(0.0, TAU);
+            let rad = spread * self.crng.f().sqrt();
             let d = (d0 + r * (a.cos() * rad) + up * (a.sin() * rad)).norm();
             let wh = self.w.raycast(o, d, def.range);
             let tw = wh.map_or(def.range, |h| h.0);
@@ -995,6 +1216,9 @@ impl Match {
             w.f32(end.z);
             w.u8(hit_kind);
             self.ev_end(start, 255, Some(muz));
+            if let Some(e) = self.evs.last_mut() {
+                e.shooter = i as u8;
+            }
         }
     }
 
@@ -1058,7 +1282,7 @@ impl Match {
         let mut w = Wr::new(&mut self.ev);
         w.u8(E_THROW);
         w.u8(i as u8);
-        self.ev_end(start, 255, Some(pos));
+        self.ev_end(start, i as u8, None);
     }
 
     fn update_nades(&mut self) {
@@ -1215,9 +1439,10 @@ impl Match {
             q.ms.vel = V3::ZERO;
             q.reload_t = 0.0;
             q.heal_t = 0.0;
-            q.spect = if (attacker as usize) < MAX_PLAYERS && attacker as usize != j { attacker } else { 255 };
             pos = q.ms.pos;
         }
+        let follow = if (attacker as usize) < MAX_PLAYERS && attacker as usize != j { attacker } else { 255 };
+        self.set_spect(j, follow);
         if (attacker as usize) < MAX_PLAYERS && attacker as usize != j {
             self.players[attacker as usize].kills += 1;
         }
@@ -1231,7 +1456,8 @@ impl Match {
             w.u8(head as u8);
             self.ev_end(start, 255, None);
         }
-        // drop loot
+        // drop loot (visible to whoever could see the victim)
+        self.item_actor = j as u8;
         let q = self.players[j].clone();
         let mut k = 0;
         for s in 0..2 {
@@ -1266,6 +1492,7 @@ impl Match {
         if q.nades > 0 {
             self.drop_item_near(IK_NADE, q.nades as u16, pos, k);
         }
+        self.item_actor = 255;
         let p = &mut self.players[j];
         p.slots = [(0, 0); 2];
         p.ammo = [0; NUM_AMMO];
@@ -1276,7 +1503,7 @@ impl Match {
         // spectators of the victim follow the killer
         for s in 0..MAX_PLAYERS {
             if s != j && self.players[s].used && !self.players[s].alive && self.players[s].spect as usize == j {
-                self.players[s].spect = attacker;
+                self.set_spect(s, attacker);
             }
         }
     }
@@ -1370,6 +1597,7 @@ impl Match {
             w.u16(took);
             self.ev_end(start, i as u8, None);
         }
+        self.item_actor = i as u8;
         if remaining == 0 {
             self.del_item(id);
         } else {
@@ -1382,6 +1610,7 @@ impl Match {
                 self.drop_item_near(k, a, pp, 3 + (self.tick % 5) as usize);
             }
         }
+        self.item_actor = 255;
         true
     }
 
@@ -1411,7 +1640,10 @@ impl Match {
             }
         }
         if let Some((id, _)) = best {
-            self.try_take(i, id, true);
+            if self.try_take(i, id, true) {
+                // a weapon swap changes two items: don't let it repeat every tick
+                self.players[i].pick_cd = 0.3;
+            }
         }
     }
 
@@ -1593,6 +1825,147 @@ impl Match {
         }
     }
 
+    /// Merge the edge buttons of a dropped command into `carry` (the latest
+    /// slot / heal request wins).
+    fn absorb(carry: u16, b: u16) -> u16 {
+        let mut out = carry | (b & EDGE_BUTTONS);
+        for sh in [8u16, 10] {
+            if b & (3 << sh) != 0 {
+                out = (out & !(3 << sh)) | (b & (3 << sh));
+            }
+        }
+        out
+    }
+
+    /// Buttons of a simulated command with the taps of dropped ones merged in
+    /// (the command's own slot / heal request wins).
+    fn with_carry(b: u16, carry: u16) -> u16 {
+        let mut out = b | (carry & EDGE_BUTTONS);
+        for sh in [8u16, 10] {
+            if b & (3 << sh) == 0 {
+                out |= carry & (3 << sh);
+            }
+        }
+        out
+    }
+
+    /// Humans: queued commands are simulated with per-player lag accounting.
+    /// Each tick adds one unit of lag and every simulated step (a command, or
+    /// an idle step when input is late) removes one, so a player is always
+    /// simulated for between (ticks - LAG_GRACE - 1) and (ticks) steps. No
+    /// arrival pattern can speed a player up (bursts, floods, late pairs) or
+    /// slow one down (starving the server to hover), and late commands that
+    /// idle steps already covered are dropped, so no backlog (input latency)
+    /// builds up after a stall.
+    fn step_humans(&mut self) {
+        let now = self.tick as f32;
+        for i in 0..MAX_PLAYERS {
+            if !(self.players[i].used && self.players[i].human) {
+                continue;
+            }
+            let p = &mut self.players[i];
+            p.pick_cd = (p.pick_cd - DT).max(0.0);
+            p.spect_cd = (p.spect_cd - DT).max(0.0);
+            p.lag = (p.lag + 1).min(LAG_GRACE + 1);
+            // A burst after a stall: its oldest commands are for ticks that
+            // idle steps already simulated. Drop them, keeping their taps.
+            while p.debt > 0 && p.cmdq.len() > p.lag as usize {
+                let Some(c) = p.cmdq.pop_front() else { break };
+                p.carry = Self::absorb(p.carry, c.buttons);
+                p.acked_seq = c.seq;
+                p.last_cmd = c;
+                p.debt -= 1;
+            }
+            let mut applied = 0;
+            while applied < 2 && self.players[i].lag > 0 {
+                let p = &mut self.players[i];
+                let Some(mut c) = p.cmdq.pop_front() else { break };
+                p.lag -= 1;
+                c.buttons = Self::with_carry(c.buttons, p.carry);
+                p.carry = 0;
+                // The view tick (lag compensation) is client-claimed: allow at
+                // most REWIND_MARGIN ticks above this player's recent minimum,
+                // so a low-latency client cannot rewind selectively.
+                let r = clampf(now - c.view as f32 / 256.0, 1.0, REWIND_MAX);
+                p.rew_floor = if r < p.rew_floor { r } else { (p.rew_floor + 0.08).min(r) };
+                let r = r.min(p.rew_floor + REWIND_MARGIN);
+                c.view = ((now - r) * 256.0).max(0.0) as u32;
+                p.acked_seq = c.seq;
+                p.last_cmd = c;
+                p.idle_run = 0;
+                p.cmds_applied = p.cmds_applied.wrapping_add(1);
+                self.apply_cmd(i, c);
+                applied += 1;
+            }
+            let p = &mut self.players[i];
+            let mut idle = false;
+            let mut drift = false;
+            if p.lag > LAG_GRACE {
+                // Input is more than LAG_GRACE ticks late: simulate the tick
+                // anyway and drop the late command when it shows up.
+                idle = true;
+                p.debt = (p.debt + 1).min(DEBT_MAX);
+                p.debt_ttl = DEBT_TTL;
+            } else {
+                if p.debt_ttl > 0 {
+                    p.debt_ttl -= 1;
+                    if p.debt_ttl == 0 {
+                        // no burst followed: the client skipped that time
+                        p.debt = 0;
+                    }
+                }
+                // The lag can get stuck above zero (a client that skipped
+                // time, a route that got slower): win the grace back slowly.
+                if p.lag == 0 {
+                    p.lag_hi_t = 0;
+                } else {
+                    p.lag_hi_t += 1;
+                    if p.lag_hi_t >= DRIFT_T && applied < 2 {
+                        p.lag_hi_t = 0;
+                        idle = true;
+                        drift = true;
+                    }
+                }
+            }
+            if idle {
+                let p = &mut self.players[i];
+                p.lag -= 1;
+                p.idle_steps = p.idle_steps.wrapping_add(1);
+                if p.alive && p.ms.mode != MODE_PLANE {
+                    // Held stance, briefly the last movement; never edge
+                    // actions or firing, so starving the server never helps.
+                    // A drift step replaces no command, so it must not move
+                    // the player; a late-input step stands in for the late
+                    // command and briefly repeats its movement.
+                    let mut c = p.last_cmd;
+                    if drift || p.idle_run >= IDLE_REPEAT {
+                        c.mx = 0.0;
+                        c.mz = 0.0;
+                    }
+                    c.buttons &= B_CROUCH | B_ADS | B_SPRINT;
+                    p.idle_run = p.idle_run.saturating_add(1);
+                    self.apply_cmd(i, c);
+                }
+            }
+            // A queue that stays long means a client clock running fast: drop
+            // the oldest command now and then so input latency stays low.
+            let p = &mut self.players[i];
+            if p.cmdq.len() > BACKLOG_MAX {
+                p.backlog_t += 1;
+                if p.backlog_t >= BACKLOG_T {
+                    p.backlog_t = 0;
+                    if let Some(c) = p.cmdq.pop_front() {
+                        p.carry = Self::absorb(p.carry, c.buttons);
+                        p.acked_seq = c.seq;
+                        p.last_cmd = c;
+                    }
+                }
+            } else {
+                p.backlog_t = 0;
+            }
+        }
+    }
+
     /// Advance one fixed tick. Returns bit 1 = snapshot due, bit 2 = match over.
     pub fn step(&mut self) -> u32 {
         self.tick = self.tick.wrapping_add(1);
@@ -1633,40 +2006,7 @@ impl Match {
                         self.apply_cmd(i, c);
                     }
                 }
-                // Humans: queued commands are simulated against a server-time
-                // budget (+1 per tick, max 3), at most two per tick. Total
-                // simulated commands can never exceed elapsed ticks + 3, so
-                // flooding gives no speed and bursts cannot teleport.
-                for i in 0..MAX_PLAYERS {
-                    if !(self.players[i].used && self.players[i].human) {
-                        continue;
-                    }
-                    {
-                        let p = &mut self.players[i];
-                        p.cmd_budget = (p.cmd_budget + 1).min(3);
-                    }
-                    let mut applied = 0;
-                    while applied < 2 && self.players[i].cmd_budget >= 1 {
-                        let Some(c) = self.players[i].cmdq.pop_front() else { break };
-                        let p = &mut self.players[i];
-                        p.cmd_budget -= 1;
-                        p.acked_seq = c.seq;
-                        p.last_cmd = c;
-                        p.cmds_applied = p.cmds_applied.wrapping_add(1);
-                        self.apply_cmd(i, c);
-                        applied += 1;
-                    }
-                    let p = &mut self.players[i];
-                    if applied == 0 && p.alive && p.ms.mode != MODE_PLANE {
-                        // Input is late: gravity and held stance only. No movement,
-                        // edge actions or firing, so starving the server never helps.
-                        let mut c = p.last_cmd;
-                        c.mx = 0.0;
-                        c.mz = 0.0;
-                        c.buttons &= B_CROUCH | B_ADS;
-                        self.apply_cmd(i, c);
-                    }
-                }
+                self.step_humans();
                 self.update_timers();
                 self.auto_pickups();
                 self.update_nades();
@@ -1756,9 +2096,12 @@ impl Match {
         }
         if (pid as usize) < MAX_PLAYERS {
             let v = self.chunk_ver.clone();
+            let n = self.ilog_n;
             let p = &mut self.players[pid as usize];
             p.need_welcome = false;
             p.item_ver = v;
+            p.ilog_from = n;
+            p.ilog_sent = [0; ILOG / 64];
         }
         &self.out
     }
@@ -1929,15 +2272,29 @@ impl Match {
             count += 1;
         }
         self.out[count_pos] = count;
-        // ---- grenades
+        // ---- grenades (near, thrown by someone visible, or in line of sight)
+        let mut nlist: Vec<(u16, V3)> = Vec::new();
+        for n in &self.nades {
+            if nlist.len() >= 40 {
+                break;
+            }
+            let d = dist_xz(n.pos.x, n.pos.z, center.x, center.z);
+            if d > INTEREST {
+                continue;
+            }
+            let o = n.owner as usize;
+            let ok = d < ALWAYS_SEND_R || o == i || (o < MAX_PLAYERS && send[o]) || !self.w.blocked(ceye, n.pos + V3::new(0.0, 0.1, 0.0));
+            if ok {
+                nlist.push((n.id, n.pos));
+            }
+        }
         let mut w = Wr::new(&mut self.out);
-        let nn = self.nades.iter().filter(|n| dist_xz(n.pos.x, n.pos.z, center.x, center.z) < INTEREST).count().min(40);
-        w.u8(nn as u8);
-        for n in self.nades.iter().filter(|n| dist_xz(n.pos.x, n.pos.z, center.x, center.z) < INTEREST).take(nn) {
-            w.u16(n.id);
-            w.f32(n.pos.x);
-            w.f32(n.pos.y);
-            w.f32(n.pos.z);
+        w.u8(nlist.len() as u8);
+        for &(id, pos) in &nlist {
+            w.u16(id);
+            w.f32(pos.x);
+            w.f32(pos.y);
+            w.f32(pos.z);
         }
         // ---- events
         let cpos = w.len();
@@ -1947,19 +2304,85 @@ impl Match {
             if e.to != 255 && e.to as usize != i {
                 continue;
             }
-            if e.filt && dist_xz(e.x, e.z, center.x, center.z) > INTEREST {
+            let d = dist_xz(e.x, e.z, center.x, center.z);
+            if e.filt && d > INTEREST {
                 continue;
             }
             let s = e.start as usize;
             let l = e.len as usize;
-            self.out.extend_from_slice(&self.ev[s..s + l]);
+            let sh = e.shooter as usize;
+            if sh < MAX_PLAYERS && sh != i && !send[sh] && l == 28 {
+                // A shooter this viewer cannot see: audible, but no id and
+                // only a coarse position (a grid that grows with distance).
+                if d > HIDDEN_SHOT_R {
+                    continue;
+                }
+                let mut b = [0u8; 28];
+                b.copy_from_slice(&self.ev[s..s + l]);
+                b[1] = 255;
+                let g = (d / 8.0).max(4.0);
+                for (k, step) in [(3usize, g), (7, 2.0), (11, g)] {
+                    let v = f32::from_le_bytes([b[k], b[k + 1], b[k + 2], b[k + 3]]);
+                    let qv = ((v / step).floor() + 0.5) * step;
+                    b[k..k + 4].copy_from_slice(&qv.to_le_bytes());
+                }
+                self.out.extend_from_slice(&b);
+            } else {
+                self.out.extend_from_slice(&self.ev[s..s + l]);
+            }
             ecount += 1;
+        }
+        // item changes this viewer may know: near it, its own, or made by a
+        // player it can see. Others wait (stale ghosts) until it comes near,
+        // or until the chunk has been quiet long enough to resync.
+        let mut fresh_hidden = [false; ICH * ICH];
+        if self.players[i].item_ver.len() == ICH * ICH {
+            let n = self.ilog_n;
+            let from = self.players[i].ilog_from.max(n.saturating_sub(ILOG as u32));
+            for idx in from..n {
+                let k = idx as usize % ILOG;
+                if self.players[i].ilog_sent[k / 64] & (1u64 << (k % 64)) != 0 {
+                    continue;
+                }
+                let e = self.ilog[k];
+                let a = e.actor as usize;
+                let near = dist_xz(e.it.pos.x, e.it.pos.z, center.x, center.z) < ALWAYS_SEND_R;
+                if a == i || near || (a < MAX_PLAYERS && send[a]) {
+                    let mut w = Wr::new(&mut self.out);
+                    if e.it.alive {
+                        w.u8(E_ITEM);
+                        w.u16(e.id);
+                        w.u8(e.it.kind);
+                        w.u16(e.it.amount);
+                        w.f32(e.it.pos.x);
+                        w.f32(e.it.pos.y);
+                        w.f32(e.it.pos.z);
+                    } else {
+                        w.u8(E_IDEL);
+                        w.u16(e.id);
+                    }
+                    ecount += 1;
+                    self.players[i].ilog_sent[k / 64] |= 1u64 << (k % 64);
+                } else if tick.wrapping_sub(e.tick) < ITEM_QUIET {
+                    fresh_hidden[e.chunk as usize] = true;
+                }
+            }
+            // If the ring no longer holds every change of the quiet window, only
+            // chunks quiet for the whole window may be resynced.
+            let ring_full = n as usize > ILOG && tick.wrapping_sub(self.ilog[n as usize % ILOG].tick) < ITEM_QUIET;
+            if ring_full {
+                for c in 0..ICH * ICH {
+                    if tick.wrapping_sub(self.chunk_tick[c]) < ITEM_QUIET {
+                        fresh_hidden[c] = true;
+                    }
+                }
+            }
         }
         // item chunk resyncs (nearest first, a few per snapshot)
         if self.players[i].item_ver.len() == ICH * ICH {
             let mut todo: Vec<(f32, usize)> = Vec::new();
             for c in 0..ICH * ICH {
-                if self.players[i].item_ver[c] == self.chunk_ver[c] {
+                if self.players[i].item_ver[c] == self.chunk_ver[c] || fresh_hidden[c] {
                     continue;
                 }
                 let x0 = (c % ICH) as f32 * ICW;
@@ -1992,6 +2415,16 @@ impl Match {
                 let v = self.chunk_ver[c];
                 self.players[i].item_ver[c] = v;
                 ecount += 1;
+                // the resync carries the chunk's current state: older changes
+                // in it must not be replayed later
+                let n = self.ilog_n;
+                let from = n.saturating_sub(ILOG as u32);
+                for idx in from..n {
+                    let k = idx as usize % ILOG;
+                    if self.ilog[k].chunk as usize == c {
+                        self.players[i].ilog_sent[k / 64] |= 1u64 << (k % 64);
+                    }
+                }
             }
         }
         self.out[cpos..cpos + 2].copy_from_slice(&ecount.to_le_bytes());

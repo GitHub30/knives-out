@@ -278,16 +278,50 @@ fn starving_the_server_does_not_hover() {
     assert!(airborne <= 30, "airborne for {airborne} ticks after a single jump");
 }
 
+fn max_marks_per_base(name: &str) -> usize {
+    let (mut run, mut worst) = (0, 0);
+    for c in name.chars() {
+        let c = c as u32;
+        let mark = matches!(c, 0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05C7 | 0x064B..=0x065F | 0x0E31..=0x0E4E);
+        if mark {
+            run += 1;
+            worst = worst.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    worst
+}
+
 #[test]
 fn names_are_sanitized_and_unique() {
-    let mut m = Match::new(1, 8, FLAG_OFFLINE, 7);
-    let p1 = m.add_human("\u{202E}gnaK\u{200B} \u{2066}x\u{0301}\u{0301}".as_bytes()).unwrap();
+    let mut m = Match::new(1, 16, FLAG_OFFLINE, 7);
+    let p1 = m.add_human("\u{202E}gnaK\u{200B} \u{2066}x\u{0301}\u{0301}\u{0301}\u{0301}".as_bytes()).unwrap();
     let n1 = m.players[p1 as usize].name.clone();
-    assert!(n1.chars().all(|c| !matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0x0300..=0x036F)), "{n1:?}");
+    assert!(n1.chars().all(|c| !matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069)), "{n1:?}");
+    assert!(max_marks_per_base(&n1) <= 2, "stacked marks kept: {n1:?}");
     let p2 = m.add_human(n1.as_bytes()).unwrap();
     assert_ne!(m.players[p2 as usize].name, n1, "duplicate names must be disambiguated");
     let p3 = m.add_human(b"   ").unwrap();
     assert_eq!(m.players[p3 as usize].name, "Player");
+    // invisible format characters are dropped, so look-alike names collide
+    let a = m.add_human(b"ab").unwrap();
+    let b = m.add_human("a\u{180B}\u{180C}\u{180D}\u{180F}b\u{1D173}\u{1BCA0}\u{110BD}\u{13430}".as_bytes()).unwrap();
+    assert_eq!(m.players[a as usize].name, "ab");
+    assert_eq!(m.players[b as usize].name, "ab#2");
+    // zalgo from blocks outside the basic combining range
+    let z = m.add_human("a\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}\u{0489}".as_bytes()).unwrap();
+    assert!(max_marks_per_base(&m.players[z as usize].name) <= 2);
+    // homoglyph and fullwidth duplicates are disambiguated
+    let k1 = m.add_human(b"Kaze").unwrap();
+    let k2 = m.add_human("K\u{0430}ze".as_bytes()).unwrap();
+    let k3 = m.add_human("\u{FF2B}\u{FF41}\u{FF5A}\u{FF45}".as_bytes()).unwrap();
+    assert_eq!(m.players[k1 as usize].name, "Kaze");
+    assert!(m.players[k2 as usize].name.ends_with("#2"), "{:?}", m.players[k2 as usize].name);
+    assert!(m.players[k3 as usize].name.ends_with("#3"), "{:?}", m.players[k3 as usize].name);
+    // ordinary Japanese names survive untouched
+    let j = m.add_human("ゆうき＿Ｖ３".as_bytes()).unwrap();
+    assert_eq!(m.players[j as usize].name, "ゆうき＿Ｖ３");
 }
 
 /// Offsets of the players block in a snapshot (mirrors `Match::snapshot`).
