@@ -55,6 +55,8 @@ pub struct Brain {
     /// Closest the bot has got to its goal item, and time since it improved.
     pub prog_d: f32,
     pub prog_t: f32,
+    /// Time since landing: fresh bots loot first and only take close fights.
+    pub ground_t: f32,
 }
 
 impl Brain {
@@ -68,9 +70,13 @@ fn turn_toward(cur: f32, target: f32, max: f32) -> f32 {
     wrap_angle(cur + clampf(wrap_angle(target - cur), -max, max))
 }
 
-/// Choose a landing target and when to leave the plane.
-pub fn pick_landing(w: &World, pl: &Plane, b: &mut Brain) -> (f32, f32, f32) {
-    for _ in 0..12 {
+/// Choose a landing target and when to leave the plane. Spots far from the
+/// landings other bots already chose are preferred, so the island does not
+/// empty in a few landing brawls.
+pub fn pick_landing(w: &World, pl: &Plane, b: &mut Brain, taken: &[(f32, f32)]) -> (f32, f32, f32) {
+    let mut best: Option<(f32, (f32, f32, f32))> = None;
+    let spread = 70.0;
+    for _ in 0..14 {
         let (x, z) = if !w.buildings.is_empty() && b.rng.chance(0.85) {
             let k = b.rng.below(w.buildings.len() as u32) as usize;
             let bl = &w.buildings[k];
@@ -93,7 +99,16 @@ pub fn pick_landing(w: &World, pl: &Plane, b: &mut Brain) -> (f32, f32, f32) {
         }
         let lead = (260.0f32 * 260.0 - perp * perp).max(0.0).sqrt() * b.rng.range(0.15, 0.5);
         let jt = clampf(along - lead, pl.enter_t + 5.0, pl.exit_t - 5.0);
-        return (x, z, jt);
+        let near = taken.iter().map(|&(tx, tz)| dist_xz(tx, tz, x, z)).fold(f32::MAX, f32::min);
+        if near >= spread {
+            return (x, z, jt);
+        }
+        if best.map_or(true, |(d, _)| near > d) {
+            best = Some((near, (x, z, jt)));
+        }
+    }
+    if let Some((_, r)) = best {
+        return r;
     }
     let t = b.rng.range(pl.enter_t + 20.0, pl.exit_t - 20.0);
     let side = if b.rng.chance(0.5) { 1.0 } else { -1.0 } * b.rng.range(40.0, 180.0);
@@ -225,6 +240,10 @@ fn find_target(m: &Match, i: usize, b: &Brain) -> u8 {
         let cosang = (to.x * f.x + to.z * f.z) / lxz;
         let current = j as u8 == b.target;
         let attacker = p.hurt_by as usize == j && p.hurt_t > 0.0;
+        // right after landing, only close threats are worth a fight
+        if b.ground_t < 45.0 && !current && !attacker && d > 30.0 + b.ground_t * 2.0 {
+            continue;
+        }
         if d > 10.0 && cosang < 0.2 && !current && !attacker {
             continue;
         }
@@ -360,7 +379,9 @@ fn choose_goal(m: &Match, i: usize, b: &mut Brain) {
         }
     }
     let ignore = b.ignore;
-    if let Some(id) = find_loot(m, i, 65.0, &ignore) {
+    // the first minute on the ground: loot around the landing spot
+    let loot_r = if b.ground_t < 60.0 { 30.0 } else { 65.0 };
+    if let Some(id) = find_loot(m, i, loot_r, &ignore) {
         let it = m.items[id as usize];
         b.goal_item = id;
         plan_path(m, b, pos, (it.pos.x, it.pos.z), 1);
@@ -486,6 +507,7 @@ fn stuck_logic(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
 fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let p = &m.players[i];
     let pos = p.ms.pos;
+    b.ground_t += DT;
     b.jump_cd -= DT;
     b.strafe_t -= DT;
     b.aim_t -= DT;
@@ -520,7 +542,11 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     if (b.target as usize) < MAX_PLAYERS && !p.ms.in_water {
         let q = &m.players[b.target as usize];
         let d = dist_xz(q.ms.pos.x, q.ms.pos.z, pos.x, pos.z);
-        if armed || d < 8.0 {
+        // Unarmed: keep looting for a gun; only punch back at close range
+        // when attacked or against another unarmed player who is right there.
+        let q_armed = slot_usable(q, 0) || slot_usable(q, 1);
+        let attacked = p.hurt_t > 0.0 && p.hurt_by == b.target;
+        if armed || (d < 4.0 && (attacked || !q_armed)) {
             fight(m, i, b, c);
             stuck_logic(m, i, b, c);
             return;
@@ -667,7 +693,7 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     c.buttons = (c.buttons & !(3 << 8)) | ((b.slot as u16 + 1) << 8);
 
     if b.aim_t <= 0.0 {
-        let base = (1.15 - b.skill) * 0.085 + q.ms.vel.len_xz() * 0.0035 + if p.ms.vel.len_xz() > 1.0 { 0.01 } else { 0.0 };
+        let base = (1.15 - b.skill) * 0.1 + q.ms.vel.len_xz() * 0.004 + if p.ms.vel.len_xz() > 1.0 { 0.012 } else { 0.0 };
         b.aim_tx = b.rng.range(-base, base);
         b.aim_ty = b.rng.range(-base * 0.6, base * 0.6);
         b.aim_t = b.rng.range(0.25, 0.6);
@@ -686,7 +712,7 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let wk = p.weapon();
     let def = WD[wk as usize];
     let mag = if p.cur < 2 { p.slots[p.cur as usize].1 } else { 0 };
-    let react = 0.8 - 0.55 * b.skill;
+    let react = 0.95 - 0.5 * b.skill;
     let in_range = if wk == W_FISTS { dist < 1.9 } else { dist < def.range * 0.8 };
     if wk != W_FISTS && dist > 22.0 && def.zoom > 1.5 && p.ms.on_ground {
         c.buttons |= B_ADS;
@@ -734,6 +760,14 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     if b.crouch && fwd_in == 0.0 {
         c.buttons |= B_CROUCH;
         c.mx *= 0.4;
+    }
+    // badly hurt with something to heal: break off the fight (fall back away
+    // from the target, still shooting) instead of trading to the death
+    let can_heal = p.heals[0] > 0 || p.heals[1] > 0;
+    if p.health < 35.0 && can_heal && dist > 6.0 {
+        move_dir(c, c.yaw, pos.x - q.ms.pos.x, pos.z - q.ms.pos.z, 1.0);
+        c.mx = clampf(c.mx + b.strafe * 0.5, -1.0, 1.0);
+        c.buttons &= !B_CROUCH;
     }
     if dist < 25.0 && b.jump_cd <= 0.0 && b.rng.chance(0.012) {
         c.buttons |= B_JUMP;

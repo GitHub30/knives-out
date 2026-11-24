@@ -746,7 +746,7 @@ impl Match {
             p.brain = crate::bot::Brain::new(seed, 0.45);
             p.brain.yaw = p.yaw;
             if p.ms.mode == MODE_PLANE && pl.active {
-                let (lx, lz, jt) = crate::bot::pick_landing(&self.w, &pl, &mut p.brain);
+                let (lx, lz, jt) = crate::bot::pick_landing(&self.w, &pl, &mut p.brain, &[]);
                 p.brain.land = (lx, lz);
                 p.brain.jump_t = jt.max(pl.t);
             } else {
@@ -826,6 +826,7 @@ impl Match {
         self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
         self.pick_next_zone();
         let ppos = self.plane.pos();
+        let mut landings: Vec<(f32, f32)> = Vec::new();
         for i in 0..self.slots {
             let pl = self.plane;
             let p = &mut self.players[i];
@@ -836,9 +837,10 @@ impl Match {
             p.ms = MoveState { pos: ppos, mode: MODE_PLANE, ..Default::default() };
             p.yaw = yaw_to(dx, dz);
             if p.bot {
-                let (lx, lz, jt) = crate::bot::pick_landing(&self.w, &pl, &mut p.brain);
+                let (lx, lz, jt) = crate::bot::pick_landing(&self.w, &pl, &mut p.brain, &landings);
                 p.brain.land = (lx, lz);
                 p.brain.jump_t = jt;
+                landings.push((lx, lz));
             }
         }
         self.record_hist();
