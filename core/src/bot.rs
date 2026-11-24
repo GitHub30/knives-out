@@ -4,7 +4,7 @@ use crate::defs::*;
 use crate::math::*;
 use crate::player::*;
 use crate::rng::Rng;
-use crate::sim::{Match, Plane, Player};
+use crate::sim::{Match, Plane, Player, SCOPE_ZOOM};
 use crate::world::*;
 
 #[derive(Clone, Default)]
@@ -47,11 +47,16 @@ pub struct Brain {
     pub avoid: f32,
     pub avoid_t: f32,
     pub slot: u8,
+    /// Items this bot gave up on (unreachable), ring buffer.
+    pub ignore: [u16; 8],
+    pub ignore_i: u8,
+    /// Time spent standing next to the goal item without getting it.
+    pub near_t: f32,
 }
 
 impl Brain {
     pub fn new(seed: u32, skill: f32) -> Brain {
-        Brain { rng: Rng::new(seed as u64 | 1), skill, target: 255, slot: 2, ..Default::default() }
+        Brain { rng: Rng::new(seed as u64 | 1), skill, target: 255, slot: 2, ignore: [u16::MAX; 8], ..Default::default() }
     }
 }
 
@@ -66,7 +71,13 @@ pub fn pick_landing(w: &World, pl: &Plane, b: &mut Brain) -> (f32, f32, f32) {
         let (x, z) = if !w.buildings.is_empty() && b.rng.chance(0.85) {
             let k = b.rng.below(w.buildings.len() as u32) as usize;
             let bl = &w.buildings[k];
-            (bl.door_out.0 + b.rng.range(-6.0, 6.0), bl.door_out.1 + b.rng.range(-6.0, 6.0))
+            // aim for the ground outside the door (never over the roof)
+            let (ox, oz) = (bl.door_out.0 - bl.door_in.0, bl.door_out.1 - bl.door_in.1);
+            let l = (ox * ox + oz * oz).sqrt().max(1e-3);
+            let (nx, nz) = (ox / l, oz / l);
+            let out = b.rng.range(0.5, 4.0);
+            let side = b.rng.range(-3.0, 3.0);
+            (bl.door_out.0 + nx * out - nz * side, bl.door_out.1 + nz * out + nx * side)
         } else {
             (b.rng.range(150.0, MAP - 150.0), b.rng.range(150.0, MAP - 150.0))
         };
@@ -245,13 +256,13 @@ fn useful(p: &Player, kind: u8, amount: u16) -> bool {
     }
 }
 
-fn find_loot(m: &Match, i: usize, radius: f32) -> Option<u16> {
+fn find_loot(m: &Match, i: usize, radius: f32, ignore: &[u16]) -> Option<u16> {
     let p = &m.players[i];
     let pos = p.ms.pos;
     let unarmed = p.slots[0].0 == 0 && p.slots[1].0 == 0;
     let mut best: Option<(u16, f32)> = None;
     for (id, it) in m.items.iter().enumerate() {
-        if !it.alive {
+        if !it.alive || ignore.contains(&(id as u16)) {
             continue;
         }
         let d = dist_xz(it.pos.x, it.pos.z, pos.x, pos.z);
@@ -277,9 +288,13 @@ fn find_loot(m: &Match, i: usize, radius: f32) -> Option<u16> {
 }
 
 fn plan_path(m: &Match, b: &mut Brain, from: V3, to: (f32, f32), kind: u8) {
+    let same = kind == b.goal_kind && dist_xz(to.0, to.1, b.goal.0, b.goal.1) < 2.0;
+    if !same {
+        b.goal_t = 0.0;
+        b.near_t = 0.0;
+    }
     b.goal = to;
     b.goal_kind = kind;
-    b.goal_t = 0.0;
     b.path_n = 0;
     b.path_i = 0;
     let push = |b: &mut Brain, pt: (f32, f32)| {
@@ -320,7 +335,27 @@ fn choose_goal(m: &Match, i: usize, b: &mut Brain) {
         plan_path(m, b, pos, (tx, tz), 3);
         return;
     }
-    if let Some(id) = find_loot(m, i, 65.0) {
+    // stranded on a roof: walk off the nearest edge first
+    if let Some(k) = m.w.building_at(pos.x, pos.z) {
+        let bl = m.w.buildings[k];
+        if pos.y > bl.y + 2.0 {
+            let cands = [(bl.x0 - 2.0, pos.z), (bl.x1 + 2.0, pos.z), (pos.x, bl.z0 - 2.0), (pos.x, bl.z1 + 2.0)];
+            let mut best = cands[0];
+            for c in cands {
+                if dist_xz(c.0, c.1, pos.x, pos.z) < dist_xz(best.0, best.1, pos.x, pos.z) {
+                    best = c;
+                }
+            }
+            b.goal_kind = 0;
+            b.path_n = 1;
+            b.path_i = 0;
+            b.path[0] = (clampf(best.0, 5.0, MAP - 5.0), clampf(best.1, 5.0, MAP - 5.0));
+            b.goal = b.path[0];
+            return;
+        }
+    }
+    let ignore = b.ignore;
+    if let Some(id) = find_loot(m, i, 65.0, &ignore) {
         let it = m.items[id as usize];
         b.goal_item = id;
         plan_path(m, b, pos, (it.pos.x, it.pos.z), 1);
@@ -474,7 +509,7 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
         }
     }
     let armed = slot_usable(p, 0) || slot_usable(p, 1);
-    if (b.target as usize) < MAX_PLAYERS {
+    if (b.target as usize) < MAX_PLAYERS && !p.ms.in_water {
         let q = &m.players[b.target as usize];
         let d = dist_xz(q.ms.pos.x, q.ms.pos.z, pos.x, pos.z);
         if armed || d < 8.0 {
@@ -486,13 +521,14 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     b.seen_t = 0.0;
     b.crouch = false;
 
-    // ---- healing / reloading when calm
-    if p.heal_t > 0.0 {
+    // ---- healing / reloading when calm (only inside the safe zone)
+    let in_zone = dist_xz(pos.x, pos.z, m.zone.cx, m.zone.cz) < m.zone.r - 3.0;
+    if p.heal_t > 0.0 && in_zone {
         c.buttons |= B_CROUCH;
         look_around(m, i, b, c);
         return;
     }
-    if p.hurt_t <= 0.0 {
+    if p.hurt_t <= 0.0 && in_zone && p.heal_t <= 0.0 {
         if p.health < 50.0 && p.heals[1] > 0 {
             c.buttons |= 2 << 10;
         } else if p.health < 72.0 && p.heals[0] > 0 {
@@ -529,8 +565,17 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
                     if p.cur == worst && p.switch_t <= 0.0 {
                         c.buttons |= B_PICKUP;
                     }
-                } else if b.goal_t > 4.0 {
+                } else {
                     c.buttons |= B_PICKUP;
+                }
+                b.near_t += DT;
+                if b.near_t > 2.5 {
+                    // unreachable (inside a crate / behind a wall): forget it
+                    b.ignore[b.ignore_i as usize % 8] = b.goal_item;
+                    b.ignore_i = b.ignore_i.wrapping_add(1);
+                    b.near_t = 0.0;
+                    b.goal_kind = 0;
+                    b.path_i = b.path_n;
                     b.think_t = 0.0;
                 }
             }
@@ -570,8 +615,15 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     // lead the target a little based on skill
     let lead = q.ms.vel * (0.06 * b.skill);
     let tp = q.ms.pos + V3::new(0.0, aim_h, 0.0) + lead;
-    let to = tp - eye;
-    let dist = to.len();
+    let dist = (tp - eye).len();
+    // Shots leave from the shoulder camera ray (or the eye when scoped), so
+    // aim from that origin, not from the eye.
+    let wk_now = p.weapon();
+    let zoom = WD[wk_now as usize].zoom;
+    let ads_planned = wk_now != W_FISTS && dist > 22.0 && zoom > 1.5 && p.ms.on_ground;
+    let scoped = ads_planned && zoom >= SCOPE_ZOOM;
+    let (origin, _) = aim_ray_safe(&m.w, pos, b.yaw, b.pitch, p.ms.crouch, ads_planned, scoped);
+    let to = tp - origin;
     b.seen_t += DT;
     b.last_seen = (q.ms.pos.x, q.ms.pos.z);
 
@@ -657,7 +709,13 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
         move_dir(c, c.yaw, z.cx - pos.x, z.cz - pos.z, 1.0);
     }
     // throw a grenade at targets behind light cover
-    if p.nades > 0 && (12.0..30.0).contains(&dist) && b.rng.chance(0.004) {
+    if p.nades > 0 && (9.0..17.5).contains(&dist) && b.rng.chance(0.006) {
+        // range = v^2 sin(2a) / g with v = 19, g = 20; server adds +0.25 rad
+        let dh = dist_xz(q.ms.pos.x, q.ms.pos.z, pos.x, pos.z);
+        let k = clampf(20.0 * dh / (19.0 * 19.0), 0.0, 1.0);
+        let a = 0.5 * k.asin();
+        c.pitch = clampf(a - 0.25, -1.2, 1.2);
+        c.buttons &= !B_FIRE;
         c.buttons |= B_NADE;
     }
 }

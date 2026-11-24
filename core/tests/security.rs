@@ -91,7 +91,7 @@ fn no_wallbang_when_hugging_a_wall() {
             let mut pitch = 0.0f32;
             let mut bpos = V3::ZERO;
             for _ in 0..4 {
-                let (o, d) = aim_ray(apos, yawd, dq_pitch(q_pitch(pitch)), false, false);
+                let (o, d) = aim_ray(apos, yawd, dq_pitch(q_pitch(pitch)), false, false, false);
                 let tz = (bl.z0 + 3.3 - o.z) / d.z;
                 let p = o + d * tz;
                 bpos = V3::new(p.x, bl.y, p.z);

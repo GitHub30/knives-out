@@ -336,7 +336,7 @@ impl World {
                 if rng.chance(0.3) {
                     w.boxes.push(Bx { min: V3::new(x - s * 0.5, y + s, z - s * 0.5), max: V3::new(x + s * 0.5, y + 2.0 * s, z + s * 0.5), kind: BK_CRATE, col: 0x8E6E42 });
                 }
-                if rng.chance(0.5) {
+                if rng.chance(0.5) && !w.spot_blocked(x + 1.2, y + 0.3, z, 0) {
                     w.spots.push(Spot { pos: V3::new(x + 1.2, y + 0.05, z), tier: t.kind });
                 }
             }
@@ -486,6 +486,15 @@ impl World {
         m
     }
 
+    /// True if a loot spot at (x,y,z) would sit inside or right against a box
+    /// (checks boxes from index `from`, the grid is not built yet).
+    fn spot_blocked(&self, x: f32, y: f32, z: f32, from: usize) -> bool {
+        let m = 0.35;
+        self.boxes[from..].iter().any(|b| {
+            b.kind != BK_FLOOR && x > b.min.x - m && x < b.max.x + m && z > b.min.z - m && z < b.max.z + m && y > b.min.y - 0.2 && y < b.max.y + 0.2
+        })
+    }
+
     fn container_stack(&mut self, x: f32, z: f32, rng: &mut Rng) {
         if self.buildings.iter().any(|b| x > b.x0 - 8.0 && x < b.x1 + 8.0 && z > b.z0 - 8.0 && z < b.z1 + 8.0) {
             return;
@@ -504,9 +513,11 @@ impl World {
                 self.boxes.push(Bx { min: V3::new(cx - hx, y + 2.6, cz - hz), max: V3::new(cx + hx, y + 5.2, cz + hz), kind: BK_CONTAINER, col: col2 });
             }
         }
-        let y = self.height(x, z);
         let (sx, sz) = if along_x { (x + 4.2, z) } else { (x, z + 4.2) };
-        self.spots.push(Spot { pos: V3::new(sx, y + 0.05, sz), tier: 1 });
+        let y = self.height(sx, sz);
+        if !self.spot_blocked(sx, y + 0.3, sz, 0) {
+            self.spots.push(Spot { pos: V3::new(sx, y + 0.05, sz), tier: 1 });
+        }
     }
 
     /// kind: 0 house, 1 warehouse, 2 hut. side: door side 0=-z 1=+x 2=+z 3=-x
@@ -533,6 +544,7 @@ impl World {
         let floor_col = if kind == 1 { 0x7D7B76 } else { 0x9B7B58 };
         let hgt = if kind == 1 { 4.4 } else { WALL_H };
 
+        let first_box = self.boxes.len();
         // floor slab
         self.boxes.push(Bx { min: V3::new(x0, lo - 0.6, z0), max: V3::new(x1, y, z1), kind: BK_FLOOR, col: floor_col });
 
@@ -620,13 +632,20 @@ impl World {
             }
         }
 
-        // loot spots
+        // loot spots (never inside crates / interior walls of this building)
         let area = w_ * d_;
         let n = clampf(area / 22.0, 2.0, 8.0) as u32;
-        for _ in 0..n {
+        let mut placed = 0;
+        let mut tries = 0;
+        while placed < n && tries < n * 6 {
+            tries += 1;
             let px = rng.range(x0 + 0.9, x1 - 0.9);
             let pz = rng.range(z0 + 0.9, z1 - 0.9);
+            if self.spot_blocked(px, y + 0.3, pz, first_box) {
+                continue;
+            }
             self.spots.push(Spot { pos: V3::new(px, y + 0.05, pz), tier });
+            placed += 1;
         }
 
         self.buildings.push(Building { x0, z0, x1, z1, y, door_out: (door.0, door.1), door_in: (door.2, door.3), town });
@@ -843,7 +862,10 @@ impl World {
             let mut dx_acc = 0.0f32;
             let mut dz_acc = 0.0f32;
             self.for_boxes(px - q, pz - q, px + q, pz + q, |b| {
-                if b.max.y <= feet + STEP || b.min.y >= feet + hgt * 0.75 {
+                // Whole body height: a crouched (1.25 m) body cannot slip
+                // through a 1.1 m window gap. Ceilings are resolved first by
+                // the caller, so door lintels above the head are not walls.
+                if b.max.y <= feet + STEP || b.min.y >= feet + hgt - 0.02 {
                     return;
                 }
                 let cx = px + dx_acc;
@@ -927,7 +949,7 @@ impl World {
             if p.x < -60.0 || p.z < -60.0 || p.x > MAP + 60.0 || p.z > MAP + 60.0 {
                 return None;
             }
-            let step = (above * 0.45).max(0.6);
+            let step = (above * 0.3).max(0.5);
             let nt = (t + step).min(maxt);
             let q = o + d * nt;
             if q.y - self.height(q.x, q.z) < 0.0 {

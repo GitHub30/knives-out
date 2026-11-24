@@ -12,6 +12,8 @@ pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
 pub const CMDQ_CAP: usize = 8;
+/// ADS with at least this zoom is a first-person scope.
+pub const SCOPE_ZOOM: f32 = 3.5;
 
 pub const C_INPUT: u8 = 2;
 pub const C_START: u8 = 4;
@@ -262,6 +264,8 @@ pub struct Match {
     pub out: Vec<u8>,
     pub ended_flag: bool,
     pub chunk_ver: Vec<u32>,
+    /// Alive count at the start of the current tick (shared placement).
+    pub alive_start: usize,
 }
 
 fn bad_name_char(ch: char) -> bool {
@@ -351,6 +355,7 @@ impl Match {
             out: Vec::with_capacity(16384),
             ended_flag: false,
             chunk_ver: vec![1; ICH * ICH],
+            alive_start: 0,
         };
         m.spawn_loot();
         m.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, nx: MAP * 0.5, nz: MAP * 0.5, nr: 780.0, timer: ZONES[0].wait, ..Default::default() };
@@ -443,12 +448,24 @@ impl Match {
     }
 
     fn drop_item_near(&mut self, kind: u8, amount: u16, base: V3, k: usize) {
-        let a = k as f32 * 2.399 + self.rng.range(0.0, 0.4);
+        // Spiral outwards, skipping spots that are not reachable from the
+        // drop point (behind a wall, inside a crate).
+        let eye = base + V3::new(0.0, 0.9, 0.0);
         let rr = 0.6 + 0.28 * (k as f32).sqrt();
-        let x = clampf(base.x + a.cos() * rr, 2.0, MAP - 2.0);
-        let z = clampf(base.z + a.sin() * rr, 2.0, MAP - 2.0);
-        let y = self.w.ground_below(x, z, base.y + 0.3, 0.2).max(WATER - 1.2);
-        self.add_item(kind, amount, V3::new(x, y + 0.05, z));
+        let a0 = k as f32 * 2.399 + self.rng.range(0.0, 0.4);
+        let mut spot = V3::new(base.x, self.w.ground_below(base.x, base.z, base.y + 0.3, 0.2).max(WATER - 1.2), base.z);
+        for tryk in 0..8 {
+            let a = a0 + tryk as f32 * 0.785;
+            let x = clampf(base.x + a.cos() * rr, 2.0, MAP - 2.0);
+            let z = clampf(base.z + a.sin() * rr, 2.0, MAP - 2.0);
+            let y = self.w.ground_below(x, z, base.y + 0.3, 0.2).max(WATER - 1.2);
+            let p = V3::new(x, y, z);
+            if !self.w.blocked(eye, p + V3::new(0.0, 0.25, 0.0)) {
+                spot = p;
+                break;
+            }
+        }
+        self.add_item(kind, amount, spot + V3::new(0.0, 0.05, 0.0));
     }
 
     // ------------------------------------------------------------------
@@ -889,13 +906,13 @@ impl Match {
             if perp2 > 4.0 {
                 continue;
             }
-            let k = if h.crouch { 0.68 } else { 1.0 };
             let head_c = p + V3::new(0.0, eye_h(h.crouch) + 0.04, 0.0);
             if let Some(t) = ray_sphere(o, d, head_c, 0.2, lim) {
                 lim = t;
                 best = Some((j, t, true));
             }
-            if let Some(t) = ray_capsule(o, d, p.x, p.z, p.y + 0.35, p.y + 1.38 * k, 0.33, lim) {
+            // body capsule ends below the head sphere so head shots count
+            if let Some(t) = ray_capsule(o, d, p.x, p.z, p.y + 0.3, head_c.y - 0.53, 0.33, lim) {
                 if t < lim {
                     lim = t;
                     best = Some((j, t, false));
@@ -908,7 +925,8 @@ impl Match {
     fn shoot(&mut self, i: usize, wk: u8, view: u32) {
         let p = &self.players[i];
         let def = WD[wk as usize];
-        let (o, d0) = aim_ray_safe(&self.w, p.ms.pos, p.yaw, p.pitch, p.ms.crouch, p.ads);
+        let scoped = p.ads && def.zoom >= SCOPE_ZOOM;
+        let (o, d0) = aim_ray_safe(&self.w, p.ms.pos, p.yaw, p.pitch, p.ms.crouch, p.ads, scoped);
         let muz = muzzle(p.ms.pos, p.yaw, p.pitch, p.ms.crouch);
         // The eye is on the body axis, so it is never inside a wall.
         let eye = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
@@ -1149,8 +1167,10 @@ impl Match {
             if attacker != KILLER_ZONE {
                 q.hurt_by = attacker;
                 q.hurt_t = 4.0;
+                // being shot interrupts healing; the zone does not (or nobody
+                // could ever heal outside the circle)
+                q.heal_t = 0.0;
             }
-            q.heal_t = 0.0;
         }
         let killed = self.players[j].health <= 0.0;
         if (attacker as usize) < MAX_PLAYERS && attacker as usize != j {
@@ -1180,7 +1200,8 @@ impl Match {
     }
 
     fn kill(&mut self, j: usize, attacker: u8, weapon: u8, head: bool) {
-        let place = self.alive_count() as u8;
+        // players who die in the same tick share the placement
+        let place = self.alive_start.max(1) as u8;
         let tick = self.tick;
         let pos;
         {
@@ -1587,6 +1608,7 @@ impl Match {
             }
             PH_PLAY => {
                 self.match_t += DT;
+                self.alive_start = self.alive_count();
                 // plane
                 if self.plane.active {
                     self.plane.t += PLANE_SPEED * DT;
@@ -1654,7 +1676,19 @@ impl Match {
                 if self.alive_count() <= 1 {
                     self.phase = PH_END;
                     self.end_t = 12.0;
-                    self.winner = (0..MAX_PLAYERS).find(|&k| self.players[k].used && self.players[k].alive).map_or(255, |k| k as u8);
+                    let survivor = (0..MAX_PLAYERS).find(|&k| self.players[k].used && self.players[k].alive);
+                    // Nobody left (last players died in the same tick): the one
+                    // with the most kills, then damage, among them wins.
+                    let tick = self.tick;
+                    let last_group = || {
+                        (0..MAX_PLAYERS)
+                            .filter(|&k| self.players[k].used && !self.players[k].alive && self.players[k].death_tick == tick)
+                            .max_by(|&a, &b| {
+                                let (pa, pb) = (&self.players[a], &self.players[b]);
+                                pa.kills.cmp(&pb.kills).then(pa.dmg_dealt.total_cmp(&pb.dmg_dealt)).then(b.cmp(&a))
+                            })
+                    };
+                    self.winner = survivor.or_else(last_group).map_or(255, |k| k as u8);
                     if (self.winner as usize) < MAX_PLAYERS {
                         self.players[self.winner as usize].place = 1;
                     }
@@ -1849,7 +1883,8 @@ impl Match {
                 continue;
             }
             let pv = &self.players[i];
-            if tick.wrapping_sub(pv.vis_check[j]) >= 3 {
+            // re-check each pair every other snapshot round, staggered by target
+            if pv.vis_check[j] == 0 || (pv.snap_round.wrapping_add(j as u32)) % 2 == 0 {
                 let head = q.ms.pos + V3::new(0.0, eye_h(q.ms.crouch) + 0.1, 0.0);
                 let chest = q.ms.pos + V3::new(0.0, 0.9, 0.0);
                 let visible = !self.w.blocked(ceye, head) || !self.w.blocked(ceye, chest);
@@ -1960,6 +1995,7 @@ impl Match {
             }
         }
         self.out[cpos..cpos + 2].copy_from_slice(&ecount.to_le_bytes());
+        self.players[i].snap_round = self.players[i].snap_round.wrapping_add(1);
         &self.out
     }
 

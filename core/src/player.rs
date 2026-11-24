@@ -104,11 +104,13 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             s.pos += s.vel * dt;
             w.collide_body(&mut s.pos, P_RADIUS, 1.8);
             let g = w.ground_below(s.pos.x, s.pos.z, prev.y.max(s.pos.y), P_RADIUS);
-            if s.pos.y <= g {
-                s.pos.y = g;
+            let land = g.max(WATER - 1.25);
+            if s.pos.y <= land {
+                s.pos.y = land;
                 s.vel = V3::ZERO;
                 s.mode = MODE_GROUND;
                 s.on_ground = true;
+                s.in_water = g < WATER - 1.2;
                 ev |= EV_LANDED;
             } else if s.pos.y - g < 80.0 || (c.has(B_JUMP) && s.airtime > 0.8 && s.pos.y - g > 12.0) {
                 s.mode = MODE_PARA;
@@ -126,11 +128,13 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             s.pos += s.vel * dt;
             w.collide_body(&mut s.pos, P_RADIUS, 1.8);
             let g = w.ground_below(s.pos.x, s.pos.z, prev.y.max(s.pos.y), P_RADIUS);
-            if s.pos.y <= g {
-                s.pos.y = g;
+            let land = g.max(WATER - 1.25);
+            if s.pos.y <= land {
+                s.pos.y = land;
                 s.vel = V3::ZERO;
                 s.mode = MODE_GROUND;
                 s.on_ground = true;
+                s.in_water = g < WATER - 1.2;
                 ev |= EV_LANDED;
             }
         }
@@ -170,6 +174,14 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             }
             let hgt = body_h(s.crouch);
             let mut np = s.pos + s.vel * dt;
+            if s.vel.y > 0.0 {
+                if let Some(cy) = w.ceiling(np.x, np.z, prev.y, hgt, P_RADIUS) {
+                    if np.y + hgt > cy {
+                        np.y = (cy - hgt).max(prev.y);
+                        s.vel.y = 0.0;
+                    }
+                }
+            }
             w.collide_body(&mut np, P_RADIUS, hgt);
             let g = w.ground_below(np.x, np.z, prev.y.max(np.y), P_RADIUS);
             let was_ground = s.on_ground;
@@ -188,13 +200,9 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             } else {
                 s.on_ground = false;
             }
-            if s.vel.y > 0.0 {
-                if let Some(cy) = w.ceiling(np.x, np.z, prev.y, hgt, P_RADIUS) {
-                    if np.y + hgt > cy {
-                        np.y = (cy - hgt).max(g);
-                        s.vel.y = 0.0;
-                    }
-                }
+            if np.y > prev.y + 0.01 {
+                // stepped or jumped up: the taller body may now touch something
+                w.collide_body(&mut np, P_RADIUS, hgt);
             }
             // deep water: float at the surface
             if g < WATER - 1.2 {
@@ -224,9 +232,14 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
 
 /// The ray through the crosshair of the over-the-shoulder camera, with its
 /// origin advanced to the plane of the head so nothing behind the player is hit.
-pub fn aim_ray(pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool) -> (V3, V3) {
+/// `scoped` (ADS with a >= 3.5x scope) uses the first-person eye instead.
+pub fn aim_ray(pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool, scoped: bool) -> (V3, V3) {
     let head = pos + V3::new(0.0, eye_h(crouch), 0.0);
     let d = dir_from(yaw, pitch);
+    if scoped {
+        // scoped weapons: first-person view from the eye
+        return (head, d);
+    }
     let r = right(yaw);
     let side = if ads { 0.38 } else { 0.55 };
     let back = if ads { 1.3 } else { 2.7 };
@@ -238,9 +251,12 @@ pub fn aim_ray(pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool) -> (V3, V
 /// Server-side aim ray: like `aim_ray`, but the shoulder offset is clamped by
 /// raycasts from the head so the origin can never start inside a wall the
 /// player is hugging (shots through walls).
-pub fn aim_ray_safe(w: &World, pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool) -> (V3, V3) {
+pub fn aim_ray_safe(w: &World, pos: V3, yaw: f32, pitch: f32, crouch: bool, ads: bool, scoped: bool) -> (V3, V3) {
     let head = pos + V3::new(0.0, eye_h(crouch), 0.0);
     let d = dir_from(yaw, pitch);
+    if scoped {
+        return (head, d);
+    }
     let r = right(yaw);
     let side_max = if ads { 0.38 } else { 0.55 };
     let side = match w.raycast(head, r, side_max + 0.2) {

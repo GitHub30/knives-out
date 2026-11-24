@@ -685,7 +685,9 @@ export class Game {
     const side = ads ? 0.38 : 0.55, back = ads ? 1.3 : 2.7;
     const cam: V3 = [head[0] + r[0] * side - d0[0] * back, head[1] + 0.28 - d0[1] * back, head[2] + r[2] * side - d0[2] * back];
     const t0 = Math.max(0, (head[0] - cam[0]) * d0[0] + (head[1] - cam[1]) * d0[1] + (head[2] - cam[2]) * d0[2]);
-    const o: V3 = add(cam, scale(d0, t0));
+    // scoped weapons fire from the eye, matching the first-person scope view (and the server)
+    const scoped = ads && def.zoom >= 3.5;
+    const o: V3 = scoped ? head : add(cam, scale(d0, t0));
     const muz: V3 = add(add([pos[0], pos[1] + EYE(crouch) - 0.12, pos[2]], scale(r, 0.22)), scale(d0, 0.55));
     const up = norm([r[1] * d0[2] - r[2] * d0[1], r[2] * d0[0] - r[0] * d0[2], r[0] * d0[1] - r[1] * d0[0]]);
     let spread = ads ? def.ads : def.hip;
