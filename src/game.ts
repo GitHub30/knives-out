@@ -381,7 +381,9 @@ export class Game {
         if (e.victim === this.myId) {
           hud.showBanner(e.killer === P.KILLER_ZONE ? '安全地帯の外で力尽きた…' : `${killer} に倒された`, 3, 'warn');
           snd.ui('lose');
-          setTimeout(() => this.finishPersonal(), 1800);
+          setTimeout(() => {
+            if (this.running) this.finishPersonal();
+          }, 1800);
         }
         break;
       }
@@ -434,6 +436,7 @@ export class Game {
       this.resultSent = true;
       setTimeout(
         () =>
+          this.running &&
           this.d.onResult({
             place: won ? 1 : s.self.place || 2,
             total: s.total,
@@ -937,7 +940,9 @@ export class Game {
       this.makeCmd();
     }
     if (this.cmdAcc > DT * 4) this.cmdAcc = 0;
-    if (this.outbox.length && !this.paused) {
+    // Online: batch two commands per message (15 msg/s) to halve per-message cost.
+    const batch = this.d.transport.kind === 'online' ? 2 : 1;
+    if (this.outbox.length >= batch && !this.paused) {
       this.send(P.encodeInputs(this.outbox));
       this.outbox = [];
     } else if (this.paused) this.outbox = [];
@@ -1125,7 +1130,8 @@ export class Game {
     else hud.setProgress(null, 0);
     const pickup = ground && me ? this.nearestPickup(me) : null;
     const touch = matchMedia('(pointer: coarse)').matches;
-    hud.setPrompt(pickup && !touch ? `[F] 拾う: ${pickup}` : null);
+    const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
+    hud.setPrompt(needLock ? 'クリックしてマウス操作を開始' : pickup && !touch ? `[F] 拾う: ${pickup}` : null);
     const spectating = !alive && s.phase === P.PH_PLAY;
     hud.setSpectate(spectating ? (s.self.spect !== 255 ? this.nameOf(s.self.spect) : '—') : null);
     if (me) hud.drawMinimap(me[0], me[2], this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, this.markers, this.time, 1024);

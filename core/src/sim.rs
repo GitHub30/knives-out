@@ -10,7 +10,7 @@ use crate::world::*;
 pub const PROTO: u16 = 3;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
-pub const INTEREST: f32 = 700.0;
+pub const INTEREST: f32 = 520.0;
 
 pub const C_INPUT: u8 = 2;
 pub const C_START: u8 = 4;
@@ -538,7 +538,7 @@ impl Match {
         while t <= 2.0 * half {
             let x = sx + dx * t;
             let z = sz + dz * t;
-            if x > 40.0 && z > 40.0 && x < MAP - 40.0 && z < MAP - 40.0 {
+            if x > 130.0 && z > 130.0 && x < MAP - 130.0 && z < MAP - 130.0 {
                 enter = enter.min(t);
                 exit = exit.max(t);
             }

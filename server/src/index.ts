@@ -9,6 +9,8 @@ export interface Env {
   LOBBY: DurableObjectNamespace;
   ALLOWED_ORIGINS: string;
   ASSETS?: Fetcher;
+  /** Workers rate-limiting binding: WebSocket join attempts per client IP. */
+  JOIN_LIMIT?: RateLimit;
 }
 
 interface SrvExports {
@@ -64,6 +66,11 @@ export default {
     if (url.pathname === '/ws') {
       if ((req.headers.get('Upgrade') ?? '').toLowerCase() !== 'websocket') return new Response('Expected WebSocket', { status: 426 });
       if (!originAllowed(req, env)) return new Response('Forbidden origin', { status: 403 });
+      const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown';
+      if (env.JOIN_LIMIT) {
+        const { success } = await env.JOIN_LIMIT.limit({ key: ip });
+        if (!success) return new Response('Too many join attempts', { status: 429 });
+      }
       const name = (url.searchParams.get('name') ?? '').slice(0, 32);
       const code = url.searchParams.get('room');
       let roomName: string;

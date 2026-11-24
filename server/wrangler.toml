@@ -20,6 +20,11 @@ class_name = "Lobby"
 tag = "v1"
 new_sqlite_classes = ["Room", "Lobby"]
 
+[[ratelimits]]
+name = "JOIN_LIMIT"
+namespace_id = "7301"
+simple = { limit = 15, period = 60 }
+
 [vars]
 ALLOWED_ORIGINS = "https://github30.github.io,http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
 
