@@ -322,9 +322,9 @@ struct VOut { @builtin(position) clip: vec4f, @location(0) wp: vec3f, @location(
   let t = F.camPos.w;
   let d = distance(i.wp.xz, F.camPos.xz);
   let stripes = 0.5 + 0.5 * sin(i.uv.x * F.zone.z * 0.9 + i.uv.y * 0.35 - t * 2.0);
-  let near = 1.0 - smoothstep(30.0, 600.0, d);
-  let base = vec3f(0.25, 0.55, 1.0);
-  let a = (0.10 + 0.22 * stripes) * (0.35 + 0.65 * near) * F.zone.w * smoothstep(-30.0, 10.0, i.wp.y);
-  return vec4f(base * (1.2 + stripes), a * (1.0 - smoothstep(150.0, 300.0, i.wp.y)));
+  let near = 1.0 - smoothstep(30.0, 700.0, d);
+  let base = vec3f(0.12, 0.38, 1.0);
+  let a = (0.2 + 0.3 * stripes) * (0.45 + 0.55 * near) * F.zone.w * smoothstep(-30.0, 10.0, i.wp.y);
+  return vec4f(base * (0.9 + 0.8 * stripes), a * (1.0 - smoothstep(150.0, 300.0, i.wp.y)));
 }
 `;
