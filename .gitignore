@@ -1,6 +1,7 @@
 node_modules/
 dist/
 core/target/
+src/core.wasm
 public/core.wasm
 server/.wrangler/
 .wrangler/

@@ -110,7 +110,7 @@ export class Game {
   private pred: Pred | null = null;
   private predPrev: V3 = [0, 0, 0];
   private smooth: V3 = [0, 0, 0];
-  private pending: { cmd: P.CmdQ; shots: number }[] = [];
+  private pending: { cmd: P.CmdQ; shots: number; at: number }[] = [];
   private outbox: P.CmdQ[] = [];
   private seq = 0;
   private cmdAcc = 0;
@@ -226,7 +226,18 @@ export class Game {
       this.rtt = lerp(this.rtt || (now - sent), (now - sent) >>> 0, 0.3);
     } else if (type === P.S_ERROR) {
       const code = new Uint8Array(buf)[1];
-      const msg = ['不明なエラー', '部屋が満員です', '試合はすでに開始しています', 'バージョンが一致しません', '接続数が多すぎます'][code] ?? 'エラー';
+      const msg =
+        [
+          '不明なエラー',
+          '部屋が満員です',
+          '試合はすでに開始しています',
+          'バージョンが一致しません',
+          '同じネットワークからの接続数が多すぎます',
+          'サーバーが混雑しています。しばらくしてから再試行してください',
+          '同じネットワークから作成できる非公開ルームの数を超えています',
+          '接続の試行が多すぎます。1分ほど待ってから再試行してください',
+          'ルームコードが正しくありません',
+        ][code] ?? 'エラー';
       this.d.onError(msg);
       this.welcomeWait?.reject(new Error(msg));
     }
@@ -537,7 +548,14 @@ export class Game {
     const old = this.pred ? ([...this.pred.pos] as V3) : null;
     this.pred = { pos: [...me.pos], vel: [...me.vel], mode: me.mode, onGround: me.onGround, crouch: me.crouch, inWater: me.inWater, airtime: me.airtime };
     const mult = this.speedMult(me);
-    for (const p of this.pending) this.step(p.cmd, mult, false);
+    // The server stood in for late commands with idle steps and drops that many of
+    // the oldest when they arrive, so they must not be replayed. Only commands old
+    // enough to be late count: a client that skipped time (frame hitch, hidden tab)
+    // has a debt on the server but no late commands.
+    const late = performance.now() - (this.rtt + 100);
+    let skip = 0;
+    while (skip < me.debt && skip < this.pending.length && this.pending[skip].at < late) skip++;
+    for (let k = skip; k < this.pending.length; k++) this.step(this.pending[k].cmd, mult, false);
     if (old) {
       const dlt = sub(old, this.pred.pos);
       if (Math.hypot(dlt[0], dlt[1], dlt[2]) < 3) {
@@ -636,7 +654,7 @@ export class Game {
     const view = Math.max(0, Math.floor(this.renderTick * 256));
     const q = P.quantizeCmd(++this.seq, view, mx, mz, this.yaw, this.pitch, b);
     const shots = this.localFire(q);
-    this.pending.push({ cmd: q, shots });
+    this.pending.push({ cmd: q, shots, at: performance.now() });
     if (this.pending.length > 90) this.pending.shift();
     this.outbox.push(q);
     if (this.pred) {

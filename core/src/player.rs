@@ -299,6 +299,58 @@ pub fn aim_ray_safe(w: &World, pos: V3, yaw: f32, pitch: f32, crouch: bool, ads:
 }
 
 /// Approximate muzzle position (visual start of tracers).
+/// Where a player's head and body are drawn (mirrors `emitCharacter` in
+/// src/render/models.ts), so hits match the model: the torso leans forward
+/// around the hips (more when crouched or sprinting), the head pitches with
+/// the view, and a free-falling body is tilted face down around the hips.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyPose {
+    /// Centre of the head.
+    pub head: V3,
+    /// Body capsule axis, from just above the feet to below the head.
+    pub a: V3,
+    pub b: V3,
+}
+
+/// Horizontal speed above which the model is drawn sprinting (leaning).
+pub const SPRINT_DRAW_SPEED: f32 = 6.2;
+
+pub fn body_pose(pos: V3, yaw: f32, pitch: f32, crouch: bool, sprint: bool, mode: u8) -> BodyPose {
+    let ground = mode == MODE_GROUND;
+    let crouch = crouch && ground;
+    let lean: f32 = if !ground {
+        0.0
+    } else if crouch {
+        0.15
+    } else if sprint {
+        0.22
+    } else {
+        0.05
+    };
+    let hip = if crouch { 0.5 } else { 0.95 };
+    // head pivot on top of the torso, then the head box centre (0, 0.14, 0.01)
+    // turned by lean + head pitch (-pitch * 0.55 - lean * 0.6)
+    let a = lean * 0.4 - pitch.clamp(-1.2, 1.2) * 0.55;
+    let head = (hip + 0.02 + 0.6 * lean.cos() + 0.14 * a.cos() - 0.01 * a.sin(), 0.6 * lean.sin() + 0.14 * a.sin() + 0.01 * a.cos());
+    let lo = (0.3, 0.0);
+    let hi = (head.0 - 0.3, 0.0);
+    let tilt = |p: (f32, f32)| {
+        if mode == MODE_FALL {
+            let (sn, cs) = 1.25f32.sin_cos();
+            let (y, z) = (p.0 - 0.95, p.1);
+            (0.95 + y * cs - z * sn, y * sn + z * cs)
+        } else {
+            p
+        }
+    };
+    let f = fwd(yaw);
+    let world = |p: (f32, f32)| {
+        let p = tilt(p);
+        V3::new(pos.x + f.x * p.1, pos.y + p.0, pos.z + f.z * p.1)
+    };
+    BodyPose { head: world(head), a: world(lo), b: world(hi) }
+}
+
 pub fn muzzle(pos: V3, yaw: f32, pitch: f32, crouch: bool) -> V3 {
     let head = pos + V3::new(0.0, eye_h(crouch) - 0.12, 0.0);
     head + right(yaw) * 0.22 + dir_from(yaw, pitch) * 0.55

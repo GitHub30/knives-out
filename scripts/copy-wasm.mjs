@@ -5,7 +5,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const src = resolve(root, 'core/target/wasm32-unknown-unknown/release/zonefall_core.wasm');
-for (const dst of ['public/core.wasm', 'server/src/core.wasm']) {
+// src/core.wasm is imported with ?url, so Vite fingerprints it: after a
+// deploy, a reload can never pair the new client with a cached old core.
+for (const dst of ['src/core.wasm', 'server/src/core.wasm']) {
   const out = resolve(root, dst);
   mkdirSync(dirname(out), { recursive: true });
   copyFileSync(src, out);

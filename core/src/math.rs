@@ -262,6 +262,40 @@ pub fn ray_sphere(o: V3, d: V3, c: V3, r: f32, maxt: f32) -> Option<f32> {
     }
 }
 
+/// Ray vs capsule around the segment a-b.
+pub fn ray_capsule_seg(o: V3, d: V3, a: V3, b: V3, r: f32, maxt: f32) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    let mut take = |t: Option<f32>| {
+        if let Some(t) = t {
+            if best.map_or(true, |b| t < b) {
+                best = Some(t);
+            }
+        }
+    };
+    take(ray_sphere(o, d, a, r, maxt));
+    take(ray_sphere(o, d, b, r, maxt));
+    // the cylinder between the caps
+    let ba = b - a;
+    let oa = o - a;
+    let baba = ba.dot(ba);
+    let bard = ba.dot(d);
+    let baoa = ba.dot(oa);
+    let k2 = baba - bard * bard;
+    if baba > 1e-6 && k2 > 1e-6 {
+        let k1 = baba * oa.dot(d) - baoa * bard;
+        let k0 = baba * oa.dot(oa) - baoa * baoa - r * r * baba;
+        let h = k1 * k1 - k2 * k0;
+        if h >= 0.0 {
+            let t = (-k1 - h.sqrt()) / k2;
+            let y = baoa + t * bard;
+            if t >= 0.0 && t <= maxt && y > 0.0 && y < baba {
+                take(Some(t));
+            }
+        }
+    }
+    best
+}
+
 /// Ray vs vertical capsule (segment from y0 to y1 at (cx,cz), radius r).
 pub fn ray_capsule(o: V3, d: V3, cx: f32, cz: f32, y0: f32, y1: f32, r: f32, maxt: f32) -> Option<f32> {
     let mut best: Option<f32> = None;

@@ -6,8 +6,9 @@ use crate::net::*;
 use crate::player::*;
 use crate::rng::Rng;
 use crate::world::*;
+use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 5;
+pub const PROTO: u16 = 6;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -21,8 +22,9 @@ const DEBT_MAX: u8 = 16;
 const IDLE_REPEAT: u8 = 6;
 /// If the lag never returns to zero for this long, take one idle step.
 const DRIFT_T: u16 = 60;
-/// More than this many commands left queued for BACKLOG_T ticks: drop one.
-const BACKLOG_MAX: usize = 3;
+/// A queue that has not emptied for BACKLOG_T ticks is pure input latency
+/// (lag accounting already absorbs late input): drop its oldest command.
+const BACKLOG_MAX: usize = 0;
 const BACKLOG_T: u8 = 30;
 /// Lag compensation: the most a shot may be rewound, and how far above the
 /// player's recent minimum rewind a single command may claim.
@@ -72,6 +74,35 @@ const ITEM_QUIET: u32 = 300;
 /// Hidden shooters: shots farther than this are not sent, nearer ones only
 /// with a coarse position and no shooter id.
 const HIDDEN_SHOT_R: f32 = 330.0;
+/// E_HURT attacker id for a player the victim is not sent.
+pub const HURT_HIDDEN: u8 = 254;
+
+/// splitmix64 finaliser.
+fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Centre of the `g`-sized world-aligned cell holding `v`.
+#[inline]
+fn cell_c(v: f32, g: f32) -> f32 {
+    ((v / g).floor() + 0.5) * g
+}
+fn get_v3(b: &[u8], k: usize) -> V3 {
+    let f = |k: usize| f32::from_le_bytes([b[k], b[k + 1], b[k + 2], b[k + 3]]);
+    V3::new(f(k), f(k + 4), f(k + 8))
+}
+fn put_v3(b: &mut [u8], k: usize, v: V3) {
+    b[k..k + 4].copy_from_slice(&v.x.to_le_bytes());
+    b[k + 4..k + 8].copy_from_slice(&v.y.to_le_bytes());
+    b[k + 8..k + 12].copy_from_slice(&v.z.to_le_bytes());
+}
+/// E_HURT from a player that viewer `i` is not sent.
+fn hidden_sh_id(ev: &[u8], i: usize, send: &[bool]) -> bool {
+    let a = ev[1] as usize;
+    a < MAX_PLAYERS && a != i && !send[a]
+}
 
 #[inline]
 pub fn item_chunk(x: f32, z: f32) -> usize {
@@ -90,6 +121,25 @@ pub struct HistE {
     pub pos: V3,
     pub crouch: bool,
     pub alive: bool,
+    /// What the model's pose depends on (see `body_pose`).
+    pub yaw: f32,
+    pub pitch: f32,
+    pub sprint: bool,
+    pub mode: u8,
+}
+
+impl HistE {
+    fn of(p: &Player) -> HistE {
+        HistE {
+            pos: p.ms.pos,
+            crouch: p.ms.crouch,
+            alive: p.used && p.alive,
+            yaw: p.yaw,
+            pitch: p.pitch,
+            sprint: p.ms.vel.len_xz() > SPRINT_DRAW_SPEED,
+            mode: p.ms.mode,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -107,6 +157,8 @@ struct ILogE {
     id: u16,
     actor: u8,
     chunk: u8,
+    /// The chunk's version after this change.
+    ver: u32,
     it: Item,
 }
 
@@ -175,7 +227,7 @@ pub struct Player {
     pub idle_run: u8,
     /// Ticks the lag has stayed above zero (slow drift back to real time).
     pub lag_hi_t: u16,
-    /// Ticks the queue has held more than BACKLOG_MAX commands.
+    /// Ticks the queue has not emptied (more than BACKLOG_MAX commands left).
     pub backlog_t: u8,
     /// Recent minimum of the rewind (ticks) this client claims for its view.
     pub rew_floor: f32,
@@ -301,6 +353,12 @@ struct EvRec {
     filt: bool,
     /// E_SHOT: the shooter (hidden shooters are anonymised per viewer).
     shooter: u8,
+    /// E_SHOT: the player hit (255 = none), and where the shot would have
+    /// ended without them (`alt`, `alt_kind`): viewers that are not sent the
+    /// victim see that instead, as the impact would locate the victim.
+    victim: u8,
+    alt: V3,
+    alt_kind: u8,
 }
 
 pub struct Match {
@@ -308,6 +366,8 @@ pub struct Match {
     pub rng: Rng,
     /// Shot spread only (see `with_secrets`).
     crng: Rng,
+    /// Server secret for per-viewer jitter (see `quiet_ticks`).
+    salt: u64,
     pub tick: u32,
     pub phase: u8,
     pub lobby_t: f32,
@@ -340,135 +400,6 @@ pub struct Match {
     pub alive_start: usize,
 }
 
-/// Name characters: 0 = dropped, 1 = base character, 2 = combining mark,
-/// 3 = space. A whitelist of letters, digits, punctuation and symbols of
-/// common scripts: control, format, private-use, unassigned and invisible
-/// filler characters are all dropped.
-fn name_char_class(c: u32) -> u8 {
-    match c {
-        0x20 | 0xA0 | 0x2000..=0x200A | 0x205F | 0x3000 => 3,
-        0x22 | 0x26 | 0x27 | 0x3C | 0x3E | 0x5C | 0x60 => 0, // " & ' < > \ `
-        0x21..=0x7E => 1,
-        0xA1..=0xAC | 0xAE..=0x2AF => 1,          // Latin-1 (no soft hyphen), Latin ext., IPA
-        0x300..=0x36F => 2,                         // combining diacritics
-        0x370..=0x377 | 0x37A..=0x37F | 0x384..=0x38A | 0x38C | 0x38E..=0x3A1 | 0x3A3..=0x3FF => 1, // Greek
-        0x400..=0x482 | 0x48A..=0x52F => 1,         // Cyrillic
-        0x483..=0x489 => 2,
-        0x531..=0x556 | 0x561..=0x587 => 1,         // Armenian
-        0x591..=0x5BD | 0x5BF | 0x5C1..=0x5C2 | 0x5C4..=0x5C5 | 0x5C7 => 2, // Hebrew points
-        0x5D0..=0x5EA => 1,
-        0x620..=0x64A | 0x660..=0x669 | 0x671..=0x6D3 => 1, // Arabic
-        0x64B..=0x65F | 0x670 => 2,
-        0x900..=0x903 | 0x93A..=0x93C | 0x93E..=0x94F | 0x951..=0x957 | 0x962..=0x963 => 2, // Devanagari signs
-        0x904..=0x939 | 0x93D | 0x950 | 0x958..=0x961 | 0x964..=0x97F => 1,
-        0xE31 | 0xE34..=0xE3A | 0xE47..=0xE4E => 2, // Thai marks
-        0xE01..=0xE30 | 0xE32..=0xE33 | 0xE3F..=0xE46 | 0xE4F..=0xE5B => 1,
-        0x1E00..=0x1EFF => 1,                       // Latin extended additional (Vietnamese)
-        0x2010..=0x2027 | 0x2030..=0x205E => 1,     // punctuation (no separators / bidi / invisible)
-        0x2070..=0x2071 | 0x2074..=0x208E | 0x2090..=0x209C => 1,
-        0x20A0..=0x20C0 | 0x2100..=0x218B | 0x2190..=0x23FF | 0x2460..=0x27BF | 0x27C0..=0x2BFF => 1,
-        0x2E80..=0x2FDF => 1,                       // CJK radicals
-        0x302A..=0x302F | 0x3099..=0x309A => 2,
-        0x3001..=0x3029 | 0x3030..=0x303F => 1,     // CJK punctuation
-        0x3041..=0x3096 | 0x309B..=0x30FF => 1,     // kana
-        0x3105..=0x312F | 0x3131..=0x3163 | 0x3165..=0x318E | 0x3190..=0x31FF => 1, // (no Hangul filler)
-        0x3200..=0x4DBF | 0x4DC0..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F => 1,
-        0xFF01..=0xFF5E | 0xFF61..=0xFF9F | 0xFFE0..=0xFFEE => 1, // full/halfwidth (no halfwidth filler)
-        0x1F3FB..=0x1F3FF => 2,                     // emoji skin tones modify the previous emoji
-        0x1F000..=0x1FAFF => 1,                     // emoji and symbols
-        0x20000..=0x2FFFF => 1,                     // CJK extensions
-        _ => 0,
-    }
-}
-
-/// At most this many combining marks per base character (accents, Thai and
-/// Indic vowel signs), so names cannot stack marks into the rows above.
-const NAME_MARKS: u32 = 2;
-
-fn sanitize_name(raw: &[u8], fallback: &str) -> String {
-    let s = String::from_utf8_lossy(raw);
-    let mut out = String::new();
-    let mut count = 0;
-    let mut last_space = true;
-    let mut marks = NAME_MARKS; // no base character yet: no marks allowed
-    for ch in s.chars() {
-        match name_char_class(ch as u32) {
-            1 => {
-                out.push(ch);
-                last_space = false;
-                marks = 0;
-            }
-            2 => {
-                if marks < NAME_MARKS {
-                    out.push(ch);
-                    marks += 1;
-                }
-                continue;
-            }
-            3 => {
-                if last_space {
-                    continue;
-                }
-                out.push(' ');
-                last_space = true;
-                marks = NAME_MARKS;
-            }
-            _ => continue,
-        }
-        count += 1;
-        if count >= 14 {
-            break;
-        }
-    }
-    let t = out.trim().to_string();
-    if t.is_empty() {
-        fallback.to_string()
-    } else {
-        t
-    }
-}
-
-/// Comparison key for duplicate names: case-folded, fullwidth folded to
-/// ASCII, marks removed and common Cyrillic / Greek look-alikes mapped to
-/// Latin, so 'Kaze', 'Ｋａｚｅ' and 'Kаze' (Cyrillic a) count as the same name.
-pub fn name_key(name: &str) -> String {
-    let mut k = String::new();
-    for ch in name.chars() {
-        let c = ch as u32;
-        if name_char_class(c) == 2 {
-            continue;
-        }
-        let ch = if (0xFF01..=0xFF5E).contains(&c) { char::from_u32(c - 0xFEE0).unwrap_or(ch) } else { ch };
-        for lc in ch.to_lowercase() {
-            k.push(match lc {
-                'а' => 'a',
-                'в' | 'β' => 'b',
-                'е' | 'ё' | 'ε' => 'e',
-                'к' | 'κ' => 'k',
-                'м' => 'm',
-                'н' | 'һ' => 'h',
-                'о' | 'ο' => 'o',
-                'р' | 'ρ' => 'p',
-                'с' => 'c',
-                'т' | 'τ' => 't',
-                'у' => 'y',
-                'х' | 'χ' => 'x',
-                'і' | 'ι' => 'i',
-                'ј' => 'j',
-                'ѕ' => 's',
-                'ԁ' => 'd',
-                'α' => 'a',
-                'η' => 'n',
-                'ν' => 'v',
-                'υ' => 'u',
-                'ζ' => 'z',
-                _ => lc,
-            });
-        }
-    }
-    k
-}
-
 impl Match {
     /// Offline / tests: both secret streams derived from one value.
     pub fn new(seed: u32, slots: usize, flags: u32, secret: u64) -> Match {
@@ -487,6 +418,7 @@ impl Match {
             w,
             rng: Rng::new(secret ^ (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED),
             crng: Rng::new(combat ^ 0x6A09_E667_F3BC_C908),
+            salt: mix64(mix64(secret ^ 0xA076_1D64_78BD_642F) ^ combat),
             tick: 0,
             phase: PH_LOBBY,
             lobby_t: if flags & FLAG_OFFLINE != 0 {
@@ -630,7 +562,7 @@ impl Match {
         self.chunk_ver[c] = self.chunk_ver[c].wrapping_add(1);
         self.chunk_tick[c] = self.tick;
         let k = self.ilog_n as usize % ILOG;
-        self.ilog[k] = ILogE { tick: self.tick, id, actor: self.item_actor, chunk: c as u8, it };
+        self.ilog[k] = ILogE { tick: self.tick, id, actor: self.item_actor, chunk: c as u8, ver: self.chunk_ver[c], it };
         self.ilog_n = self.ilog_n.wrapping_add(1);
         for p in self.players.iter_mut() {
             p.ilog_sent[k / 64] &= !(1u64 << (k % 64));
@@ -670,7 +602,7 @@ impl Match {
             Some(p) => (p.x, p.z, true),
             None => (0.0, 0.0, false),
         };
-        self.evs.push(EvRec { to, start, len, x, z, filt, shooter: 255 });
+        self.evs.push(EvRec { to, start, len, x, z, filt, shooter: 255, victim: 255, alt: V3::ZERO, alt_kind: 0 });
     }
     fn ev_pinfo(&mut self, i: usize, left: bool) {
         let p = &self.players[i];
@@ -885,6 +817,9 @@ impl Match {
                                 p.carry = Self::absorb(p.carry, old.buttons);
                                 p.acked_seq = old.seq;
                                 p.last_cmd = old;
+                                // the oldest queued commands are the late ones that
+                                // idle steps already covered: this drop pays for one
+                                p.debt = p.debt.saturating_sub(1);
                             }
                         }
                         p.cmdq.push_back(c);
@@ -1092,7 +1027,8 @@ impl Match {
         if !a.alive && !b.alive {
             return None;
         }
-        Some(HistE { pos: a.pos.lerp(b.pos, frac), crouch: if frac < 0.5 { a.crouch } else { b.crouch }, alive: true })
+        let n = if frac < 0.5 { a } else { b };
+        Some(HistE { pos: a.pos.lerp(b.pos, frac), alive: true, ..n })
     }
 
     /// Returns (victim, distance, headshot).
@@ -1107,7 +1043,7 @@ impl Match {
             if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
                 continue;
             }
-            let h = if self.players[shooter].bot { HistE { pos: q.ms.pos, crouch: q.ms.crouch, alive: true } } else {
+            let h = if self.players[shooter].bot { HistE::of(q) } else {
                 match self.rewound(j, view) {
                     Some(h) => h,
                     None => continue,
@@ -1124,15 +1060,18 @@ impl Match {
             if perp2 > 4.0 {
                 continue;
             }
-            // head sphere around the rendered head; the body capsule reaches
-            // the shoulders. Head vs body is decided by where the ray enters:
+            // head sphere on the rendered head; the body capsule reaches the
+            // shoulders. Head vs body is decided by where the ray enters:
             // body below the neck (the rendered torso top), head above it.
-            let head_c = p + V3::new(0.0, eye_h(h.crouch) + if h.crouch { 0.1 } else { 0.06 }, 0.0);
+            let pose = body_pose(p, h.yaw, h.pitch, h.crouch, h.sprint, h.mode);
+            let head_c = pose.head;
             let th = ray_sphere(o, d, head_c, 0.2, lim);
-            let tb = ray_capsule(o, d, p.x, p.z, p.y + 0.3, head_c.y - 0.3, 0.33, lim);
-            let neck = head_c.y - 0.1;
+            let upright = h.mode != MODE_FALL;
+            let tb = if upright { ray_capsule(o, d, p.x, p.z, pose.a.y, pose.b.y, 0.33, lim) } else { ray_capsule_seg(o, d, pose.a, pose.b, 0.33, lim) };
+            // between the rendered torso top and head bottom
+            let neck = head_c.y - 0.15;
             let hit = match (th, tb) {
-                (Some(th), Some(tb)) if tb < th && o.y + d.y * tb < neck => Some((tb, false)),
+                (Some(th), Some(tb)) if tb < th && (!upright || o.y + d.y * tb < neck) => Some((tb, false)),
                 (Some(th), _) => Some((th, true)),
                 (None, Some(tb)) => Some((tb, false)),
                 (None, None) => None,
@@ -1182,6 +1121,9 @@ impl Match {
             let mut end = target;
             let mut hit_kind = if ph.is_some() { 1u8 } else if wh.is_some() { 3 } else { 0 };
             let mut victim = ph;
+            // the shot as a viewer that is not sent the victim sees it
+            let alt = o + d * tw;
+            let alt_kind = if wh.is_some() { 3u8 } else { 0 };
             if ml > 0.3 {
                 let dd = md * (1.0 / ml);
                 if let Some(h) = self.w.raycast(eye, dd, ml - 0.2) {
@@ -1220,6 +1162,11 @@ impl Match {
             self.ev_end(start, 255, Some(muz));
             if let Some(e) = self.evs.last_mut() {
                 e.shooter = i as u8;
+                if let (Some((j, _, _)), 1 | 2) = (victim, hit_kind) {
+                    e.victim = j as u8;
+                    e.alt = alt;
+                    e.alt_kind = alt_kind;
+                }
             }
         }
     }
@@ -1688,7 +1635,7 @@ impl Match {
         let slot = self.tick as usize % HIST;
         for j in 0..MAX_PLAYERS {
             let p = &self.players[j];
-            self.hist[slot][j] = HistE { pos: p.ms.pos, crouch: p.ms.crouch, alive: p.used && p.alive };
+            self.hist[slot][j] = HistE::of(p);
         }
     }
 
@@ -1888,8 +1835,14 @@ impl Match {
                 // The view tick (lag compensation) is client-claimed: allow at
                 // most REWIND_MARGIN ticks above this player's recent minimum,
                 // so a low-latency client cannot rewind selectively.
-                let r = clampf(now - c.view as f32 / 256.0, 1.0, REWIND_MAX);
-                p.rew_floor = if r < p.rew_floor { r } else { (p.rew_floor + 0.08).min(r) };
+                let raw = now - c.view as f32 / 256.0;
+                let r = clampf(raw, 1.0, REWIND_MAX);
+                // A view at or ahead of the server tick (commands simulated in
+                // catch-up ticks after a server hitch) says nothing about this
+                // client's latency, so it must not pull the floor down.
+                if raw >= 1.0 {
+                    p.rew_floor = if r < p.rew_floor { r } else { (p.rew_floor + 0.08).min(r) };
+                }
                 let r = r.min(p.rew_floor + REWIND_MARGIN);
                 c.view = ((now - r) * 256.0).max(0.0) as u32;
                 p.acked_seq = c.seq;
@@ -1949,8 +1902,9 @@ impl Match {
                     self.apply_cmd(i, c);
                 }
             }
-            // A queue that stays long means a client clock running fast: drop
-            // the oldest command now and then so input latency stays low.
+            // A queue that never empties (the route got faster, a client clock
+            // running fast, a server time skip) is standing input latency: drop
+            // the oldest command now and then, keeping its taps.
             let p = &mut self.players[i];
             if p.cmdq.len() > BACKLOG_MAX {
                 p.backlog_t += 1;
@@ -2108,6 +2062,14 @@ impl Match {
         &self.out
     }
 
+    /// Quiet period before a chunk with withheld changes is resynced to
+    /// viewer `i`: 10-15 s, secret per viewer and chunk version, so the
+    /// resync's arrival does not date the hidden change.
+    fn quiet_ticks(&self, i: usize, c: usize) -> u32 {
+        let x = mix64(self.salt ^ ((i as u64) << 40) ^ ((c as u64) << 32) ^ self.chunk_ver[c] as u64);
+        ITEM_QUIET + (x % 151) as u32
+    }
+
     pub fn snapshot(&mut self, pid: u8) -> &[u8] {
         self.out.clear();
         let i = pid as usize;
@@ -2172,6 +2134,10 @@ impl Match {
         w.u8(me.spect);
         w.u8(me.place);
         w.u8(me.killer);
+        // Late commands that idle steps already stood in for: the server drops
+        // that many of the oldest when they arrive, so the client skips them
+        // when it replays its pending input.
+        w.u8(me.debt);
         // ---- zone
         let z = self.zone;
         w.u8(z.stage);
@@ -2313,21 +2279,60 @@ impl Match {
             let s = e.start as usize;
             let l = e.len as usize;
             let sh = e.shooter as usize;
-            if sh < MAX_PLAYERS && sh != i && !send[sh] && l == 28 {
-                // A shooter this viewer cannot see: audible, but no id and
-                // only a coarse position (a grid that grows with distance).
-                if d > HIDDEN_SHOT_R {
-                    continue;
-                }
+            let vi = e.victim as usize;
+            let hidden_sh = sh < MAX_PLAYERS && sh != i && !send[sh];
+            let hidden_vi = vi < MAX_PLAYERS && vi != i && !send[vi];
+            let kind = self.ev[s];
+            if kind == E_SHOT && l == 28 && (hidden_sh || hidden_vi) {
                 let mut b = [0u8; 28];
                 b.copy_from_slice(&self.ev[s..s + l]);
-                b[1] = 255;
-                let g = (d / 8.0).max(4.0);
-                for (k, step) in [(3usize, g), (7, 2.0), (11, g)] {
-                    let v = f32::from_le_bytes([b[k], b[k + 1], b[k + 2], b[k + 3]]);
-                    let qv = ((v / step).floor() + 0.5) * step;
-                    b[k..k + 4].copy_from_slice(&qv.to_le_bytes());
+                if hidden_vi {
+                    // A hit on a player this viewer is not sent: the impact
+                    // would locate them, so show the shot as if it missed.
+                    put_v3(&mut b, 15, e.alt);
+                    b[27] = e.alt_kind;
                 }
+                if hidden_sh {
+                    // A shooter this viewer cannot see: audible, but no id and
+                    // only the centre of a cell of a nested world-aligned grid
+                    // (32 / 16 / 8 m). The range cut-off and each refinement
+                    // depend only on the centre of the enclosing coarser cell,
+                    // so the cell is all a viewer learns (never a distance).
+                    let m = get_v3(&b, 3);
+                    let mut g = 32.0f32;
+                    if dist_xz(cell_c(m.x, g), cell_c(m.z, g), center.x, center.z) > HIDDEN_SHOT_R {
+                        continue;
+                    }
+                    while g > 8.0 && dist_xz(cell_c(m.x, g), cell_c(m.z, g), center.x, center.z) < g * 6.0 {
+                        g *= 0.5;
+                    }
+                    let from = V3::new(cell_c(m.x, g), cell_c(m.y, 2.0), cell_c(m.z, g));
+                    b[1] = 255;
+                    put_v3(&mut b, 3, from);
+                    if b[27] == 0 {
+                        // A miss ends exactly `range` from the aim origin (a
+                        // few of them would locate the shooter): send only a
+                        // coarse direction, drawn from the coarse origin.
+                        let dir = (get_v3(&b, 15) - m).norm();
+                        let q = |v: f32| (v * 16.0).round() / 16.0;
+                        let dq = V3::new(q(dir.x), q(dir.y), q(dir.z)).norm();
+                        let range = WD.get(b[2] as usize).map_or(100.0, |w| w.range);
+                        put_v3(&mut b, 15, from + dq * range);
+                    }
+                }
+                self.out.extend_from_slice(&b);
+            } else if kind == E_HURT && l == 11 && hidden_sh_id(&self.ev[s..s + l], i, &send) {
+                // Hurt by a player this viewer is not sent: the HUD only needs
+                // a direction, so no id and no position.
+                let mut b = [0u8; 11];
+                b.copy_from_slice(&self.ev[s..s + l]);
+                let sx = f32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+                let sz = f32::from_le_bytes([b[6], b[7], b[8], b[9]]);
+                let step = TAU / 32.0;
+                let a = ((sx - me.ms.pos.x).atan2(sz - me.ms.pos.z) / step).round() * step;
+                b[1] = HURT_HIDDEN;
+                b[2..6].copy_from_slice(&(me.ms.pos.x + a.sin() * 20.0).to_le_bytes());
+                b[6..10].copy_from_slice(&(me.ms.pos.z + a.cos() * 20.0).to_le_bytes());
                 self.out.extend_from_slice(&b);
             } else {
                 self.out.extend_from_slice(&self.ev[s..s + l]);
@@ -2339,42 +2344,82 @@ impl Match {
         // or until the chunk has been quiet long enough to resync.
         let mut fresh_hidden = [false; ICH * ICH];
         if self.players[i].item_ver.len() == ICH * ICH {
+            let quiet: [u32; ICH * ICH] = std::array::from_fn(|c| self.quiet_ticks(i, c));
             let n = self.ilog_n;
             let from = self.players[i].ilog_from.max(n.saturating_sub(ILOG as u32));
-            for idx in from..n {
+            // Newest first: a change is only sent while the viewer holds no
+            // newer state of that item (sent earlier, by a resync, or in this
+            // snapshot), so a withheld older change (say, the creation of a
+            // death pile far away) can never be replayed over a newer one
+            // (its looting) and bring looted items back as ghosts.
+            let mut covered = [0u64; MAX_ITEMS / 64 + 1];
+            let mut now: Vec<usize> = Vec::new();
+            // per chunk: ring entries newer than the viewer's version, and
+            // whether one of them is still withheld
+            let mut newer = [0u32; ICH * ICH];
+            let mut withheld = [false; ICH * ICH];
+            for idx in (from..n).rev() {
                 let k = idx as usize % ILOG;
-                if self.players[i].ilog_sent[k / 64] & (1u64 << (k % 64)) != 0 {
+                let bit = 1u64 << (k % 64);
+                let e = self.ilog[k];
+                let c = e.chunk as usize;
+                let (cw, cb) = (e.id as usize / 64, 1u64 << (e.id % 64));
+                let is_newer = e.ver.wrapping_sub(self.players[i].item_ver[c]) as i32 > 0;
+                if is_newer {
+                    newer[c] += 1;
+                }
+                if self.players[i].ilog_sent[k / 64] & bit != 0 || covered[cw] & cb != 0 {
+                    // delivered, or superseded by a newer state the viewer holds
+                    self.players[i].ilog_sent[k / 64] |= bit;
+                    covered[cw] |= cb;
                     continue;
                 }
-                let e = self.ilog[k];
                 let a = e.actor as usize;
                 let near = dist_xz(e.it.pos.x, e.it.pos.z, center.x, center.z) < ALWAYS_SEND_R;
                 if a == i || near || (a < MAX_PLAYERS && send[a]) {
-                    let mut w = Wr::new(&mut self.out);
-                    if e.it.alive {
-                        w.u8(E_ITEM);
-                        w.u16(e.id);
-                        w.u8(e.it.kind);
-                        w.u16(e.it.amount);
-                        w.f32(e.it.pos.x);
-                        w.f32(e.it.pos.y);
-                        w.f32(e.it.pos.z);
-                    } else {
-                        w.u8(E_IDEL);
-                        w.u16(e.id);
+                    now.push(k);
+                    covered[cw] |= cb;
+                    self.players[i].ilog_sent[k / 64] |= bit;
+                } else {
+                    withheld[c] |= is_newer;
+                    if tick.wrapping_sub(e.tick) < quiet[c] {
+                        fresh_hidden[c] = true;
                     }
-                    ecount += 1;
-                    self.players[i].ilog_sent[k / 64] |= 1u64 << (k % 64);
-                } else if tick.wrapping_sub(e.tick) < ITEM_QUIET {
-                    fresh_hidden[e.chunk as usize] = true;
+                }
+            }
+            for &k in now.iter().rev() {
+                let e = self.ilog[k];
+                let mut w = Wr::new(&mut self.out);
+                if e.it.alive {
+                    w.u8(E_ITEM);
+                    w.u16(e.id);
+                    w.u8(e.it.kind);
+                    w.u16(e.it.amount);
+                    w.f32(e.it.pos.x);
+                    w.f32(e.it.pos.y);
+                    w.f32(e.it.pos.z);
+                } else {
+                    w.u8(E_IDEL);
+                    w.u16(e.id);
+                }
+                ecount += 1;
+            }
+            // A chunk whose every change since the viewer's version reached it
+            // as a delta is up to date. Resyncing it anyway (say, right after
+            // the viewer's own pickup) would answer at once whether hidden
+            // changes are pending there.
+            for c in 0..ICH * ICH {
+                let (v, cv) = (self.players[i].item_ver[c], self.chunk_ver[c]);
+                if v != cv && !withheld[c] && newer[c] == cv.wrapping_sub(v) {
+                    self.players[i].item_ver[c] = cv;
                 }
             }
             // If the ring no longer holds every change of the quiet window, only
             // chunks quiet for the whole window may be resynced.
-            let ring_full = n as usize > ILOG && tick.wrapping_sub(self.ilog[n as usize % ILOG].tick) < ITEM_QUIET;
+            let ring_full = n as usize > ILOG && tick.wrapping_sub(self.ilog[n as usize % ILOG].tick) < ITEM_QUIET + 150;
             if ring_full {
                 for c in 0..ICH * ICH {
-                    if tick.wrapping_sub(self.chunk_tick[c]) < ITEM_QUIET {
+                    if tick.wrapping_sub(self.chunk_tick[c]) < quiet[c] {
                         fresh_hidden[c] = true;
                     }
                 }

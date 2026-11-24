@@ -148,7 +148,9 @@ fn torso_shoulders_and_heads_register() {
 
 #[test]
 fn no_item_spawns_inside_solids() {
-    for seed in 1..=12u32 {
+    // crates of a later town used to cover loot spots of earlier ones
+    // (seeds 25, 55, 132, 162)
+    for seed in (1..=40u32).chain([55, 132, 162]) {
         let m = Match::new(seed, 8, FLAG_OFFLINE, 1);
         for it in m.items.iter().filter(|it| it.alive) {
             assert!(m.w.item_spot_clear(it.pos.x, it.pos.y + 0.2, it.pos.z, 0.0), "seed {seed}: item kind {} inside a solid at {:?}", it.kind, it.pos);
@@ -190,4 +192,99 @@ fn bots_do_not_freeze_at_waypoints() {
     }
     eprintln!("longest idle bot freeze: {worst:.1} s");
     assert!(worst < 12.0, "a bot stood still for {worst:.1} s without fighting or healing");
+}
+
+/// Third review: the head sphere sat on the body axis while the drawn head
+/// is ahead of it (crouched 0.11 m, more when looking down), so from the side
+/// a quarter of the drawn head missed and air behind it counted as head.
+/// The head box here is rebuilt from src/render/models.ts (emitCharacter).
+#[test]
+fn side_shots_hit_the_drawn_head() {
+    let mut m = Match::new(42, 2, FLAG_OFFLINE, 3);
+    let a = m.add_human(b"A").unwrap() as usize;
+    let b = m.add_human(b"B").unwrap() as usize;
+    m.step();
+    m.players[a].bot = true; // live positions, no rewind
+    let t = V3::new(500.0, 30.0, 500.0);
+    let rot = |ang: f32, y: f32, z: f32| (y * ang.cos() - z * ang.sin(), y * ang.sin() + z * ang.cos());
+    let mut worst = 1.0f32;
+    for crouch in [false, true] {
+        for pitch in [-0.6f32, 0.0, 0.5] {
+            for yaw in [0.0f32, 1.2, -2.5] {
+                {
+                    let q = &mut m.players[b];
+                    q.ms = MoveState { pos: t, mode: MODE_GROUND, on_ground: true, crouch, ..Default::default() };
+                    q.yaw = yaw;
+                    q.pitch = pitch;
+                }
+                // models.ts: hips at hipH, torso pivot +0.02 leaning `lean`, head pivot
+                // +0.6 up the torso, head box centre (0, 0.14, 0.01) turned by
+                // lean + headPitch, size 0.25 x 0.27 x 0.27
+                let lean = if crouch { 0.15f32 } else { 0.05 };
+                let hip = if crouch { 0.5f32 } else { 0.95 };
+                let head_pitch = -pitch * 0.55 - lean * 0.6;
+                let (py, pz) = rot(lean, 0.6, 0.0);
+                let (cy, cz) = rot(lean + head_pitch, 0.14, 0.01);
+                let (hy, hz) = (hip + 0.02 + py + cy, pz + cz);
+                let f = fwd(yaw);
+                let side = right(yaw);
+                let at = |up: f32, ahead: f32| t + V3::new(f.x * ahead, up, f.z * ahead);
+                // rays from the side through the central 80% of the head's side silhouette
+                let (mut n, mut head) = (0, 0);
+                for iy in -4..=4 {
+                    for iz in -4..=4 {
+                        let p = at(hy + iy as f32 * 0.027, hz + iz as f32 * 0.027);
+                        m.players[a].ms = MoveState { pos: p + side * 10.0 - V3::new(0.0, eye_h(false), 0.0), mode: MODE_GROUND, on_ground: true, ..Default::default() };
+                        let o = p + side * 10.0;
+                        n += 1;
+                        if let Some((j, _, true)) = m.ray_players(a, o, side * -1.0, 30.0, 0) {
+                            if j == b {
+                                head += 1;
+                            }
+                        }
+                    }
+                }
+                let frac = head as f32 / n as f32;
+                worst = worst.min(frac);
+                assert!(frac >= 0.97, "crouch={crouch} pitch={pitch} yaw={yaw}: only {:.0}% of the drawn head registers as head", frac * 100.0);
+                // air 0.25 m behind the head centre is not a headshot
+                let p = at(hy, hz - 0.25);
+                let o = p + side * 10.0;
+                let r = m.ray_players(a, o, side * -1.0, 30.0, 0);
+                assert!(!matches!(r, Some((_, _, true))), "crouch={crouch} pitch={pitch}: air behind the head counts as a headshot");
+            }
+        }
+    }
+    eprintln!("worst head coverage from the side: {:.0}%", worst * 100.0);
+}
+
+/// A free-falling body is drawn face down around the hips: shots at the drawn
+/// torso hit, shots where an upright body would be miss.
+#[test]
+fn free_fall_hitbox_follows_the_drawn_body() {
+    let mut m = Match::new(42, 2, FLAG_OFFLINE, 3);
+    let a = m.add_human(b"A").unwrap() as usize;
+    let b = m.add_human(b"B").unwrap() as usize;
+    m.step();
+    m.players[a].bot = true;
+    let t = V3::new(500.0, 200.0, 500.0);
+    for yaw in [0.0f32, 2.0] {
+        {
+            let q = &mut m.players[b];
+            q.ms = MoveState { pos: t, mode: MODE_FALL, ..Default::default() };
+            q.yaw = yaw;
+            q.pitch = 0.0;
+        }
+        let f = fwd(yaw);
+        let side = right(yaw);
+        let shot = |m: &Match, up: f32, ahead: f32| {
+            let p = t + V3::new(f.x * ahead, up, f.z * ahead);
+            m.ray_players(a, p + side * 10.0, side * -1.0, 30.0, 0).map(|h| h.2)
+        };
+        // the drawn torso and head lie ahead of the hips (0.95 m up)
+        assert_eq!(shot(&m, 0.95 + 0.12, 0.35), Some(false), "yaw {yaw}: drawn torso not hit");
+        assert_eq!(shot(&m, 0.95 + 0.2, 0.73), Some(true), "yaw {yaw}: drawn head not hit");
+        // where an upright head would be: empty air
+        assert_eq!(shot(&m, 1.7, 0.0), None, "yaw {yaw}: upright head position still hit");
+    }
 }

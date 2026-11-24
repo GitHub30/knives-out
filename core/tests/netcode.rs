@@ -400,3 +400,256 @@ fn queue_overflow_keeps_taps() {
     }
     assert!(jumped, "a jump tap was lost when the queue overflowed");
 }
+
+// ---------------------------------------------------------------------------
+// Third adversarial review
+
+/// The uplink delay drops (bufferbloat clears): the commands that were in
+/// flight arrive early. Lag accounting can't simulate them faster, so they
+/// must be trimmed, not left as a standing queue (input latency) for the rest
+/// of the match.
+#[test]
+fn delay_drop_leaves_no_standing_backlog() {
+    for (hi, lo) in [(8u32, 2u32), (5, 2), (4, 1)] {
+        let (mut m, a, _) = two_humans(42);
+        let start = open_run(&m);
+        place(&mut m, a, start);
+        let mut seq = m.players[a as usize].last_seq;
+        // (seq, tick made)
+        let mut flight: VecDeque<(u32, u32)> = VecDeque::new();
+        let (mut qsum, mut lsum, mut n) = (0usize, 0u32, 0u32);
+        for k in 0..900u32 {
+            seq += 1;
+            flight.push_back((seq, k));
+            let delay = if k < 150 { hi } else { lo };
+            // online client: two commands per message, sent every other tick
+            if k % 2 == 1 {
+                let mut batch = vec![];
+                while let Some(&(s, made)) = flight.front() {
+                    if made + delay > k {
+                        break;
+                    }
+                    flight.pop_front();
+                    batch.push((s, m.tick.saturating_sub(4) * 256, 0i8, 0i8, 0u16, 0i16, 0u16));
+                }
+                for c in batch.chunks(8) {
+                    m.on_message(a, &cmd_bytes(c));
+                }
+            }
+            m.step();
+            if k >= 600 {
+                let p = &m.players[a as usize];
+                qsum += p.cmdq.len();
+                lsum += seq - p.acked_seq;
+                n += 1;
+            }
+        }
+        let q = qsum as f32 / n as f32;
+        let behind = lsum as f32 / n as f32;
+        eprintln!("delay {hi} -> {lo} ticks: queue {q:.2}, ack {behind:.2} commands behind (network delay {lo})");
+        assert!(q <= 1.0, "delay {hi} -> {lo}: standing queue of {q:.2} commands");
+        assert!(behind <= lo as f32 + 1.5, "delay {hi} -> {lo}: ack {behind:.2} commands behind");
+    }
+}
+
+/// Commands pushed out of a full queue are the late ones that idle steps
+/// already covered: they pay the debt, so no stale debt is left to drop (and
+/// to tell the client to skip) commands that are not late.
+#[test]
+fn queue_overflow_pays_debt() {
+    let (mut m, a, _) = two_humans(42);
+    let start = open_run(&m);
+    place(&mut m, a, start);
+    let mut cl = Client::new(&m, a);
+    for k in 0..30 {
+        cl.tick(&mut m, a, k, 1, 1, 0, 0, 0.0);
+    }
+    // 20-tick uplink stall, then the whole burst lands at once
+    for _ in 0..20 {
+        cl.seq += 1;
+        cl.pending.push_back((cl.seq, m.tick.saturating_sub(4) * 256, 0, 0, 0, 0, 0));
+        m.step();
+    }
+    assert!(m.players[a as usize].debt >= 12, "debt {}", m.players[a as usize].debt);
+    cl.tick(&mut m, a, 0, 1, usize::MAX, 0, 0, 0.0);
+    for k in 0..3 {
+        cl.tick(&mut m, a, k, 1, 1, 0, 0, 0.0);
+    }
+    let p = &m.players[a as usize];
+    assert!(p.debt <= 1, "stale debt of {} after the late commands were dropped", p.debt);
+    assert!(p.cmds_applied + p.idle_steps <= m.tick, "more steps than ticks");
+}
+
+/// After a server hitch the catch-up ticks simulate commands whose view is
+/// ahead of the server tick. They say nothing about the client's latency and
+/// must not cut an honest high-latency player's lag compensation.
+#[test]
+fn server_hitch_keeps_rewind_floor() {
+    let (mut m, a, _) = two_humans(42);
+    let start = open_run(&m);
+    place(&mut m, a, start);
+    let mut seq = m.players[a as usize].last_seq;
+    fn send(m: &mut Match, a: u8, seq: &mut u32, view: u32) {
+        *seq += 1;
+        m.on_message(a, &cmd_bytes(&[(*seq, view, 0, 0, 0, 0, 0)]));
+        m.step();
+    }
+    let rew = |m: &Match| m.tick as f32 - m.players[a as usize].last_cmd.view as f32 / 256.0;
+    for _ in 0..20 {
+        m.step();
+    }
+    // a high-latency client: renders 9 ticks behind the tick that simulates it
+    for _ in 0..120 {
+        let v = (m.tick + 1 - 9) * 256;
+        send(&mut m, a, &mut seq, v);
+    }
+    assert!((rew(&m) - 9.0).abs() < 0.01, "rewind {}", rew(&m));
+    // server hitch: commands made while it stood still are simulated in
+    // catch-up ticks, with views up to a few ticks ahead
+    for _ in 0..6 {
+        let v = (m.tick + 1 + 3) * 256;
+        send(&mut m, a, &mut seq, v);
+    }
+    let v = (m.tick + 1 - 9) * 256;
+    send(&mut m, a, &mut seq, v);
+    assert!((rew(&m) - 9.0).abs() < 0.01, "rewind cut to {:.2} ticks after a server hitch", rew(&m));
+}
+
+/// Client prediction across uplink stalls (TCP retransmits, radio hiccups).
+/// The server stands in for late commands with idle steps and drops as many
+/// late commands when they arrive; the snapshot says how many (debt), so the
+/// client must not replay them. Mirrors `Game.reconcile` in src/game.ts.
+fn stall_run(mode: u8, seed: u32, hold_ms: f64) -> (u32, u32, f32) {
+    let mut m = Match::new(42 + seed, 2, 0, 99);
+    let a = m.add_human(b"A").unwrap();
+    let _b = m.add_human(b"B").unwrap();
+    m.step();
+    assert_eq!(m.phase, PH_PLAY);
+    let g = open_run(&m);
+    m.players[a as usize].ms = match mode {
+        MODE_FALL => MoveState { pos: g + V3::new(0.0, 700.0, 0.0), vel: V3::new(0.0, -5.0, 0.0), mode: MODE_FALL, ..Default::default() },
+        MODE_PARA => MoveState { pos: g + V3::new(0.0, 125.0, 0.0), vel: V3::new(0.0, -6.0, 0.0), mode: MODE_PARA, ..Default::default() },
+        _ => MoveState { pos: g, mode: MODE_GROUND, on_ground: true, ..Default::default() },
+    };
+    let yaw = q_yaw(yaw_to(1.0, 0.0));
+    let mut rng = Rng::new(1000 + seed as u64 * 7 + mode as u64);
+    let (up, down, jit) = (25.0f64, 25.0f64, 10.0f64);
+    let tick_ms = 1000.0 / 30.0;
+    let frame_ms = 1000.0 / 60.0;
+    let (mut next_tick, mut next_frame) = (tick_ms, 0.0f64);
+    // uplink messages and downlink snapshots (tick, ack, debt, state, speed)
+    let mut up_q: VecDeque<(f64, Vec<u8>)> = VecDeque::new();
+    let mut down_q: VecDeque<(f64, (u32, u32, u8, MoveState, f32))> = VecDeque::new();
+    let (mut last_up, mut last_down) = (0.0f64, 0.0f64);
+    let mut seq = m.players[a as usize].last_seq;
+    // pending (seq, command, made at ms)
+    let mut pending: VecDeque<(u32, Q, f64)> = VecDeque::new();
+    let mut outbox: Vec<Q> = Vec::new();
+    let mut pred: Option<MoveState> = None;
+    let mut mult = 1.0f32;
+    let (mut cmd_acc, mut last_frame, mut latest_tick) = (0.0f64, 0.0f64, 0u32);
+    let rtt = up + down + jit;
+    let holds: Vec<f64> = (0..3).map(|k| 2500.0 + k as f64 * (hold_ms + 2100.0)).collect();
+    let end = 2500.0 + 3.0 * (hold_ms + 2100.0);
+    let (mut corrections, mut hard, mut worst) = (0u32, 0u32, 0.0f32);
+    loop {
+        let t;
+        if next_tick <= next_frame {
+            t = next_tick;
+            next_tick += tick_ms;
+            while up_q.front().map_or(false, |(at, _)| *at <= t) {
+                let (_, msg) = up_q.pop_front().unwrap();
+                m.on_message(a, &msg);
+            }
+            if m.step() & 1 != 0 {
+                // the client reads ack and debt off the wire
+                let buf = m.snapshot(a).to_vec();
+                let ack = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                let debt = buf[17 + 81];
+                let p = &m.players[a as usize];
+                assert_eq!((ack, debt), (p.acked_seq, p.debt), "snapshot ack/debt offsets");
+                let at = (t + down + rng.f() as f64 * jit).max(last_down);
+                last_down = at;
+                down_q.push_back((at, (m.tick, ack, debt, p.ms, p.speed_mult())));
+            }
+        } else {
+            t = next_frame;
+            next_frame += frame_ms;
+            while down_q.front().map_or(false, |(at, _)| *at <= t) {
+                let (_, (tick, ack, debt, ms, sm)) = down_q.pop_front().unwrap();
+                if tick <= latest_tick {
+                    continue;
+                }
+                latest_tick = tick;
+                while pending.front().map_or(false, |q| q.0 <= ack) {
+                    pending.pop_front();
+                }
+                let old = pred.map(|p| p.pos);
+                let mut s = ms;
+                mult = sm;
+                let late = t - (rtt + 100.0);
+                let mut skip = 0;
+                while skip < debt as usize && skip < pending.len() && pending[skip].2 < late {
+                    skip += 1;
+                }
+                for (_, q, _) in pending.iter().skip(skip) {
+                    step_move(&m.w, &mut s, &Cmd::from_quant(0, 0, q.2, q.3, q.4, q.5, q.6), mult, DT);
+                }
+                if let (Some(o), true) = (old, ms.mode == mode) {
+                    let d = (o - s.pos).len();
+                    if d > 1e-3 {
+                        corrections += 1;
+                    }
+                    if d >= 3.0 {
+                        hard += 1;
+                    }
+                    worst = worst.max(d);
+                }
+                pred = Some(s);
+            }
+            // commands at 30 Hz, two per message
+            cmd_acc += t - last_frame;
+            last_frame = t;
+            let mut n = 0;
+            while cmd_acc >= tick_ms && n < 4 {
+                cmd_acc -= tick_ms;
+                n += 1;
+                seq += 1;
+                let q: Q = (seq, latest_tick.saturating_sub(4) * 256, 0, 127, yaw, 0, 0);
+                pending.push_back((seq, q, t));
+                outbox.push(q);
+                if let Some(p) = pred.as_mut() {
+                    step_move(&m.w, p, &Cmd::from_quant(0, 0, q.2, q.3, q.4, q.5, q.6), mult, DT);
+                }
+            }
+            if outbox.len() >= 2 {
+                let mut at = t + up + rng.f() as f64 * jit;
+                for &h in &holds {
+                    if t >= h && t < h + hold_ms {
+                        at = at.max(h + hold_ms);
+                    }
+                }
+                at = at.max(last_up);
+                last_up = at;
+                up_q.push_back((at, cmd_bytes(&outbox)));
+                outbox.clear();
+            }
+        }
+        if t > end || (m.players[a as usize].ms.mode != mode && t > 1000.0) {
+            break;
+        }
+    }
+    (corrections, hard, worst)
+}
+
+#[test]
+fn uplink_stalls_do_not_snap_the_prediction() {
+    for (mode, name, limit) in [(MODE_FALL, "freefall", 3.0f32), (MODE_PARA, "parachute", 1.2), (MODE_GROUND, "ground", 0.6)] {
+        for seed in 0..2 {
+            let (corr, hard, worst) = stall_run(mode, seed, 400.0);
+            eprintln!("{name} seed {seed}: {corr} corrections, {hard} hard snaps, worst {worst:.2} m");
+            assert_eq!(hard, 0, "{name}: {hard} hard snaps (worst {worst:.2} m)");
+            assert!(worst < limit, "{name}: prediction corrected by {worst:.2} m after 400 ms uplink stalls");
+        }
+    }
+}

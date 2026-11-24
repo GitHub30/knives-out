@@ -14,6 +14,7 @@ pub mod bot;
 pub mod defs;
 pub mod math;
 pub mod mesh;
+pub mod names;
 pub mod net;
 pub mod player;
 pub mod rng;

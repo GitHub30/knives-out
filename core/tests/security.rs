@@ -327,7 +327,7 @@ fn names_are_sanitized_and_unique() {
 /// Offsets of the players block in a snapshot (mirrors `Match::snapshot`).
 fn snapshot_player_ids(buf: &[u8]) -> Vec<u8> {
     let header = 1 + 4 + 4 + 1 + 4 + 1 + 1 + 1;
-    let selfb = 1 + 1 + 12 + 12 + 4 + 4 + 4 + 1 + 6 + 8 + 3 + 1 + 4 + 4 + 1 + 4 + 4 + 2 + 2 + 3;
+    let selfb = 1 + 1 + 12 + 12 + 4 + 4 + 4 + 1 + 6 + 8 + 3 + 1 + 4 + 4 + 1 + 4 + 4 + 2 + 2 + 3 + 1;
     let zone = 2 + 4 * 8;
     let plane = 1 + 4 * 7;
     let off = header + selfb + zone + plane;
@@ -368,4 +368,54 @@ fn hidden_players_are_not_sent() {
         }
     }
     assert!(seen > 0 && hidden > 0, "need both visible ({seen}) and hidden ({hidden}) cases");
+}
+
+/// Third review: blank-looking names, look-alike duplicates that the key
+/// missed, and scripts / emoji sequences that were mangled.
+#[test]
+fn names_round3() {
+    let mut m = Match::new(1, 32, FLAG_OFFLINE, 7);
+    let mut add = |s: &str| {
+        let id = m.add_human(s.as_bytes()).unwrap();
+        m.players[id as usize].name.clone()
+    };
+    // a blank (Braille pattern blank) is not a name
+    assert_eq!(add("\u{2800}\u{2800}\u{2800}"), "Player");
+    assert_eq!(add("a\u{2800}b"), "ab");
+    // look-alike pairs: the second one gets a suffix
+    for (a, b) in [
+        ("Caf\u{e9}", "Cafe\u{301}"),
+        ("YUKI", "\u{3a5}UKI"),
+        ("NINJA", "\u{39d}I\u{39d}JA"),
+        ("HERO", "\u{397}ERO"),
+        ("MAX", "\u{39c}AX"),
+        ("Yuki", "\u{4ae}uki"),
+        ("WOLF", "\u{51c}OLF"),
+        ("lolo", "\u{4cf}o\u{4cf}o"),
+        ("Kiki", "K\u{131}k\u{131}"),
+        ("\u{30ab}\u{30bf}\u{30ab}\u{30ca}", "\u{ff76}\u{ff80}\u{ff76}\u{ff85}"),
+        ("\u{30ac}\u{30c3}\u{30c4}", "\u{ff76}\u{ff9e}\u{ff6f}\u{ff82}"),
+        ("Bill", "BiII"),
+        ("modern", "modem"),
+    ] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        let na = add(a);
+        let nb = add(b);
+        assert_eq!(na, a, "{a:?} was changed to {na:?}");
+        assert!(nb.contains('#'), "{b:?} ({nb:?}) is accepted next to {a:?}");
+    }
+    // radicals, compatibility ideographs and Roman numerals look like other
+    // characters: dropped
+    assert!(add("\u{2f24}\u{2f08}").starts_with("Player"));
+    assert!(add("\u{2170}\u{2170}").starts_with("Player"));
+    // whole scripts and emoji sequences survive
+    for s in ["\u{10dc}\u{10d8}\u{10dc}\u{10dd}", "\u{986}\u{9ae}\u{9bf}", "\u{ba4}\u{bae}\u{bbf}\u{bb4}\u{bcd}", "\u{2764}\u{fe0f}", "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "1\u{fe0f}\u{20e3}", "\u{1f44d}\u{1f3fd}"] {
+        assert_eq!(add(s), s, "{s:?} was mangled");
+    }
+    // joiners and selectors only inside emoji sequences
+    assert_eq!(add("a\u{200d}b\u{fe0f}"), "ab#2", "joiner / selector between letters kept");
 }

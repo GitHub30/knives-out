@@ -41,12 +41,16 @@ interface CoreExports {
   cli_pred_step(): void;
 }
 
+// Content-hashed by Vite (assets/core-<hash>.wasm): a cached copy of an
+// older core can never be paired with a newer client.
+import coreWasmUrl from './core.wasm?url';
+
 let modulePromise: Promise<WebAssembly.Module> | null = null;
 
 /** Compile once; the same Module is shared with the offline server worker. */
 export function coreModule(): Promise<WebAssembly.Module> {
   if (!modulePromise) {
-    const url = new URL('core.wasm', document.baseURI).href;
+    const url = new URL(coreWasmUrl, document.baseURI).href;
     modulePromise = (async () => {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`core.wasm: HTTP ${res.status}`);

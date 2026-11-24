@@ -673,10 +673,14 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let q = &m.players[b.target as usize];
     let pos = p.ms.pos;
     let eye = pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
-    let aim_h = if b.skill > 0.7 && b.rng.chance(0.02) { eye_h(q.ms.crouch) + 0.05 } else if q.ms.crouch { 0.85 } else { 1.2 };
+    let aim = if b.skill > 0.7 && b.rng.chance(0.02) {
+        body_pose(q.ms.pos, q.yaw, q.pitch, q.ms.crouch, q.ms.vel.len_xz() > SPRINT_DRAW_SPEED, q.ms.mode).head
+    } else {
+        q.ms.pos + V3::new(0.0, if q.ms.crouch { 0.85 } else { 1.2 }, 0.0)
+    };
     // lead the target a little based on skill
     let lead = q.ms.vel * (0.06 * b.skill);
-    let tp = q.ms.pos + V3::new(0.0, aim_h, 0.0) + lead;
+    let tp = aim + lead;
     let dist = (tp - eye).len();
     // Shots leave from the shoulder camera ray (or the eye when scoped), so
     // aim from that origin, not from the eye.

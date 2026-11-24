@@ -421,6 +421,14 @@ impl World {
         }
 
         // ---- finalize
+        // A box placed after a loot spot (a crate of a later town) can cover
+        // it: every item spawned there would sit inside the box.
+        let blocked: Vec<bool> = w.spots.iter().map(|sp| w.spot_blocked(sp.pos.x, sp.pos.y + 0.3, sp.pos.z, 0)).collect();
+        let mut k = 0;
+        w.spots.retain(|_| {
+            k += 1;
+            !blocked[k - 1]
+        });
         w.maxh = w.h.iter().cloned().fold(f32::MIN, f32::max);
         w.build_grid();
         w.checksum = w.compute_checksum();

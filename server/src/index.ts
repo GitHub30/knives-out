@@ -4,11 +4,15 @@
 //
 // Abuse limits (all approximate, fail-open if the Lobby object is reset):
 // * Workers rate-limit binding: join attempts per IP per minute.
+// * Workers rate-limit binding: join attempts per IP / IPv6 /64 and per IPv6 /48.
 // * Lobby object: concurrent sockets per client network (IPv4 address or IPv6 /64,
 //   plus an aggregate per IPv6 /48), global concurrent sockets and rooms. Private
 //   rooms have their own, smaller cap (public matchmaking always keeps capacity)
-//   and each network may only hold one private room it created.
-// * Room object: sockets silent for 2 minutes are closed.
+//   and each network may only hold two private rooms it created. Joins that
+//   leave again do not advance the public room's fill count.
+// * Refusals are sent in-band (S_ERROR + reason code) so the player sees why.
+// * Room object: sockets silent for 2 minutes are closed; a private room closes
+//   as soon as its last player leaves.
 // * Room object: sockets per IP per room, message size, message rate (token bucket).
 
 import wasmModule from './core.wasm';
@@ -44,6 +48,10 @@ const S_ERROR = 0x84;
 const ERR_FULL = 1;
 const ERR_STARTED = 2;
 const ERR_TOO_MANY = 4;
+const ERR_BUSY = 5;
+const ERR_PRIV_NET = 6;
+const ERR_RATE = 7;
+const ERR_BAD_CODE = 8;
 const TICK_MS = 1000 / 30;
 const MAX_MSG = 256;
 const MAX_ROOM_MS = 25 * 60 * 1000;
@@ -87,6 +95,21 @@ export function net48(net: string): string {
   return net.split(':').slice(0, 3).join(':') + '::/48';
 }
 
+/** Refuse a WebSocket join in-band: a browser cannot read an HTTP error on an
+ * upgrade, so the reason travels as S_ERROR on an accepted socket. */
+function refuse(code: number, reason: string): Response {
+  const pair = new WebSocketPair();
+  const server = pair[1];
+  server.accept();
+  try {
+    server.send(new Uint8Array([S_ERROR, code]));
+    server.close(4000 + code, reason);
+  } catch {
+    /* ignore */
+  }
+  return new Response(null, { status: 101, webSocket: pair[0] });
+}
+
 function plain(text: string, status: number): Response {
   return new Response(text, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' } });
 }
@@ -109,14 +132,25 @@ export default {
       const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown';
       const net = netKey(ip);
       if (env.JOIN_LIMIT) {
-        const { success } = await env.JOIN_LIMIT.limit({ key: net });
-        if (!success) return plain('Too many join attempts', 429);
+        // per address (IPv6 /64), and per IPv6 /48 so one allocation cannot
+        // rotate through its /64s
+        const g48 = net48(net);
+        const keys = g48 !== net ? [net, g48] : [net];
+        for (const key of keys) {
+          const { success } = await env.JOIN_LIMIT.limit({ key });
+          if (!success) return refuse(ERR_RATE, 'too many join attempts');
+        }
       }
       const name = (url.searchParams.get('name') ?? '').slice(0, 32);
       const code = url.searchParams.get('room');
-      if (code !== null && !ROOM_CODE.test(code)) return plain('Bad room code', 400);
+      if (code !== null && !ROOM_CODE.test(code)) return refuse(ERR_BAD_CODE, 'bad room code');
       const r = await lobbyStub(env).fetch('https://lobby/join', { method: 'POST', body: JSON.stringify({ net, code }) });
-      if (!r.ok) return plain(r.status === 429 ? 'Too many connections' : 'Server busy', r.status);
+      if (!r.ok) {
+        const err = ((await r.json().catch(() => ({}))) as { error?: string }).error;
+        if (err === 'privnet') return refuse(ERR_PRIV_NET, 'too many private rooms');
+        if (r.status === 429) return refuse(ERR_TOO_MANY, 'too many connections');
+        return refuse(ERR_BUSY, 'server busy');
+      }
       const { room } = (await r.json()) as { room: string };
       const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
       const fwd = new URL('https://room/ws');
@@ -214,7 +248,7 @@ export class Lobby {
             if (net48(owner) === g48) by48++;
           }
           if (total >= MAX_PRIVATE_ROOMS) return json({ error: 'busy' }, 503);
-          if (byNet >= MAX_PRIVATE_PER_NET || by48 >= MAX_PRIVATE_PER_NET48) return json({ error: 'net' }, 429);
+          if (byNet >= MAX_PRIVATE_PER_NET || by48 >= MAX_PRIVATE_PER_NET48) return json({ error: 'privnet' }, 429);
         }
       } else {
         const c = this.current;
@@ -240,6 +274,10 @@ export class Lobby {
         if (!list.length) this.nets.delete(net);
       }
       if (body.room && this.rooms.has(body.room)) this.rooms.set(body.room, now);
+      // a join that left again (or never got in) must not fill the open public
+      // room: otherwise a stream of short joins forces new rooms
+      const c = this.current;
+      if (c && body.room === c.name && c.count > 0) c.count--;
       return json({ ok: true });
     }
     if (url.pathname === '/closed') {
@@ -276,6 +314,7 @@ export class Room {
   private emptySince = 0;
   private ended = false;
   private roomName = '';
+  private isPrivate = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -292,6 +331,7 @@ export class Room {
   }
 
   private init(isPrivate: boolean) {
+    this.isPrivate = isPrivate;
     const inst = new WebAssembly.Instance(wasmModule, {});
     this.ex = inst.exports as unknown as SrvExports;
     // public island seed + 128 bits of server-only entropy (match and combat RNG)
@@ -418,7 +458,12 @@ export class Room {
     this.conns.delete(ws);
     this.ex?.srv_remove(c.pid);
     this.notifyLobby('/leave', { net: c.net, room: this.roomName });
-    if (this.conns.size === 0) this.emptySince = Date.now();
+    if (this.conns.size === 0) {
+      this.emptySince = Date.now();
+      // nobody is coming back to a private room (its code makes a fresh one):
+      // free it at once, so its creator's network can open another
+      if (this.isPrivate && !this.ended) this.stop('empty');
+    }
   }
 
   private startLoop() {

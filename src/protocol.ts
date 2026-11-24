@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 5;
+export const PROTO = 6;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -150,6 +150,8 @@ export interface SelfState {
   spect: number;
   place: number;
   killer: number;
+  /** Late commands the server will drop instead of simulating (see Game.reconcile). */
+  debt: number;
 }
 
 export interface ZoneState {
@@ -311,6 +313,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
     spect: 255,
     place: 0,
     killer: 255,
+    debt: 0,
   };
   for (let s = 0; s < 2; s++) self.slots.push({ kind: r.u8(), mag: r.u16() });
   for (let a = 0; a < 4; a++) self.ammo.push(r.u16());
@@ -326,6 +329,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
   self.spect = r.u8();
   self.place = r.u8();
   self.killer = r.u8();
+  self.debt = r.u8();
   const zstage = r.u8();
   const zf = r.u8();
   const zone: ZoneState = {
