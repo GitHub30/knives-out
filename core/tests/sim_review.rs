@@ -288,3 +288,240 @@ fn free_fall_hitbox_follows_the_drawn_body() {
         assert_eq!(shot(&m, 1.7, 0.0), None, "yaw {yaw}: upright head position still hit");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fourth adversarial review
+
+type Q = (u32, u32, i8, i8, u16, i16, u16);
+
+fn cmd_bytes(cmds: &[Q]) -> Vec<u8> {
+    let mut v = vec![C_INPUT, cmds.len() as u8];
+    for &(seq, view, mx, mz, yaw, pitch, b) in cmds {
+        v.extend_from_slice(&seq.to_le_bytes());
+        v.extend_from_slice(&view.to_le_bytes());
+        v.push(mx as u8);
+        v.push(mz as u8);
+        v.extend_from_slice(&yaw.to_le_bytes());
+        v.extend_from_slice(&pitch.to_le_bytes());
+        v.extend_from_slice(&b.to_le_bytes());
+    }
+    v
+}
+
+/// Flat open ground with 30 m of clear view along +z.
+fn open_ground(m: &Match) -> V3 {
+    for gz in (80..940).step_by(11) {
+        for gx in (80..860).step_by(11) {
+            let (x, z) = (gx as f32, gz as f32);
+            let h0 = m.w.height(x, z);
+            if h0 < 3.0 || m.w.building_at(x, z).is_some() {
+                continue;
+            }
+            let flat = (0..30).all(|k| {
+                let h = m.w.height(x, z + k as f32);
+                (h - h0).abs() < 0.6 && h > 2.0
+            });
+            let clear = [0.4f32, 1.0, 1.6, 2.0].iter().all(|&y| m.w.raycast(V3::new(x, h0 + y, z), V3::new(0.0, 0.0, 1.0), 30.0).is_none());
+            if flat && clear {
+                return V3::new(x, m.w.ground_below(x, z, h0 + 5.0, P_RADIUS), z);
+            }
+        }
+    }
+    panic!("no open ground");
+}
+
+/// Online snapshots go out every 2 ticks, and the client draws the stance of
+/// the newer snapshot around its render time. A target crouching only on odd
+/// ticks is always drawn standing (crouching only on even ticks, always
+/// crouched): shots at the head it is drawn with must hit that head.
+#[test]
+fn stance_flicker_between_snapshots_is_judged_as_drawn() {
+    for odd in [true, false] {
+        let mut m = Match::new(42, 2, 0, 99);
+        let a = m.add_human(b"A").unwrap() as usize;
+        let b = m.add_human(b"B").unwrap() as usize;
+        m.step();
+        assert_eq!((m.phase, m.snap_every), (PH_PLAY, 2));
+        let g = open_ground(&m);
+        let gb = V3::new(g.x, m.w.ground_below(g.x, g.z + 20.0, g.y + 6.0, P_RADIUS), g.z + 20.0);
+        m.players[a].ms = MoveState { pos: g, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+        m.players[b].ms = MoveState { pos: gb, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+        let byaw = yaw_to(0.0, -1.0);
+        // what B's snapshots carry, per tick
+        let mut hist = vec![(V3::ZERO, false, 0.0f32, 0.0f32, 0u8); 1000];
+        let (mut sa, mut sb) = (m.players[a].last_seq, m.players[b].last_seq);
+        let mut rng = Rng::new(5);
+        let (mut n, mut heads, mut drawn_crouched) = (0, 0, 0);
+        for _ in 0..400 {
+            let next = m.tick + 1;
+            let crouch = (next % 2 == 1) == odd;
+            sb += 1;
+            m.on_message(b as u8, &cmd_bytes(&[(sb, m.tick.saturating_sub(5) * 256, 0, 0, net_yaw(byaw), 0, if crouch { B_CROUCH } else { 0 })]));
+            sa += 1;
+            m.on_message(a as u8, &cmd_bytes(&[(sa, m.tick.saturating_sub(5) * 256, 0, 0, 0, 0, 0)]));
+            m.step();
+            let q = &m.players[b];
+            hist[m.tick as usize] = (q.ms.pos, q.ms.crouch, q.yaw, q.pitch, q.ms.mode);
+            if m.tick < 60 {
+                continue;
+            }
+            // A renders 4-10 ticks back, between the even-tick snapshots
+            let eye = m.players[a].ms.pos + V3::new(0.0, eye_h(false), 0.0);
+            for _ in 0..6 {
+                let rt = m.tick as f32 - rng.range(4.0, 10.0);
+                let t0 = (rt / 2.0).floor() as usize * 2;
+                let (x, y) = (hist[t0], hist[t0 + 2]);
+                let f = (rt - t0 as f32) / 2.0;
+                let head = body_pose(x.0.lerp(y.0, f), x.2 + wrap_angle(y.2 - x.2) * f, x.3 + (y.3 - x.3) * f, y.1, false, y.4).head;
+                drawn_crouched += y.1 as u32;
+                n += 1;
+                if let Some((j, _, true)) = m.ray_players(a, eye, (head - eye).norm(), 60.0, (rt * 256.0) as u32) {
+                    if j == b {
+                        heads += 1;
+                    }
+                }
+            }
+        }
+        let drawn = drawn_crouched as f32 / n as f32;
+        assert!(if odd { drawn == 0.0 } else { drawn == 1.0 }, "odd={odd}: drawn crouched {drawn:.2} of the time");
+        let frac = heads as f32 / n as f32;
+        eprintln!("crouch on {} ticks: {:.1}% of shots at the drawn head are headshots", if odd { "odd" } else { "even" }, frac * 100.0);
+        assert!(frac >= 0.99, "crouch on {} ticks: only {:.1}% headshots at the drawn head", if odd { "odd" } else { "even" }, frac * 100.0);
+    }
+}
+
+fn net_yaw(y: f32) -> u16 {
+    zonefall_core::net::q_yaw(y)
+}
+
+/// The client model's torso frame (models.ts emitCharacter), composed the way
+/// the client composes its rotations: qY(yaw) (times qX(1.25) about the hips
+/// in free fall), the hips, then the torso turned by qX(lean).
+fn drawn_torso(pos: V3, yaw: f32, crouch: bool, sprint: bool, mode: u8) -> (V3, [V3; 3]) {
+    let ry = |v: V3| V3::new(v.x * yaw.cos() + v.z * yaw.sin(), v.y, -v.x * yaw.sin() + v.z * yaw.cos());
+    let rx = |a: f32, v: V3| V3::new(v.x, v.y * a.cos() - v.z * a.sin(), v.y * a.sin() + v.z * a.cos());
+    let ground = mode == MODE_GROUND;
+    let crouch = crouch && ground;
+    let hip_h = if crouch { 0.5 } else { 0.95 };
+    let lean = if !ground { 0.0 } else if crouch { 0.15 } else if sprint { 0.22 } else { 0.05 };
+    let fall = mode == MODE_FALL;
+    let r0 = |v: V3| if fall { ry(rx(1.25, v)) } else { ry(v) };
+    let p0 = if fall { pos + V3::new(0.0, 0.95, 0.0) + r0(V3::new(0.0, -0.95, 0.0)) } else { pos };
+    let origin = p0 + r0(V3::new(0.0, hip_h + 0.02, 0.0));
+    let rt = |v: V3| r0(rx(lean, v));
+    (origin, [rt(V3::new(1.0, 0.0, 0.0)), rt(V3::new(0.0, 1.0, 0.0)), rt(V3::new(0.0, 0.0, 1.0))])
+}
+
+/// Does the ray pass through the drawn shirt, vest or backpack before `maxt`?
+fn through_drawn_torso(o: V3, d: V3, frame: (V3, [V3; 3]), maxt: f32) -> bool {
+    let (org, ax) = frame;
+    [([0.0, 0.3, 0.0], [0.23, 0.28, 0.13]), ([0.0, 0.27, 0.0], [0.25, 0.21, 0.155]), ([0.0, 0.32, -0.2], [0.17, 0.21, 0.07])]
+        .iter()
+        .any(|(c, h)| ray_obb(o, d, org + ax[0] * c[0] + ax[1] * c[1] + ax[2] * c[2], ax, *h, maxt).is_some())
+}
+
+/// Shots at the drawn head that pass no part of the drawn torso are
+/// headshots: from below (the fat body capsule used to shadow the chin) and
+/// at a free-falling body (whose tilted capsule wrapped the back of the
+/// head). Shots through the drawn torso first stay body hits.
+#[test]
+fn unobstructed_shots_at_the_drawn_head_are_headshots() {
+    let mut m = Match::new(42, 2, FLAG_OFFLINE, 3);
+    let a = m.add_human(b"A").unwrap() as usize;
+    let b = m.add_human(b"B").unwrap() as usize;
+    m.step();
+    m.players[a].bot = true; // live positions, no rewind
+    let t = V3::new(500.0, 200.0, 500.0);
+    let mut rng = Rng::new(9);
+    for (mode, crouch, name) in [(MODE_GROUND, false, "standing"), (MODE_GROUND, true, "crouched"), (MODE_PARA, false, "parachute"), (MODE_FALL, false, "free fall")] {
+        let (mut free, mut free_head, mut blocked, mut blocked_body) = (0, 0, 0, 0);
+        for yaw in [0.0f32, 1.3, 2.6, -1.9] {
+            for pitch in [-0.5f32, 0.0, 0.6] {
+                {
+                    let q = &mut m.players[b];
+                    q.ms = MoveState { pos: t, mode, on_ground: mode == MODE_GROUND, crouch, ..Default::default() };
+                    q.yaw = yaw;
+                    q.pitch = pitch;
+                    q.draw_speed = 0.0;
+                }
+                let pose = body_pose(t, yaw, pitch, crouch, false, mode);
+                let frame = drawn_torso(t, yaw, crouch, false, mode);
+                // shooters all around, level up to 60 degrees below the target
+                for k in 0..12 {
+                    let az = k as f32 * TAU / 12.0;
+                    for elev in [0.0f32, 0.3, 0.6, 1.05] {
+                        for _ in 0..6 {
+                            let aim = pose.head + V3::new(rng.range(-0.07, 0.07), rng.range(-0.07, 0.07), rng.range(-0.07, 0.07));
+                            let back = V3::new(az.sin() * elev.cos(), -elev.sin(), az.cos() * elev.cos());
+                            let o = aim + back * 20.0;
+                            let d = (aim - o).norm();
+                            let r = m.ray_players(a, o, d, 40.0, 0);
+                            if through_drawn_torso(o, d, frame, 20.0) {
+                                blocked += 1;
+                                blocked_body += matches!(r, Some((j, _, false)) if j == b) as u32;
+                            } else {
+                                free += 1;
+                                free_head += matches!(r, Some((j, _, true)) if j == b) as u32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let fh = free_head as f32 / free.max(1) as f32;
+        let bb = blocked_body as f32 / blocked.max(1) as f32;
+        eprintln!("{name}: {free} clear shots at the head, {:.1}% headshots; {blocked} through the torso, {:.1}% body", fh * 100.0, bb * 100.0);
+        assert!(fh >= 0.99, "{name}: only {:.1}% of clear shots at the drawn head are headshots", fh * 100.0);
+        if blocked >= 20 {
+            assert!(bb >= 0.9, "{name}: only {:.1}% of shots through the drawn torso are body hits", bb * 100.0);
+        }
+    }
+}
+
+/// Running into a wall keeps the velocity up while the player does not move.
+/// Clients animate from the change of position and draw them standing, so
+/// the hit volume must not lean the head forward as if sprinting.
+#[test]
+fn running_into_a_wall_is_not_judged_as_sprinting() {
+    let mut m = Match::new(42, 2, FLAG_OFFLINE, 3);
+    let a = m.add_human(b"A").unwrap() as usize;
+    let b = m.add_human(b"B").unwrap() as usize;
+    m.step();
+    // an outer wall with open ground in front of it
+    let (pos, yaw) = m
+        .w
+        .buildings
+        .iter()
+        .find_map(|bl| {
+            let (x, z) = (bl.x0 - 0.6, (bl.z0 + bl.z1) * 0.5);
+            let y = m.w.ground_below(x, z, bl.y + 3.0, P_RADIUS);
+            let open = m.w.building_at(x - 3.0, z).is_none() && (y - bl.y).abs() < 0.5 && m.w.raycast(V3::new(x - 4.0, y + 1.0, z), V3::new(1.0, 0.0, 0.0), 3.0).is_none();
+            open.then_some((V3::new(x - 1.5, y, z), yaw_to(1.0, 0.0)))
+        })
+        .expect("no wall");
+    m.players[b].ms = MoveState { pos, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+    let mut seq = m.players[b].last_seq;
+    for _ in 0..45 {
+        seq += 1;
+        m.on_message(b as u8, &cmd_bytes(&[(seq, m.tick.saturating_sub(3) * 256, 0, 127, net_yaw(yaw), 0, B_SPRINT)]));
+        m.step();
+    }
+    let q = &m.players[b];
+    assert!(q.ms.vel.len_xz() > SPRINT_DRAW_SPEED, "not pressing into the wall at sprint speed ({:.2} m/s)", q.ms.vel.len_xz());
+    assert!(q.draw_speed < 1.0, "drawn speed {:.2} m/s while standing at the wall", q.draw_speed);
+    // side shots at the head as drawn (standing, not leaning)
+    let (p, qy, qp) = (q.ms.pos, q.yaw, q.pitch);
+    let head = body_pose(p, qy, qp, false, false, MODE_GROUND).head;
+    m.players[a].bot = true;
+    let side = right(qy);
+    let mut rng = Rng::new(3);
+    let (mut n, mut heads) = (0, 0);
+    for _ in 0..200 {
+        let aim = head + V3::new(0.0, rng.range(-0.1, 0.1), 0.0) + fwd(qy) * rng.range(-0.1, 0.1);
+        let o = aim + side * 10.0;
+        n += 1;
+        heads += matches!(m.ray_players(a, o, side * -1.0, 30.0, 0), Some((j, _, true)) if j == b) as u32;
+    }
+    let frac = heads as f32 / n as f32;
+    assert!(frac >= 0.97, "only {:.1}% of side shots at the drawn head are headshots", frac * 100.0);
+}

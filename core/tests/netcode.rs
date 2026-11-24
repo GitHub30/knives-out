@@ -222,36 +222,40 @@ fn starving_never_freezes_or_slows_a_jump() {
 
 #[test]
 fn stall_burst_leaves_no_backlog_and_keeps_taps() {
-    let (mut m, a, _) = two_humans(42);
-    let start = open_run(&m);
-    place(&mut m, a, start);
-    let mut cl = Client::new(&m, a);
-    for k in 0..30 {
-        cl.tick(&mut m, a, k, 1, 1, 0, 0, 0.0);
-    }
-    // 12-tick network stall; the player taps jump during it
-    for k in 0..12u32 {
-        cl.seq += 1;
-        let b = if k == 6 { B_JUMP } else { 0 };
-        cl.pending.push_back((cl.seq, m.tick.saturating_sub(4) * 256, 0, 0, 0, 0, b));
-        m.step();
-    }
-    let mut jumped = false;
-    let sent = cl.seq;
-    // the whole backlog arrives at once, then normal traffic
-    for k in 0..6 {
-        cl.tick(&mut m, a, k, 1, usize::MAX, 0, 0, 0.0);
-        jumped |= m.players[a as usize].ms.vel.y > 0.5;
-    }
-    let p = &m.players[a as usize];
-    assert!(jumped, "the jump tap inside the stalled commands was lost");
-    assert!(p.cmdq.len() <= 1, "backlog of {} commands left after the stall", p.cmdq.len());
-    assert!(cl.seq - p.acked_seq <= 2, "ack is {} commands behind", cl.seq - p.acked_seq);
-    assert!(p.acked_seq >= sent);
-    // and it stays drained
-    for k in 0..120 {
-        cl.tick(&mut m, a, k, 1, 1, 0, 0, 0.0);
-        assert!(m.players[a as usize].cmdq.len() <= 1);
+    // up to 4 s: TCP retransmit backoff, a radio handover
+    for stall in [12u32, 20, 30, 45, 60, 120] {
+        let (mut m, a, _) = two_humans(42);
+        let start = open_run(&m);
+        place(&mut m, a, start);
+        let mut cl = Client::new(&m, a);
+        for k in 0..30 {
+            cl.tick(&mut m, a, k, 1, 1, 0, 0, 0.0);
+        }
+        // network stall; the player taps jump during it
+        for k in 0..stall {
+            cl.seq += 1;
+            let b = if k == stall / 2 { B_JUMP } else { 0 };
+            cl.pending.push_back((cl.seq, m.tick.saturating_sub(4) * 256, 0, 0, 0, 0, b));
+            m.step();
+        }
+        let mut jumped = false;
+        let sent = cl.seq;
+        // the whole backlog arrives at once, then normal traffic
+        for k in 0..6 {
+            cl.tick(&mut m, a, k, 1, usize::MAX, 0, 0, 0.0);
+            jumped |= m.players[a as usize].ms.vel.y > 0.5;
+        }
+        let p = &m.players[a as usize];
+        assert!(jumped, "{stall}-tick stall: the jump tap inside the stalled commands was lost");
+        assert!(p.cmdq.len() <= 1, "{stall}-tick stall: backlog of {} commands left", p.cmdq.len());
+        assert!(cl.seq - p.acked_seq <= 2, "{stall}-tick stall: ack is {} commands behind", cl.seq - p.acked_seq);
+        assert!(p.acked_seq >= sent);
+        assert_eq!(p.debt, 0, "{stall}-tick stall: debt left after the burst");
+        // and it stays drained
+        for k in 0..120 {
+            cl.tick(&mut m, a, k, 1, 1, 0, 0, 0.0);
+            assert!(m.players[a as usize].cmdq.len() <= 1);
+        }
     }
 }
 
@@ -329,11 +333,47 @@ fn rewind_case(k: u32, view_of: impl Fn(u32) -> u32, prime_r: u32) -> f32 {
 fn rewind_never_reads_unrecorded_or_stale_history() {
     // control: an honest shot right after B left still hits where B was
     assert!(rewind_case(1, |t| (t - 2) * 256, 2) < 100.0, "control shot should hit");
-    for k in [2u32, 8, 20, 31, 32, 33] {
-        for (name, f) in [("u32::MAX", Box::new(|_t: u32| u32::MAX) as Box<dyn Fn(u32) -> u32>), ("now", Box::new(|t: u32| t * 256)), ("now-0.5", Box::new(|t: u32| t * 256 - 128))] {
-            let hp = rewind_case(k, |t| f(t), 2);
-            assert_eq!(hp, 100.0, "view {name}, {k} ticks after B left: hit a stale history slot");
+    // A view at or ahead of the server tick is simulated at the client's
+    // floor (1 tick after prime 0, 3 ticks after prime 2): never at an
+    // unrecorded or stale slot.
+    for (prime, ks) in [(0u32, [2u32, 8, 20, 31, 32, 33]), (2, [5, 8, 20, 31, 32, 33])] {
+        for k in ks {
+            for (name, f) in [("u32::MAX", Box::new(|_t: u32| u32::MAX) as Box<dyn Fn(u32) -> u32>), ("now", Box::new(|t: u32| t * 256)), ("now-0.5", Box::new(|t: u32| t * 256 - 128))] {
+                let hp = rewind_case(k, |t| f(t), prime);
+                assert_eq!(hp, 100.0, "view {name}, prime {prime}, {k} ticks after B left: hit a stale history slot");
+            }
         }
+    }
+    // ... and a future view still gets the floor's lag compensation
+    assert!(rewind_case(2, |_t| u32::MAX, 2) < 100.0, "a future view lost the 3-tick floor");
+}
+
+/// Views ahead of the server tick on most commands leave the floor where it
+/// is; they must then also be rewound by the floor, or a client gets a 1-tick
+/// rewind on every shot and a 15-tick one on the shots it chooses.
+#[test]
+fn future_views_do_not_reopen_selective_rewind() {
+    for ahead in [u32::MAX, 40 * 256] {
+        let (mut m, a, _) = two_humans(42);
+        let start = open_run(&m);
+        place(&mut m, a, start);
+        for _ in 0..20 {
+            m.step();
+        }
+        let mut seq = m.players[a as usize].last_seq;
+        let mut applied = vec![];
+        for i in 0..150u32 {
+            seq += 1;
+            // the command is simulated on tick m.tick + 1
+            let now = (m.tick + 1) * 256;
+            let v = if i % 5 == 4 { now - 15 * 256 } else { now.saturating_add(ahead) };
+            m.on_message(a, &cmd_bytes(&[(seq, v, 0, 0, 0, 0, 0)]));
+            m.step();
+            applied.push(m.tick as f32 - m.players[a as usize].last_cmd.view as f32 / 256.0);
+        }
+        let lo = applied[60..].iter().cloned().fold(f32::MAX, f32::min);
+        let hi = applied[60..].iter().cloned().fold(f32::MIN, f32::max);
+        assert!(hi - lo <= 4.1, "applied rewinds span {lo:.2}..{hi:.2} ticks");
     }
 }
 
@@ -505,10 +545,12 @@ fn server_hitch_keeps_rewind_floor() {
     }
     assert!((rew(&m) - 9.0).abs() < 0.01, "rewind {}", rew(&m));
     // server hitch: commands made while it stood still are simulated in
-    // catch-up ticks, with views up to a few ticks ahead
+    // catch-up ticks, with views up to a few ticks ahead; they keep the
+    // player's lag compensation
     for _ in 0..6 {
         let v = (m.tick + 1 + 3) * 256;
         send(&mut m, a, &mut seq, v);
+        assert!((rew(&m) - 9.0).abs() < 0.01, "a catch-up command was rewound {:.2} ticks", rew(&m));
     }
     let v = (m.tick + 1 - 9) * 256;
     send(&mut m, a, &mut seq, v);
@@ -644,12 +686,18 @@ fn stall_run(mode: u8, seed: u32, hold_ms: f64) -> (u32, u32, f32) {
 
 #[test]
 fn uplink_stalls_do_not_snap_the_prediction() {
-    for (mode, name, limit) in [(MODE_FALL, "freefall", 3.0f32), (MODE_PARA, "parachute", 1.2), (MODE_GROUND, "ground", 0.6)] {
-        for seed in 0..2 {
-            let (corr, hard, worst) = stall_run(mode, seed, 400.0);
-            eprintln!("{name} seed {seed}: {corr} corrections, {hard} hard snaps, worst {worst:.2} m");
-            assert_eq!(hard, 0, "{name}: {hard} hard snaps (worst {worst:.2} m)");
-            assert!(worst < limit, "{name}: prediction corrected by {worst:.2} m after 400 ms uplink stalls");
+    // While the uplink is stalled the server holds the player still (after a
+    // few repeated steps) and the client is pulled back a snapshot's worth of
+    // movement at a time; a longer stall adds no larger correction.
+    for hold in [400.0, 1000.0, 2500.0] {
+        let ground = if hold <= 400.0 { 0.6 } else { 0.8 };
+        for (mode, name, limit) in [(MODE_FALL, "freefall", 3.0f32), (MODE_PARA, "parachute", 1.2), (MODE_GROUND, "ground", ground)] {
+            for seed in 0..2 {
+                let (corr, hard, worst) = stall_run(mode, seed, hold);
+                eprintln!("{hold} ms {name} seed {seed}: {corr} corrections, {hard} hard snaps, worst {worst:.2} m");
+                assert_eq!(hard, 0, "{hold} ms {name}: {hard} hard snaps (worst {worst:.2} m)");
+                assert!(worst < limit, "{name}: prediction corrected by {worst:.2} m after {hold} ms uplink stalls");
+            }
         }
     }
 }

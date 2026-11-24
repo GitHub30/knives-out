@@ -7,6 +7,11 @@
 /// between two emoji), 6 = keycap mark. A whitelist of letters, digits,
 /// punctuation and symbols of common scripts.
 pub fn name_char_class(c: u32) -> u8 {
+    if nfc_unstable(c) {
+        // canonical twins of other characters (CJK compatibility ideographs,
+        // Indic nukta letters, U+037E ';'): never written so after NFC
+        return 0;
+    }
     match c {
         0x20 | 0xA0 | 0x2000..=0x200A | 0x205F | 0x3000 => 3,
         0x22 | 0x26 | 0x27 | 0x3C | 0x3E | 0x5C | 0x60 => 0, // " & ' < > \ `
@@ -48,7 +53,7 @@ pub fn name_char_class(c: u32) -> u8 {
         0xFF01..=0xFF5E | 0xFF61..=0xFF9F | 0xFFE0..=0xFFEE => 1, // full/halfwidth (no halfwidth filler)
         0x1F3FB..=0x1F3FF => 2,                     // emoji skin tones modify the previous emoji
         0x1F000..=0x1FAFF => 1,                     // emoji and symbols
-        0x20000..=0x2FFFF => 1,                     // CJK extensions
+        0x20000..=0x2F7FF => 1,                     // CJK extensions (not the compatibility supplement)
         _ => 0,
     }
 }
@@ -140,13 +145,15 @@ pub fn sanitize_name(raw: &[u8], fallback: &str) -> String {
     }
 }
 
-/// Comparison key for duplicate names: marks, emoji selectors and joiners
-/// removed; precomposed letters reduced to their base (NFC 'é' and NFD 'é'
-/// alike); case folded; fullwidth and halfwidth forms folded; voiced kana
-/// folded; Greek, Cyrillic and Armenian look-alikes (capitals and small
-/// letters) mapped to Latin; 'l', 'I', '1' and '|' (and 'O' / '0') merged;
-/// 'rn' read as 'm' and 'vv' as 'w'. So 'Kaze', 'Ｋａｚｅ', 'Kаze' (Cyrillic
-/// a) and 'ΚΑΖΕ' all count as the same name.
+/// Comparison key for duplicate names: compatibility twins folded (NFKC:
+/// 'µ' as 'μ', '…' as '...', '℃' as '°C'); marks, emoji selectors and
+/// joiners removed; precomposed letters reduced to their base (NFC 'é' and
+/// NFD 'é' alike); case folded; fullwidth and halfwidth forms folded; voiced
+/// kana folded; Greek, Cyrillic, Armenian, Hebrew and Arabic look-alikes
+/// (capitals and small letters) mapped to Latin, and kanji / hiragana
+/// look-alikes to katakana ('力' as 'カ', '一' as 'ー'); 'l', 'I', '1' and
+/// '|' (and 'O' / '0') merged; 'rn' read as 'm' and 'vv' as 'w'. So 'Kaze',
+/// 'Ｋａｚｅ', 'Kаze' (Cyrillic a) and 'ΚΑΖΕ' all count as the same name.
 pub fn name_key(name: &str) -> String {
     let mut k = String::new();
     let mut push = |c: char| {
@@ -157,43 +164,50 @@ pub fn name_key(name: &str) -> String {
         };
         k.push(c);
     };
-    for ch in name.chars() {
-        let mut c = ch as u32;
-        if name_char_class(c) >= 2 && name_char_class(c) != 3 {
-            continue;
-        }
-        if (0xFF01..=0xFF5E).contains(&c) {
-            c -= 0xFEE0;
-        }
-        if matches!(c, 0xFF9E | 0xFF9F | 0x309B | 0x309C) {
-            continue; // spacing (semi-)voiced sound marks: folded like the voicing
-        }
-        if let Some(f) = fold_halfwidth_kana(c) {
-            c = f as u32;
-        }
-        if let Some(f) = fold_voiced_kana(c) {
-            c = f as u32;
-        }
-        let ch = char::from_u32(c).unwrap_or(ch);
-        // the letter as written (capital Η is H-like, small η n-like) ...
-        let base = strip_marks(c).unwrap_or(ch);
-        if let Some(s) = look_alike(base as u32) {
-            s.chars().for_each(&mut push);
-            continue;
-        }
-        // ... then in lowercase
-        for lc in base.to_lowercase() {
-            let lb = strip_marks(lc as u32).unwrap_or(lc);
-            match look_alike(lb as u32) {
-                Some(s) => s.chars().for_each(&mut push),
-                None => push(lb),
+    let mut buf = [0u8; 4];
+    for ch0 in name.chars() {
+        let seq: &str = match compat_fold(ch0 as u32) {
+            Some(s) => s,
+            None => ch0.encode_utf8(&mut buf),
+        };
+        for ch in seq.chars() {
+            let mut c = ch as u32;
+            if name_char_class(c) >= 2 && name_char_class(c) != 3 {
+                continue;
+            }
+            if (0xFF01..=0xFF5E).contains(&c) {
+                c -= 0xFEE0;
+            }
+            if matches!(c, 0xFF9E | 0xFF9F | 0x309B | 0x309C) {
+                continue; // spacing (semi-)voiced sound marks: folded like the voicing
+            }
+            if let Some(f) = fold_halfwidth_kana(c) {
+                c = f as u32;
+            }
+            if let Some(f) = fold_voiced_kana(c) {
+                c = f as u32;
+            }
+            let ch = char::from_u32(c).unwrap_or(ch);
+            // the letter as written (capital Η is H-like, small η n-like) ...
+            let base = strip_marks(c).unwrap_or(ch);
+            if let Some(s) = look_alike(base as u32) {
+                s.chars().for_each(&mut push);
+                continue;
+            }
+            // ... then in lowercase
+            for lc in base.to_lowercase() {
+                let lb = strip_marks(lc as u32).unwrap_or(lc);
+                match look_alike(lb as u32) {
+                    Some(s) => s.chars().for_each(&mut push),
+                    None => push(lb),
+                }
             }
         }
     }
     k.replace("rn", "m").replace("vv", "w")
 }
 
-// ---- tables generated from Unicode 15.1.0 data (scratch gen_names2.py)
+// ---- tables generated from Unicode 15.1.0 data (scratch gen_names3.py)
 
 /// Precomposed letters (Latin, Greek, Cyrillic) to their base letter (NFD minus marks).
 fn strip_marks(c: u32) -> Option<char> {
@@ -770,6 +784,7 @@ fn look_alike(c: u32) -> Option<&'static str> {
         0x1B3..=0x1B4 => "y",
         0x1B5..=0x1B6 => "z",
         0x1C0 => "l",
+        0x1C3 => "!",
         0x1C4..=0x1C6 => "dz",
         0x1C7..=0x1C9 => "lj",
         0x1CA..=0x1CC => "nj",
@@ -885,19 +900,46 @@ fn look_alike(c: u32) -> Option<&'static str> {
         0x4BA..=0x4BB => "h",
         0x4C0 => "l",
         0x4CF => "l",
+        0x4D8..=0x4D9 => "e",
         0x500..=0x501 => "d",
         0x50D => "g",
         0x51A..=0x51B => "q",
         0x51C..=0x51D => "w",
         0x54D => "u",
         0x555 => "o",
+        0x561 => "w",
         0x566 => "q",
         0x570 => "h",
         0x578 => "n",
         0x57D => "u",
         0x581 => "g",
         0x585 => "o",
+        0x5D5 => "l",
+        0x5DF => "l",
+        0x627 => "l",
         0x1E9E => "ss",
+        0x2010 => "-",
+        0x2012..=0x2013 => "-",
+        0x2014..=0x2015 => "ー",
+        0x2043 => "-",
+        0x2044 => "/",
+        0x2212 => "-",
+        0x2215 => "/",
+        0x2236 => ":",
+        0x2500..=0x2501 => "ー",
+        0x25CB => "o",
+        0x3007 => "o",
+        0x3078 => "ヘ",
+        0x308A => "リ",
+        0x31D0 => "ー",
+        0x4E00 => "ー",
+        0x4E8C => "ニ",
+        0x516B => "ハ",
+        0x529B => "カ",
+        0x535C => "ト",
+        0x53E3 => "ロ",
+        0x5915 => "タ",
+        0x5DE5 => "エ",
         _ => return None,
     })
 }
@@ -1021,6 +1063,163 @@ fn fold_voiced_kana(c: u32) -> Option<char> {
         0x30F9 => 'ヱ',
         0x30FA => 'ヲ',
         0x30FE => 'ヽ',
+        _ => return None,
+    })
+}
+
+/// Whitelisted code points that NFC rewrites (canonical twins of other
+/// characters): never kept in names.
+fn nfc_unstable(c: u32) -> bool {
+    matches!(
+        c,
+        0x340..=0x341 |
+        0x343..=0x344 |
+        0x374 |
+        0x37E |
+        0x387 |
+        0x958..=0x95F |
+        0x9DC..=0x9DD |
+        0x9DF |
+        0xA33 |
+        0xA36 |
+        0xA59..=0xA5B |
+        0xA5E |
+        0x2329..=0x232A |
+        0x2ADC |
+        0x2F800..=0x2FA1D
+    )
+}
+
+/// Compatibility twins (NFKC) that look like their target.
+fn compat_fold(c: u32) -> Option<&'static str> {
+    Some(match c {
+        0xB5 => "μ",
+        0xBC => "1⁄4",
+        0xBD => "1⁄2",
+        0xBE => "3⁄4",
+        0x132 => "IJ",
+        0x133 => "ij",
+        0x13F => "L·",
+        0x140 => "l·",
+        0x17F => "s",
+        0x1C4 => "DŽ",
+        0x1C5 => "Dž",
+        0x1C6 => "dž",
+        0x1C7 => "LJ",
+        0x1C8 => "Lj",
+        0x1C9 => "lj",
+        0x1CA => "NJ",
+        0x1CB => "Nj",
+        0x1CC => "nj",
+        0x1F1 => "DZ",
+        0x1F2 => "Dz",
+        0x1F3 => "dz",
+        0x3D0 => "β",
+        0x3D1 => "θ",
+        0x3D2 => "Υ",
+        0x3D3 => "Ύ",
+        0x3D4 => "Ϋ",
+        0x3D5 => "φ",
+        0x3D6 => "π",
+        0x3F0 => "κ",
+        0x3F1 => "ρ",
+        0x3F2 => "ς",
+        0x3F4 => "Θ",
+        0x3F5 => "ε",
+        0x3F9 => "Σ",
+        0x587 => "եւ",
+        0x675 => "اٴ",
+        0x676 => "وٴ",
+        0x677 => "ۇٴ",
+        0x678 => "يٴ",
+        0xE33 => "ํา",
+        0x10FC => "ნ",
+        0x1E9B => "ṡ",
+        0x2011 => "‐",
+        0x2024 => ".",
+        0x2025 => "..",
+        0x2026 => "...",
+        0x2033 => "′′",
+        0x2034 => "′′′",
+        0x2036 => "‵‵",
+        0x2037 => "‵‵‵",
+        0x203C => "!!",
+        0x2047 => "??",
+        0x2048 => "?!",
+        0x2049 => "!?",
+        0x2057 => "′′′′",
+        0x20A8 => "Rs",
+        0x2103 => "°C",
+        0x2109 => "°F",
+        0x2116 => "No",
+        0x2122 => "TM",
+        0x222C => "∫∫",
+        0x222D => "∫∫∫",
+        0x222F => "∮∮",
+        0x2230 => "∮∮∮",
+        0x2A0C => "∫∫∫∫",
+        0x2A74 => "::=",
+        0x2A75 => "==",
+        0x2A76 => "===",
+        0x3036 => "〒",
+        0x3038 => "十",
+        0x3039 => "卄",
+        0x303A => "卅",
+        0x309F => "より",
+        0x30FF => "コト",
+        0x3192 => "一",
+        0x3193 => "二",
+        0x3194 => "三",
+        0x3195 => "四",
+        0x3196 => "上",
+        0x3197 => "中",
+        0x3198 => "下",
+        0x3199 => "甲",
+        0x319A => "乙",
+        0x319B => "丙",
+        0x319C => "丁",
+        0x319D => "天",
+        0x319E => "地",
+        0x319F => "人",
+        0xFE30 => "..",
+        0xFE31 => "—",
+        0xFE32 => "–",
+        0xFE33 => "_",
+        0xFE34 => "_",
+        0xFE35 => "(",
+        0xFE36 => ")",
+        0xFE37 => "{",
+        0xFE38 => "}",
+        0xFE39 => "〔",
+        0xFE3A => "〕",
+        0xFE3B => "【",
+        0xFE3C => "】",
+        0xFE3D => "《",
+        0xFE3E => "》",
+        0xFE3F => "〈",
+        0xFE40 => "〉",
+        0xFE41 => "「",
+        0xFE42 => "」",
+        0xFE43 => "『",
+        0xFE44 => "』",
+        0xFE47 => "[",
+        0xFE48 => "]",
+        0xFE4D => "_",
+        0xFE4E => "_",
+        0xFE4F => "_",
+        0xFFE0 => "¢",
+        0xFFE1 => "£",
+        0xFFE2 => "¬",
+        0xFFE4 => "¦",
+        0xFFE5 => "¥",
+        0xFFE6 => "₩",
+        0xFFE8 => "│",
+        0xFFE9 => "←",
+        0xFFEA => "↑",
+        0xFFEB => "→",
+        0xFFEC => "↓",
+        0xFFED => "■",
+        0xFFEE => "○",
         _ => return None,
     })
 }

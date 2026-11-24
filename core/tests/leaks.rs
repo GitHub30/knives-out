@@ -970,3 +970,158 @@ fn own_item_changes_do_not_reveal_hidden_looting() {
     assert!(delays.len() >= 3, "only {} cases", delays.len());
     assert!(delays.iter().any(|&d| d != delays[0]), "the resync always comes the same time after the hidden change");
 }
+
+// ---------------------------------------------------------------------------
+// Fourth adversarial review
+
+/// A shooter the viewer cannot see, firing level into the walls of the
+/// building it stands in: the wall hits right next to it would locate it to
+/// about a metre, so they must arrive like misses (a coarse direction from
+/// the cell centre), never as exact impacts near the muzzle.
+#[test]
+fn hidden_wall_hits_near_the_shooter_are_coarse() {
+    let mut cases = 0;
+    for seed in [3u32, 42, 123, 77] {
+        let (mut m, ids) = setup(seed, 2);
+        let (a, b) = (ids[0], ids[1]);
+        let Some((_, spot, va)) = indoor_case(&m, 60.0) else { continue };
+        place(&mut m, a, va);
+        place(&mut m, b, spot);
+        {
+            let p = &mut m.players[b as usize];
+            p.slots[0] = (W_AR, 30);
+            p.cur = 0;
+            p.switch_t = 0.0;
+        }
+        let mut seq = m.players[b as usize].last_seq;
+        let (mut shots, mut near_walls) = (0, 0);
+        for k in 0..24u16 {
+            seq += 1;
+            {
+                let p = &mut m.players[b as usize];
+                p.fire_cd = 0.0;
+                p.ammo = [200; NUM_AMMO];
+            }
+            m.on_message(b, &cmd_bytes(&[(seq, m.tick * 256, 0, 0, k * 2730, 0, B_FIRE)]));
+            let s = tick(&mut m, &[a]);
+            let pb = &m.players[b as usize];
+            let muz = muzzle(pb.ms.pos, pb.yaw, pb.pitch, pb.ms.crouch);
+            for e in &s[0].events {
+                if let Ev::Shot { shooter, weapon, from, end, kind } = e {
+                    assert_eq!(*shooter, 255);
+                    shots += 1;
+                    let g = hidden_cell(muz, va);
+                    assert!((*end - muz).len() >= 8.0, "seed {seed}: an anonymised shot ends {:.2} m from the hidden muzzle (kind {kind})", (*end - muz).len());
+                    match kind {
+                        0 => assert!(((*end - *from).len() - WD[*weapon as usize].range).abs() < 0.05, "a coarse end not range from the cell centre"),
+                        3 => assert!((*end - *from).len() >= g + 8.0, "an exact wall hit {:.2} m from the cell centre", (*end - *from).len()),
+                        _ => {}
+                    }
+                }
+            }
+            // the walls really are next to the shooter
+            let d = dir_from(dq_yaw(k * 2730), 0.0);
+            if m.w.raycast(eye(spot), d, 8.0).is_some() {
+                near_walls += 1;
+            }
+        }
+        assert!(shots >= 20, "seed {seed}: only {shots} shots heard");
+        if near_walls >= 6 {
+            cases += 1;
+        }
+    }
+    assert!(cases >= 2, "only {cases} cases with walls near the shooter");
+}
+
+/// Resync delay after a hidden looter's change, with the viewer idle or
+/// changing items in the same chunk every `probe` ticks.
+fn resync_delay(seed: u32, probe: Option<u32>) -> Option<u32> {
+    let (mut m, ids) = setup(seed, 2);
+    let (v, l) = (ids[0], ids[1]);
+    let (xid, loot, _) = indoor_case(&m, 60.0)?;
+    let c = item_chunk(loot.x, loot.z);
+    let cw = MAP / ICH as f32;
+    let (x0, z0) = ((c % ICH) as f32 * cw, (c / ICH) as f32 * cw);
+    let mut vpos = None;
+    'find: for gz in 0..15 {
+        for gx in 0..15 {
+            let (x, z) = (x0 + 8.0 + gx as f32 * 8.0, z0 + 8.0 + gz as f32 * 8.0);
+            if dist_xz(x, z, loot.x, loot.z) < 50.0 || m.w.height(x, z) < 2.5 || m.w.building_at(x, z).is_some() {
+                continue;
+            }
+            let p = V3::new(x, m.w.ground_below(x, z, 300.0, P_RADIUS), z);
+            if hidden(&m, p, loot) && m.w.blocked(eye(p), m.items[xid as usize].pos + V3::new(0.0, 0.25, 0.0)) {
+                vpos = Some(p);
+                break 'find;
+            }
+        }
+    }
+    let vpos = vpos?;
+    let park = V3::new(if vpos.x < MAP * 0.5 { MAP - 20.0 } else { 20.0 }, 200.0, if vpos.z < MAP * 0.5 { MAP - 20.0 } else { 20.0 });
+    place(&mut m, v, vpos);
+    place(&mut m, l, park);
+    {
+        let p = &mut m.players[v as usize];
+        p.slots = [(W_PISTOL, 10), (W_SMG, 10)];
+        p.cur = 0;
+    }
+    let gun = m.items.iter().position(|it| it.alive && it.kind == W_AR && dist_xz(it.pos.x, it.pos.z, loot.x, loot.z) > 60.0)?;
+    m.items[gun].pos = vpos + V3::new(0.4, 0.05, 0.0);
+    for _ in 0..60 {
+        m.players[l as usize].ms.pos = park;
+        tick(&mut m, &[v]);
+    }
+    let resync = |s: &Snap| s.events.iter().any(|e| matches!(e, Ev::Chunk { chunk, .. } if *chunk as usize == c));
+    let before = m.items[xid as usize];
+    place(&mut m, l, loot);
+    let mut seq_l = m.players[l as usize].last_seq;
+    let mut looted_at = None;
+    for _ in 0..12 {
+        seq_l += 1;
+        m.on_message(l, &cmd_bytes(&[(seq_l, m.tick * 256, 0, 0, 0, 0, if m.tick % 2 == 0 { B_PICKUP } else { 0 })]));
+        tick(&mut m, &[v]);
+        let now = m.items[xid as usize];
+        if now.alive != before.alive || now.amount != before.amount {
+            looted_at = Some(m.tick);
+            break;
+        }
+    }
+    let looted_at = looted_at?;
+    m.players[l as usize].ms.pos = park;
+    let mut seq_v = m.players[v as usize].last_seq;
+    let mut swaps = 0;
+    for k in 0..700u32 {
+        m.players[l as usize].ms.pos = park;
+        seq_v += 1;
+        let b = match probe {
+            Some(p) if k % p == 0 => B_PICKUP,
+            _ => 0,
+        };
+        m.on_message(v, &cmd_bytes(&[(seq_v, m.tick * 256, 0, 0, 0, 0, b)]));
+        let s = tick(&mut m, &[v]).swap_remove(0);
+        swaps += s.events.iter().filter(|e| matches!(e, Ev::Item { .. })).count();
+        if resync(&s) {
+            if probe.is_some() {
+                assert!(swaps >= 20, "seed {seed}: the viewer's swaps did not happen ({swaps})");
+            }
+            return Some(m.tick - looted_at);
+        }
+    }
+    panic!("seed {seed}: the hidden change was never resynced");
+}
+
+/// The resync of a hidden change comes after a secret, jittered quiet
+/// period. A viewer changing items of its own in the same chunk must not be
+/// able to re-draw that period (and so bring the resync forward, dating the
+/// hidden change more precisely).
+#[test]
+fn own_item_changes_do_not_redraw_the_quiet_period() {
+    let mut cases = 0;
+    for seed in [3u32, 11, 42, 77, 123, 5, 7, 9, 13, 21, 31, 55] {
+        let Some(idle) = resync_delay(seed, None) else { continue };
+        let probed = resync_delay(seed, Some(10)).unwrap();
+        assert_eq!(idle, probed, "seed {seed}: the viewer's own swaps moved the resync ({idle} vs {probed} ticks)");
+        cases += 1;
+    }
+    assert!(cases >= 3, "only {cases} cases");
+}

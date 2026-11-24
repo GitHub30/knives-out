@@ -48,7 +48,8 @@ export class WsTransport implements Transport {
       });
       this.ws.addEventListener('close', () => {
         clearTimeout(t);
-        reject(new Error('サーバーに接続できませんでした'));
+        // (a refused upgrade, e.g. after too many attempts, looks the same)
+        reject(new Error('サーバーに接続できませんでした。しばらく待ってから再試行してください'));
       });
     });
   }

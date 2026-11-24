@@ -310,6 +310,31 @@ pub struct BodyPose {
     /// Body capsule axis, from just above the feet to below the head.
     pub a: V3,
     pub b: V3,
+    /// The hip pivot (on the axis): legs below it, the torso above.
+    pub hip: V3,
+    /// The drawn torso's frame: origin (its base) and axes (right, up,
+    /// forward). See `TORSO_BOXES`.
+    pub torso_o: V3,
+    pub torso_ax: [V3; 3],
+}
+
+/// The client model's torso boxes (shirt, vest, backpack) in the torso frame:
+/// centre and half extents (models.ts emitCharacter).
+pub const TORSO_BOXES: [([f32; 3], [f32; 3]); 3] = [
+    ([0.0, 0.3, 0.0], [0.23, 0.28, 0.13]),
+    ([0.0, 0.27, 0.0], [0.25, 0.21, 0.155]),
+    ([0.0, 0.32, -0.2], [0.17, 0.21, 0.07]),
+];
+
+impl BodyPose {
+    /// Ray vs the drawn torso: the entry distance.
+    pub fn ray_torso(&self, o: V3, d: V3, maxt: f32) -> Option<f32> {
+        let ax = self.torso_ax;
+        TORSO_BOXES
+            .iter()
+            .filter_map(|(c, h)| ray_obb(o, d, self.torso_o + ax[0] * c[0] + ax[1] * c[1] + ax[2] * c[2], ax, *h, maxt))
+            .min_by(|a, b| a.total_cmp(b))
+    }
 }
 
 /// Horizontal speed above which the model is drawn sprinting (leaning).
@@ -348,7 +373,30 @@ pub fn body_pose(pos: V3, yaw: f32, pitch: f32, crouch: bool, sprint: bool, mode
         let p = tilt(p);
         V3::new(pos.x + f.x * p.1, pos.y + p.0, pos.z + f.z * p.1)
     };
-    BodyPose { head: world(head), a: world(lo), b: world(hi) }
+    // The torso turns by the lean about its base (hip + 0.02). In free fall
+    // the whole model turns about the hip.
+    let (sl, cl) = lean.sin_cos();
+    let (up2, fw2) = ((cl, sl), (-sl, cl));
+    let turn = |v: (f32, f32)| {
+        if mode == MODE_FALL {
+            let (sn, cs) = 1.25f32.sin_cos();
+            (v.0 * cs - v.1 * sn, v.0 * sn + v.1 * cs)
+        } else {
+            v
+        }
+    };
+    let dir = |v: (f32, f32)| {
+        let v = turn(v);
+        V3::new(f.x * v.1, v.0, f.z * v.1)
+    };
+    BodyPose {
+        head: world(head),
+        a: world(lo),
+        b: world(hi),
+        hip: world((hip, 0.0)),
+        torso_o: world((hip + 0.02, 0.0)),
+        torso_ax: [right(yaw), dir(up2), dir(fw2)],
+    }
 }
 
 pub fn muzzle(pos: V3, yaw: f32, pitch: f32, crouch: bool) -> V3 {

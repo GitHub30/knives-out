@@ -419,3 +419,64 @@ fn names_round3() {
     // joiners and selectors only inside emoji sequences
     assert_eq!(add("a\u{200d}b\u{fe0f}"), "ab#2", "joiner / selector between letters kept");
 }
+
+/// Fourth review: canonical twins (NFC) are not kept, compatibility twins
+/// (NFKC) and a few more look-alikes share a key.
+#[test]
+fn names_round4() {
+    let mut m = Match::new(1, 32, FLAG_OFFLINE, 7);
+    let mut add = |s: &str| {
+        let id = m.add_human(s.as_bytes()).unwrap();
+        m.players[id as usize].name.clone()
+    };
+    // CJK compatibility supplement, Greek question mark, Indic nukta letter:
+    // never written so after NFC, dropped
+    assert_eq!(add("\u{2f804}\u{597d}"), "\u{597d}");
+    assert_eq!(add("a\u{37e}b"), "ab");
+    assert_eq!(add("\u{915}\u{958}"), "\u{915}");
+    // look-alike pairs: the second one gets a suffix
+    for (a, b) in [
+        ("\u{3bc}Tank", "\u{b5}Tank"),          // micro sign
+        ("Hi!", "Hi\u{1c3}"),                   // retroflex click
+        ("a.b", "a\u{2024}b"),                  // one dot leader
+        ("wait...", "wait\u{2026}"),            // ellipsis
+        ("x-X", "x\u{2010}X"),                  // hyphen
+        ("x-X", "x\u{2011}X"),                  // non-breaking hyphen
+        ("x-X", "x\u{2212}X"),                  // minus sign
+        ("x-X", "x\u{2013}X"),                  // en dash
+        ("a/b", "a\u{2215}b"),                  // division slash
+        ("??", "\u{2047}"),                     // double question mark
+        ("25\u{b0}C", "25\u{2103}"),            // degree Celsius
+        ("\u{3a3}IGMA", "\u{3f9}IGMA"),         // lunate sigma
+        ("\u{4d9}li", "\u{259}li"),             // Cyrillic / Latin schwa
+        ("\u{30ab}\u{30bc}", "\u{529b}\u{30bc}"), // カ / 力
+        ("\u{30ed}\u{30a4}", "\u{53e3}\u{30a4}"), // ロ / 口
+        ("\u{30a8}\u{30eb}", "\u{5de5}\u{30eb}"), // エ / 工
+        ("\u{30cb}\u{30b3}", "\u{4e8c}\u{30b3}"), // ニ / 二
+        ("\u{30cf}\u{30eb}", "\u{516b}\u{30eb}"), // ハ / 八
+        ("\u{30bf}\u{30ed}", "\u{5915}\u{30ed}"), // タ / 夕
+        ("\u{30d8}\u{30bf}", "\u{3078}\u{30bf}"), // ヘ / へ
+        ("\u{30eb}\u{30fc}", "\u{30eb}\u{4e00}"), // ー / 一
+        ("\u{30eb}\u{30fc}", "\u{30eb}\u{2500}"), // ー / ─
+    ] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        let na = add(a);
+        let nb = add(b);
+        assert_eq!(na, a, "{a:?} was changed to {na:?}");
+        assert!(nb.contains('#'), "{b:?} ({nb:?}) is accepted next to {a:?}");
+    }
+    // ordinary different names stay apart
+    for (a, b) in [("Kai", "Kei"), ("\u{529b}\u{4e5f}", "\u{529b}\u{58eb}"), ("\u{3086}\u{3046}", "\u{30e6}\u{30a6}\u{30ad}")] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        add(a);
+        assert_eq!(add(b), b, "{b:?} got a suffix next to {a:?}");
+    }
+}

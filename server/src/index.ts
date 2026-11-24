@@ -3,14 +3,17 @@
 // offline client, authoritatively, at 30 Hz.
 //
 // Abuse limits (all approximate, fail-open if the Lobby object is reset):
-// * Workers rate-limit binding: join attempts per IP per minute.
-// * Workers rate-limit binding: join attempts per IP / IPv6 /64 and per IPv6 /48.
+// * Workers rate-limit bindings: join attempts per IP / IPv6 /64, and (a larger
+//   budget, checked after it) per IPv6 /48 so one allocation cannot rotate
+//   through its /64s while one /64 cannot use up its neighbours' joins.
 // * Lobby object: concurrent sockets per client network (IPv4 address or IPv6 /64,
 //   plus an aggregate per IPv6 /48), global concurrent sockets and rooms. Private
 //   rooms have their own, smaller cap (public matchmaking always keeps capacity)
 //   and each network may only hold two private rooms it created. Joins that
 //   leave again do not advance the public room's fill count.
-// * Refusals are sent in-band (S_ERROR + reason code) so the player sees why.
+// * Refusals are sent in-band (S_ERROR + reason code) so the player sees why;
+//   a network that keeps retrying past the attempt limit gets plain HTTP 429s
+//   (an in-band refusal is a socket that stays open until the client closes it).
 // * Room object: sockets silent for 2 minutes are closed; a private room closes
 //   as soon as its last player leaves.
 // * Room object: sockets per IP per room, message size, message rate (token bucket).
@@ -22,8 +25,12 @@ export interface Env {
   LOBBY: DurableObjectNamespace;
   ALLOWED_ORIGINS: string;
   ASSETS?: Fetcher;
-  /** Workers rate-limiting binding: WebSocket join attempts per client IP. */
+  /** Workers rate-limiting binding: WebSocket join attempts per client IP / IPv6 /64. */
   JOIN_LIMIT?: RateLimit;
+  /** Join attempts per IPv6 /48: several /64s' worth (like MAX_PER_NET48 vs MAX_PER_NET). */
+  JOIN_LIMIT48?: RateLimit;
+  /** In-band "too many attempts" refusals per network (the rest get plain 429s). */
+  REFUSE_LIMIT?: RateLimit;
 }
 
 interface SrvExports {
@@ -110,6 +117,17 @@ function refuse(code: number, reason: string): Response {
   return new Response(null, { status: 101, webSocket: pair[0] });
 }
 
+/** Too many join attempts: say so in-band a few times a minute per network,
+ * then answer plain 429s, which the runtime closes by itself (an in-band
+ * refusal is an accepted socket that lingers until the client closes it). */
+async function refuseRate(env: Env, net: string): Promise<Response> {
+  if (env.REFUSE_LIMIT) {
+    const { success } = await env.REFUSE_LIMIT.limit({ key: net });
+    if (!success) return plain('Too many join attempts', 429);
+  }
+  return refuse(ERR_RATE, 'too many join attempts');
+}
+
 function plain(text: string, status: number): Response {
   return new Response(text, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' } });
 }
@@ -132,14 +150,17 @@ export default {
       const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown';
       const net = netKey(ip);
       if (env.JOIN_LIMIT) {
-        // per address (IPv6 /64), and per IPv6 /48 so one allocation cannot
-        // rotate through its /64s
-        const g48 = net48(net);
-        const keys = g48 !== net ? [net, g48] : [net];
-        for (const key of keys) {
-          const { success } = await env.JOIN_LIMIT.limit({ key });
-          if (!success) return refuse(ERR_RATE, 'too many join attempts');
-        }
+        // per address (IPv4, or IPv6 /64)
+        const { success } = await env.JOIN_LIMIT.limit({ key: net });
+        if (!success) return refuseRate(env, net);
+      }
+      const g48 = net48(net);
+      if (env.JOIN_LIMIT48 && g48 !== net) {
+        // per IPv6 /48, so one allocation cannot rotate through its /64s. Its
+        // own, larger budget, checked after the /64 key: a single /64 can
+        // spend at most its own allowance of it, not lock its /48 out.
+        const { success } = await env.JOIN_LIMIT48.limit({ key: g48 });
+        if (!success) return refuseRate(env, net);
       }
       const name = (url.searchParams.get('name') ?? '').slice(0, 32);
       const code = url.searchParams.get('room');

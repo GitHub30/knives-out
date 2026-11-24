@@ -674,7 +674,7 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let pos = p.ms.pos;
     let eye = pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
     let aim = if b.skill > 0.7 && b.rng.chance(0.02) {
-        body_pose(q.ms.pos, q.yaw, q.pitch, q.ms.crouch, q.ms.vel.len_xz() > SPRINT_DRAW_SPEED, q.ms.mode).head
+        body_pose(q.ms.pos, q.yaw, q.pitch, q.ms.crouch, q.draw_speed > SPRINT_DRAW_SPEED, q.ms.mode).head
     } else {
         q.ms.pos + V3::new(0.0, if q.ms.crouch { 0.85 } else { 1.2 }, 0.0)
     };

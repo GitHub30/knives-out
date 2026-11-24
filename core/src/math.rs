@@ -262,6 +262,32 @@ pub fn ray_sphere(o: V3, d: V3, c: V3, r: f32, maxt: f32) -> Option<f32> {
     }
 }
 
+/// Ray vs oriented box (centre `c`, unit axes `ax`, half extents `h`): the
+/// entry distance, or 0 when the ray starts inside.
+pub fn ray_obb(o: V3, d: V3, c: V3, ax: [V3; 3], h: [f32; 3], maxt: f32) -> Option<f32> {
+    let rel = o - c;
+    let (mut t0, mut t1) = (0.0f32, maxt);
+    for k in 0..3 {
+        let (oo, dd) = (rel.dot(ax[k]), d.dot(ax[k]));
+        if dd.abs() < 1e-9 {
+            if oo.abs() > h[k] {
+                return None;
+            }
+            continue;
+        }
+        let (mut a, mut b) = ((-h[k] - oo) / dd, (h[k] - oo) / dd);
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        t0 = t0.max(a);
+        t1 = t1.min(b);
+        if t0 > t1 {
+            return None;
+        }
+    }
+    Some(t0)
+}
+
 /// Ray vs capsule around the segment a-b.
 pub fn ray_capsule_seg(o: V3, d: V3, a: V3, b: V3, r: f32, maxt: f32) -> Option<f32> {
     let mut best: Option<f32> = None;
