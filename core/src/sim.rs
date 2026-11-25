@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 14;
+pub const PROTO: u16 = 15;
 /// A car catches fire below this share of its bodywork, and then explodes
 /// after the fuse (5 s) whatever happens.
 pub const CAR_FIRE_AT: f32 = 0.19;
@@ -16,6 +16,21 @@ pub const CAR_FUSE_TICKS: u32 = 150;
 /// Helicopters: hull strength, missiles carried, seconds between launches,
 /// missile speed (m/s) and life (ticks).
 pub const HELI_HP: f32 = 1500.0;
+/// Vehicles shoving each other: how close counts as touching, the closing
+/// speed above which a knock dents (and bodywork lost per m/s above it).
+/// (How a shoved car slides and stops is in `player.rs`: the predicting
+/// client does the same sums.)
+pub const CAR_TOUCH: f32 = 0.03;
+pub const CAR_CRASH_V: f32 = 6.0;
+pub const CAR_CRASH_DMG: f32 = 9.0;
+/// A car sliding faster than this hurts whoever it runs into.
+pub const CAR_SLIDE_HURT_V: f32 = 5.0;
+/// The closing speed from which a car nudges a helicopter, the speed from
+/// which a helicopter skidding on the ground shoves cars (in the air it
+/// always does), and how fast it shoves one it merely settles on.
+pub const HELI_NUDGE_V: f32 = 3.0;
+pub const HELI_SHOVE_V: f32 = HELI_STAND_V;
+pub const HELI_SHOVE_MIN: f32 = 2.5;
 pub const HELI_AMMO: u8 = 16;
 pub const MISSILE_CD: f32 = 0.8;
 pub const MISSILE_SPEED: f32 = 95.0;
@@ -527,6 +542,11 @@ pub struct Match {
     /// where they are parked at the start of a match. Poses are in `w.cars`.
     pub car_driver: Vec<u8>,
     car_moved: Vec<u32>,
+    /// Shoved cars: the velocity (x, z) each slides with on top of what its
+    /// driver does, how fast it turns (rad/s), and who set it going.
+    pub car_slide: Vec<[f32; 2]>,
+    pub car_spin: Vec<f32>,
+    car_pusher: Vec<u8>,
     /// Bodywork left (0 = a burnt-out wreck) and who damaged it last.
     pub car_hp: Vec<f32>,
     car_hit_by: Vec<u8>,
@@ -600,6 +620,9 @@ impl Match {
             alive_start: 0,
             car_driver: vec![255; ncar],
             car_moved: vec![0; ncar],
+            car_slide: vec![[0.0; 2]; ncar],
+            car_spin: vec![0.0; ncar],
+            car_pusher: vec![255; ncar],
             car_hp: Vec::new(),
             car_hit_by: vec![255; ncar],
             car_fire: vec![0; ncar],
@@ -830,7 +853,7 @@ impl Match {
             self.ev_pinfo(i, true);
             self.players[i] = Player::default();
         } else {
-            // AI takes over the abandoned character (bots do not drive or fly).
+            // AI takes over the abandoned character (on foot, and not as one of the drivers).
             self.exit_car(i);
             self.leave_heli(i);
             let seed = self.rng.u32();
@@ -895,6 +918,7 @@ impl Match {
             p.reset_combat();
             self.ev_pinfo(i, false);
         }
+        crate::bot::pick_drivers(&mut self.players);
         // plane path
         let a = self.rng.range(0.0, TAU);
         let (dx, dz) = (a.cos(), a.sin());
@@ -932,6 +956,9 @@ impl Match {
         for k in 0..self.car_driver.len() {
             self.car_driver[k] = 255;
             self.car_moved[k] = self.tick;
+            self.car_slide[k] = [0.0; 2];
+            self.car_spin[k] = 0.0;
+            self.car_pusher[k] = 255;
             self.car_hp[k] = self.car_max_hp(k);
             self.car_hit_by[k] = 255;
             self.car_fire[k] = 0;
@@ -1074,9 +1101,11 @@ impl Match {
         let w = &self.w;
         let p = &mut self.players[i];
         let v0 = if mode == MODE_DRIVE { car_speed(&p.ms).abs() } else { 0.0 };
-        let ev = step_move(w, &mut p.ms, &c, mult, DT);
+        let vel0 = p.ms.vel;
+        let mut hits = DriveHits::default();
+        let ev = step_move_hits(w, &mut p.ms, &c, mult, DT, &mut hits);
         if mode == MODE_DRIVE {
-            self.car_moved_by(i, v0);
+            self.car_moved_by(i, v0, vel0, &hits);
             return;
         }
         if ev & EV_LANDED != 0 && mode != MODE_GROUND {
@@ -1343,18 +1372,54 @@ impl Match {
             self.props[k] = p;
             // (move_box unlinks first: harmless for a box already out of the grid)
             self.w.move_box(p.bx, np);
+            if grounded && !p.crate_ {
+                self.box_clears_cars(p.bx);
+            }
+        }
+    }
+
+    /// A container that came down where an empty car stands (the stack it
+    /// was on was knocked away): the car is moved out from under it. (A
+    /// driven one is kept out of it by its own step.)
+    fn box_clears_cars(&mut self, bx: usize) {
+        let b = self.w.boxes[bx];
+        for j in 0..self.w.cars.len() {
+            let c = self.w.cars[j];
+            if c[0] < b.min.x - 4.0 || c[0] > b.max.x + 4.0 || c[2] < b.min.z - 4.0 || c[2] > b.max.z + 4.0 || b.max.y < c[1] || b.min.y > c[1] + 1.6 {
+                continue;
+            }
+            let dr = self.car_driver[j] as usize;
+            if dr < MAX_PLAYERS && self.car_of(dr) == Some(j) {
+                continue;
+            }
+            let mut np = V3::new(c[0], c[1], c[2]);
+            car_out_of_walls(&self.w, self.w.car_kind[j], &mut np, c[3]);
+            if !np.finite() || (np.x == c[0] && np.z == c[2]) {
+                continue;
+            }
+            np.x = clampf(np.x, 4.0, MAP - 4.0);
+            np.z = clampf(np.z, 4.0, MAP - 4.0);
+            self.w.cars[j] = [np.x, self.w.height(np.x, np.z), np.z, c[3]];
+            self.car_moved[j] = self.tick;
+            self.cars_make_room(j);
         }
     }
 
     /// A car knocks crates flying and shoves containers.
     fn car_hits_props(&mut self, k: usize, v0: f32) {
+        let f = fwd(self.w.cars[k][3]);
+        let dir = if self.players[self.car_driver[k] as usize % MAX_PLAYERS].ms.vel.dot(f) >= 0.0 { f } else { f * -1.0 };
+        self.car_knocks_props(k, v0, dir);
+    }
+
+    /// Car `k`, going `v0` m/s along `dir`, against the props it touches.
+    fn car_knocks_props(&mut self, k: usize, v0: f32, dir: V3) {
         if v0 < 1.5 {
             return;
         }
         let c = self.w.cars[k];
         let f = fwd(c[3]);
         let (circles, cr, _) = car_shape(self.w.car_kind[k]);
-        let dir = if self.players[self.car_driver[k] as usize % MAX_PLAYERS].ms.vel.dot(f) >= 0.0 { f } else { f * -1.0 };
         for j in 0..self.props.len() {
             let p = self.props[j];
             let b = self.w.boxes[p.bx];
@@ -1463,6 +1528,7 @@ impl Match {
         };
         self.car_driver[k] = 255;
         self.car_moved[k] = self.tick;
+        self.sync_car_vel(k);
         let c = self.w.cars[k];
         let (f, r) = (fwd(c[3]), right(c[3]));
         let (hw, hl, _) = self.w.car_dims(k);
@@ -1501,8 +1567,380 @@ impl Match {
         p.switch_t = p.switch_t.max(0.35);
     }
 
+    /// How fast car `k` really moves: its driver's speed and its slide.
+    pub fn car_velocity(&self, k: usize) -> (f32, f32) {
+        let s = self.car_slide[k];
+        let dr = self.car_driver[k] as usize;
+        if dr < MAX_PLAYERS && self.car_of(dr) == Some(k) {
+            let v = self.players[dr].ms.vel;
+            (s[0] + v.x, s[1] + v.z)
+        } else {
+            (s[0], s[1])
+        }
+    }
+
+    fn sync_car_vel(&mut self, k: usize) {
+        let (x, z) = self.car_velocity(k);
+        if let Some(v) = self.w.car_vel.get_mut(k) {
+            *v = [x, z];
+        }
+    }
+
+    /// Change the velocity of car `k` by (`dvx`, `dvz`), pushed at the point
+    /// (`cx`, `cz`): off-centre it turns the car as well. With a driver
+    /// aboard, what goes along the car is added to their own speed.
+    pub fn shove_car(&mut self, k: usize, dvx: f32, dvz: f32, cx: f32, cz: f32, by: u8) {
+        if k >= self.car_slide.len() || !(dvx.is_finite() && dvz.is_finite()) {
+            return;
+        }
+        let c = self.w.cars[k];
+        let kind = self.w.car_kind[k];
+        let f = fwd(c[3]);
+        let (mut sx, mut sz) = (dvx, dvz);
+        let dr = self.car_driver[k] as usize;
+        if dr < MAX_PLAYERS && self.car_of(dr) == Some(k) {
+            let along = dvx * f.x + dvz * f.z;
+            let lim = car_shape(kind).2 + 8.0;
+            let ms = &mut self.players[dr].ms;
+            let v = clampf(car_speed(ms) + along, -lim, lim);
+            ms.vel = V3::new(f.x * v, 0.0, f.z * v);
+            sx -= f.x * along;
+            sz -= f.z * along;
+        }
+        let s = &mut self.car_slide[k];
+        s[0] += sx;
+        s[1] += sz;
+        let l = (s[0] * s[0] + s[1] * s[1]).sqrt();
+        if l > CAR_SLIDE_MAX {
+            s[0] *= CAR_SLIDE_MAX / l;
+            s[1] *= CAR_SLIDE_MAX / l;
+        }
+        self.car_spin[k] = clampf(self.car_spin[k] + shove_spin(kind, dvx, dvz, cx - c[0], cz - c[2]), -CAR_SPIN_MAX, CAR_SPIN_MAX);
+        self.car_pusher[k] = by;
+        self.car_moved[k] = self.tick;
+        self.sync_car_vel(k);
+    }
+
+    /// Car `k`, moving at (`vx`, `vz`), touches car `j`; (`nx`, `nz`) points
+    /// from `j` to `k`. `j` is shoved along and dented by a hard knock.
+    /// Returns the closing speed (0 when they are not closing).
+    fn car_hit_car(&mut self, k: usize, j: usize, nx: f32, nz: f32, cx: f32, cz: f32, vx: f32, vz: f32, by: u8) -> f32 {
+        let (ox, oz) = self.car_velocity(j);
+        let closing = -((vx - ox) * nx + (vz - oz) * nz);
+        self.car_struck(k, j, nx, nz, cx, cz, closing, by)
+    }
+
+    /// Car `j` is run into by car `k` at `closing` m/s along (`nx`, `nz`)
+    /// (from `j` to `k`): shoved along, and dented by a hard knock.
+    fn car_struck(&mut self, k: usize, j: usize, nx: f32, nz: f32, cx: f32, cz: f32, closing: f32, by: u8) -> f32 {
+        if !(closing > 0.05) || j >= self.w.cars.len() || j == k {
+            return 0.0;
+        }
+        let (mk, mj) = (car_mass(self.w.car_kind[k]), car_mass(self.w.car_kind[j]));
+        let dv = closing * hit_share(mj, mk);
+        self.shove_car(j, -nx * dv, -nz * dv, cx, cz, by);
+        if closing > CAR_CRASH_V {
+            self.hurt_car(j, (closing - CAR_CRASH_V) * CAR_CRASH_DMG * 2.0 * mk / (mk + mj), by);
+        }
+        closing
+    }
+
+    /// Car `k`, moving at (`vx`, `vz`), against the helicopters it touches:
+    /// they are far heavier, so a hard knock only nudges them.
+    fn car_hits_helis(&mut self, k: usize, vx: f32, vz: f32, by: u8) {
+        if vx * vx + vz * vz < HELI_NUDGE_V * HELI_NUDGE_V {
+            return;
+        }
+        let c = self.w.cars[k];
+        let kind = self.w.car_kind[k];
+        let f = fwd(c[3]);
+        let (circles, cr, _) = car_shape(kind);
+        for h in 0..self.helis.len() {
+            let o = self.w.helis[h];
+            if (o[0] - c[0]).abs() > 14.0 || (o[2] - c[2]).abs() > 14.0 {
+                continue;
+            }
+            let mut best: Option<(f32, f32, f32)> = None;
+            for off in circles {
+                let base = V3::new(c[0] + f.x * off, c[1] + 0.45, c[2] + f.z * off);
+                let mut q = base;
+                if self.w.push_heli(h, &mut q, cr + CAR_TOUCH, 1.0) {
+                    let (dx, dz) = (q.x - base.x, q.z - base.z);
+                    let d = (dx * dx + dz * dz).sqrt();
+                    if d > 1e-5 && best.map_or(true, |b| d > b.2) {
+                        best = Some((dx / d, dz / d, d));
+                    }
+                }
+            }
+            let Some((nx, nz, _)) = best else { continue };
+            let pilot = self.helis[h].pilot as usize;
+            let piloted = pilot < MAX_PLAYERS && self.heli_of(pilot) == Some(h);
+            let hv = if piloted { self.players[pilot].ms.vel } else { self.helis[h].vel };
+            let closing = -((vx - hv.x) * nx + (vz - hv.z) * nz);
+            if closing < HELI_NUDGE_V {
+                continue;
+            }
+            // (never enough to set a standing one skidding)
+            let dv = (closing * hit_share(HELI_MASS, car_mass(kind))).min(HELI_STAND_V * 0.9);
+            let had = (hv.x * hv.x + hv.z * hv.z).sqrt();
+            if had + dv >= HELI_STAND_V && !self.helis[h].air {
+                continue;
+            }
+            if piloted {
+                let v = &mut self.players[pilot].ms.vel;
+                v.x -= nx * dv;
+                v.z -= nz * dv;
+            } else {
+                let v = &mut self.helis[h].vel;
+                v.x -= nx * dv;
+                v.z -= nz * dv;
+            }
+            if closing > CAR_CRASH_V {
+                self.hurt_heli(h, (closing - CAR_CRASH_V) * 6.0 * car_mass(kind), by);
+            }
+        }
+    }
+
+    /// A helicopter in the air (or skidding fast) that touches a car shoves
+    /// it out of its way. `v0` is how fast the helicopter came in.
+    fn heli_shoves_cars(&mut self, h: usize, v0: V3, by: u8) {
+        let o = self.w.helis[h];
+        let f = fwd(o[3]);
+        for k in 0..self.w.cars.len() {
+            let c = self.w.cars[k];
+            if (c[0] - o[0]).abs() > 14.0 || (c[2] - o[2]).abs() > 14.0 {
+                continue;
+            }
+            let mut best: Option<(f32, f32, f32, V3)> = None;
+            for off in HELI_CIRCLES {
+                let base = V3::new(o[0] + f.x * off, o[1] + 0.2, o[2] + f.z * off);
+                let mut q = base;
+                if self.w.push_car(k, &mut q, HELI_CR + CAR_TOUCH) {
+                    let (dx, dz) = (q.x - base.x, q.z - base.z);
+                    let d = (dx * dx + dz * dz).sqrt();
+                    if d > 1e-5 && best.map_or(true, |b| d > b.2) {
+                        best = Some((dx / d, dz / d, d, base));
+                    }
+                }
+            }
+            // (nx, nz): from the car to the helicopter
+            let Some((nx, nz, _, base)) = best else { continue };
+            let (cvx, cvz) = self.car_velocity(k);
+            let closing = -((v0.x - cvx) * nx + (v0.z - cvz) * nz);
+            // out of the way at a walking pace at least (it is coming down on the car)
+            let dv = (closing.max(0.0) * hit_share(car_mass(self.w.car_kind[k]), HELI_MASS)).max(HELI_SHOVE_MIN + closing.min(0.0));
+            if dv <= 0.0 {
+                continue;
+            }
+            self.shove_car(k, -nx * dv, -nz * dv, base.x - nx * HELI_CR, base.z - nz * HELI_CR, by);
+            if closing > CAR_CRASH_V {
+                self.hurt_car(k, (closing - CAR_CRASH_V) * CAR_CRASH_DMG * 1.8, by);
+            }
+        }
+    }
+
+    /// Car `k` was pushed back out of a wall, maybe into the vehicles that
+    /// pinned it there: those are moved out of its way (and out of walls
+    /// themselves), so that nothing comes to rest inside something else.
+    fn cars_make_room(&mut self, k: usize) {
+        let tick = self.tick;
+        for j in 0..self.w.cars.len() {
+            let (a, b) = (self.w.cars[k], self.w.cars[j]);
+            if j == k || (a[0] - b[0]).abs() > 8.0 || (a[2] - b[2]).abs() > 8.0 || (a[1] - b[1]).abs() > 3.0 {
+                continue;
+            }
+            let jk = self.w.car_kind[j];
+            let mut moved = false;
+            for _ in 0..2 {
+                let b = self.w.cars[j];
+                let Some((nx, nz, depth)) = car_overlap(a, self.w.car_kind[k], b, jk) else { break };
+                let mut np = V3::new(b[0] - nx * depth, b[1], b[2] - nz * depth);
+                car_out_of_walls(&self.w, jk, &mut np, b[3]);
+                np.x = clampf(np.x, 4.0, MAP - 4.0);
+                np.z = clampf(np.z, 4.0, MAP - 4.0);
+                np.y = self.w.height(np.x, np.z);
+                if !np.finite() || (np.x == b[0] && np.z == b[2]) {
+                    break;
+                }
+                self.w.cars[j] = [np.x, np.y, np.z, b[3]];
+                moved = true;
+            }
+            if moved {
+                self.car_moved[j] = tick;
+                let dr = self.car_driver[j] as usize;
+                if dr < MAX_PLAYERS && self.car_of(dr) == Some(j) {
+                    let c = self.w.cars[j];
+                    self.players[dr].ms.pos = V3::new(c[0], c[1], c[2]);
+                }
+            }
+        }
+    }
+
+    /// Shoved cars slide on, slow down, turn, bump into the world and into
+    /// each other, and come to rest.
+    fn update_cars(&mut self) {
+        let tick = self.tick;
+        for k in 0..self.w.cars.len() {
+            let [mut sx, mut sz] = self.car_slide[k];
+            let mut spin = self.car_spin[k];
+            if sx == 0.0 && sz == 0.0 && spin == 0.0 {
+                continue;
+            }
+            let c = self.w.cars[k];
+            let kind = self.w.car_kind[k];
+            let by = self.car_pusher[k];
+            let dr = self.car_driver[k] as usize;
+            let driver = (dr < MAX_PLAYERS && self.car_of(dr) == Some(k)).then_some(dr);
+            let (vx, vz) = self.car_velocity(k);
+            let sp = (sx * sx + sz * sz).sqrt();
+            let dir = if sp > 1e-4 { V3::new(sx / sp, 0.0, sz / sp) } else { V3::ZERO };
+            let yaw = wrap_angle(c[3] + spin * DT);
+            let mut np = V3::new(c[0] + sx * DT, c[1], c[2] + sz * DT);
+            // a bank too steep to slide up
+            let reach = car_shape(kind).0[2] + 0.7;
+            let rise = self.w.height(np.x + dir.x * reach, np.z + dir.z * reach) - self.w.height(np.x, np.z);
+            if rise > 1.9 {
+                np.x = c[0];
+                np.z = c[2];
+                sx = 0.0;
+                sz = 0.0;
+            } else if rise > 0.5 {
+                let k2 = (1.0 - (rise - 0.5) * 9.0 * DT / sp.max(0.5)).max(0.0);
+                sx *= k2;
+                sz *= k2;
+            }
+            // (a fast one in short steps, up to whatever it touches first: it
+            // must not skip through a thin wall)
+            let mut hits = [CarHit::default(); CAR_HITS];
+            let (mut solid, mut n) = (V3::ZERO, 0);
+            let steps = ((sp * DT / 0.5).ceil() as usize).clamp(1, 4);
+            let (ex, ez) = (np.x - c[0], np.z - c[2]);
+            np.x = c[0];
+            np.z = c[2];
+            for _ in 0..steps {
+                np.x += ex / steps as f32;
+                np.z += ez / steps as f32;
+                let (_, s2, n2) = car_collide(&self.w, k, kind, &mut np, yaw, &mut hits);
+                solid = s2;
+                n = n2;
+                if n2 > 0 || s2.x != 0.0 || s2.z != 0.0 {
+                    break;
+                }
+            }
+            // squeezed between a vehicle and a wall: the wall wins (and the
+            // vehicle is moved out of the way below)
+            let walled = {
+                let w0 = np;
+                car_out_of_walls(&self.w, kind, &mut np, yaw);
+                solid.x += np.x - w0.x;
+                solid.z += np.z - w0.z;
+                np.x != w0.x || np.z != w0.z
+            };
+            let mut dent = 0.0f32;
+            let sl = (solid.x * solid.x + solid.z * solid.z).sqrt();
+            if sl > 1e-4 {
+                // a wall, a tree or a helicopter takes the speed towards it
+                let (nx, nz) = (solid.x / sl, solid.z / sl);
+                let into = sx * nx + sz * nz;
+                if into < 0.0 {
+                    sx -= nx * into * 1.1;
+                    sz -= nz * into * 1.1;
+                    dent = dent.max(-into - CAR_CRASH_V);
+                }
+                spin *= 0.5;
+            }
+            let mk = car_mass(kind);
+            for h in &hits[..n] {
+                let Some((nx, nz, cx, cz)) = h.normal() else { continue };
+                let closing = self.car_hit_car(k, h.k, nx, nz, cx, cz, vx, vz, by);
+                if closing > 0.0 {
+                    let mj = car_mass(self.w.car_kind[h.k]);
+                    let dv = closing * hit_share(mk, mj);
+                    sx += nx * dv;
+                    sz += nz * dv;
+                    spin = clampf(spin + shove_spin(kind, nx * dv, nz * dv, cx - np.x, cz - np.z), -CAR_SPIN_MAX, CAR_SPIN_MAX);
+                    dent = dent.max((closing - CAR_CRASH_V) * 2.0 * mj / (mk + mj));
+                }
+            }
+            // rolling along its wheels is easy, sideways the tyres bite
+            let f = fwd(yaw);
+            (sx, sz, spin) = slide_friction(sx, sz, spin, yaw, self.w.height(np.x, np.z) < WATER - 0.45, DT);
+            let (bx, bz) = (clampf(np.x, 4.0, MAP - 4.0), clampf(np.z, 4.0, MAP - 4.0));
+            if bx != np.x {
+                sx = 0.0;
+            }
+            if bz != np.z {
+                sz = 0.0;
+            }
+            np.x = bx;
+            np.z = bz;
+            np.y = self.w.height(np.x, np.z);
+            if sx * sx + sz * sz < CAR_REST_V * CAR_REST_V && spin.abs() < CAR_REST_SPIN {
+                sx = 0.0;
+                sz = 0.0;
+                spin = 0.0;
+            }
+            if !(np.finite() && sx.is_finite() && sz.is_finite() && spin.is_finite() && yaw.is_finite()) {
+                self.car_slide[k] = [0.0; 2];
+                self.car_spin[k] = 0.0;
+                self.sync_car_vel(k);
+                continue;
+            }
+            self.w.cars[k] = [np.x, np.y, np.z, yaw];
+            self.car_moved[k] = tick;
+            if walled {
+                self.cars_make_room(k);
+            }
+            self.car_slide[k] = [sx, sz];
+            self.car_spin[k] = spin;
+            if let Some(d) = driver {
+                // the driver goes with the car, at the speed they had along it
+                let ms = &mut self.players[d].ms;
+                let v = car_speed(ms);
+                ms.pos = np;
+                ms.airtime = yaw;
+                ms.vel = V3::new(f.x * v, 0.0, f.z * v);
+            }
+            self.sync_car_vel(k);
+            self.car_knocks_props(k, sp, dir);
+            self.car_hits_helis(k, vx, vz, by);
+            if driver.is_none() {
+                // people in its way: pushed aside, and hurt by a fast one
+                // (a driven car does this after its driver's step)
+                for j in 0..MAX_PLAYERS {
+                    let q = &self.players[j];
+                    if !q.used || !q.alive || q.ms.mode != MODE_GROUND {
+                        continue;
+                    }
+                    let mut at = q.ms.pos;
+                    if !self.w.push_car(k, &mut at, P_RADIUS) {
+                        continue;
+                    }
+                    let hgt = body_h(q.ms.crouch);
+                    self.w.collide_body(&mut at, P_RADIUS, hgt);
+                    let towards = (q.ms.pos.x - c[0]) * dir.x + (q.ms.pos.z - c[2]) * dir.z > 0.0;
+                    let q = &mut self.players[j];
+                    q.ms.pos.x = at.x;
+                    q.ms.pos.z = at.z;
+                    if sp > CAR_SLIDE_HURT_V && towards && tick.wrapping_sub(q.ram_tick) > 24 {
+                        q.ram_tick = tick;
+                        let who = if (by as usize) < MAX_PLAYERS && self.players[by as usize].used { by } else { j as u8 };
+                        let wk = if kind == VK_TRUCK { WK_TRUCK } else { WK_CAR };
+                        self.damage(j, who, 8.0 + (sp - CAR_SLIDE_HURT_V) * 4.0, false, wk, np);
+                        let s = &mut self.car_slide[k];
+                        s[0] *= 0.85;
+                        s[1] *= 0.85;
+                    }
+                }
+            }
+            if dent > 0.0 {
+                self.hurt_car(k, dent * CAR_CRASH_DMG, by);
+            }
+        }
+    }
+
     /// After the driver's step: move the car with them and run people over.
-    fn car_moved_by(&mut self, i: usize, v0: f32) {
+    fn car_moved_by(&mut self, i: usize, v0: f32, vel0: V3, hits: &DriveHits) {
         let Some(k) = self.car_of(i) else {
             self.exit_car(i);
             return;
@@ -1516,6 +1954,24 @@ impl Match {
         }
         let v = car_speed(&ms);
         self.car_hits_props(k, v0.max(v.abs()));
+        // the vehicles it ran into are shoved along: each gets exactly what
+        // the driver paid for with its own speed in `step_drive` (the same
+        // closing speed, so that pushing loses no engine power)
+        {
+            let s = self.car_slide[k];
+            let (vx, vz) = (vel0.x + s[0], vel0.z + s[1]);
+            for h in &hits.hits[..hits.n] {
+                if let Some((nx, nz, cx, cz)) = h.normal() {
+                    self.car_struck(k, h.k, nx, nz, cx, cz, h.closing, i as u8);
+                }
+            }
+            self.car_hits_helis(k, vx, vz, i as u8);
+            self.sync_car_vel(k);
+            if self.car_of(i) != Some(k) {
+                // (the crash blew something up, and that killed the driver)
+                return;
+            }
+        }
         // a crash: the speed lost in one step dents the car
         let lost = v0 - v.abs();
         if lost > 5.0 {
@@ -1779,6 +2235,9 @@ impl Match {
             h.vel = ms.vel;
             h.air = !ms.on_ground;
         }
+        if !ms.on_ground || v0.x * v0.x + v0.z * v0.z > HELI_SHOVE_V * HELI_SHOVE_V {
+            self.heli_shoves_cars(k, v0, i as u8);
+        }
         // a crash: the speed lost in one step (a wall, a tree, the ground
         // taken at speed) dents the hull
         let lost = v0.len() - ms.vel.len();
@@ -1928,19 +2387,38 @@ impl Match {
             }
             h.pitch = lerpf(h.pitch, 0.0, 0.08);
             h.roll = lerpf(h.roll, 0.0, 0.08);
+            let pos = V3::new(c[0], c[1], c[2]);
             if !h.air {
-                h.vel = V3::ZERO;
+                if h.vel.x * h.vel.x + h.vel.z * h.vel.z < 0.01 {
+                    h.vel = V3::ZERO;
+                    self.helis[k] = h;
+                    continue;
+                }
+                // knocked by a vehicle: it skids a little and stands again
+                let mut ms = MoveState { pos, vel: V3::new(h.vel.x, 0.0, h.vel.z), mode: MODE_FLY, on_ground: true, airtime: c[3], car: k as u8, ..Default::default() };
+                step_fly(&self.w, &mut ms, &Cmd { yaw: c[3], ..Default::default() }, DT);
+                if ms.pos.finite() && ms.vel.finite() {
+                    self.w.helis[k] = [ms.pos.x, ms.pos.y, ms.pos.z, c[3]];
+                    h.vel = ms.vel;
+                    h.air = !ms.on_ground;
+                } else {
+                    h.vel = V3::ZERO;
+                }
                 self.helis[k] = h;
                 continue;
             }
-            let pos = V3::new(c[0], c[1], c[2]);
             let mut impact = 0.0;
             if h.hp > 0.0 {
+                let v0 = h.vel;
                 let mut ms = MoveState { pos, vel: h.vel, mode: MODE_FLY, airtime: c[3], car: k as u8, ..Default::default() };
                 step_fly(&self.w, &mut ms, &Cmd { yaw: c[3], buttons: B_CROUCH, ..Default::default() }, DT);
                 self.w.helis[k] = [ms.pos.x, ms.pos.y, ms.pos.z, c[3]];
                 h.vel = ms.vel;
                 h.air = !ms.on_ground;
+                self.helis[k] = h;
+                // (coming down on a car, it shoves the car out from under it)
+                self.heli_shoves_cars(k, v0, h.hit_by);
+                h = self.helis[k];
             } else {
                 h.vel.y = (h.vel.y - 14.0 * DT).max(-40.0);
                 h.vel.x *= 0.99;
@@ -2490,6 +2968,8 @@ impl Match {
                 if k < self.car_driver.len() && self.car_driver[k] == j as u8 {
                     self.car_driver[k] = 255;
                     self.car_moved[k] = tick;
+                    // (it stops, but for what it still slides at)
+                    self.w.car_vel[k] = self.car_slide[k];
                 }
             }
             let mut at = q.ms.pos;
@@ -3086,6 +3566,10 @@ impl Match {
                         self.plane.active = false;
                     }
                 }
+                // (what the cars are doing, for whoever drives into one)
+                for k in 0..self.w.cars.len() {
+                    self.sync_car_vel(k);
+                }
                 // bots
                 for i in 0..MAX_PLAYERS {
                     if self.players[i].used && self.players[i].bot && self.players[i].alive {
@@ -3098,6 +3582,7 @@ impl Match {
                 self.auto_pickups();
                 self.update_nades();
                 self.update_car_fires();
+                self.update_cars();
                 self.update_helis();
                 self.update_missiles();
                 self.update_props();
@@ -3457,6 +3942,12 @@ impl Match {
             let hp = self.car_hp[k];
             let full = if self.w.car_kind.get(k) == Some(&VK_TRUCK) { 1100.0 } else { 600.0 };
             w.u8(if hp <= 0.0 { 0 } else { ((hp / full) * 255.0).ceil().clamp(1.0, 255.0) as u8 });
+            // how fast it moves (cm/s) and turns (rad/s in 50ths): a client
+            // that runs into it predicts where the knock sends it
+            let [vx, vz] = self.w.car_vel[k];
+            w.u16((vx * 100.0).round().clamp(-32767.0, 32767.0) as i16 as u16);
+            w.u16((vz * 100.0).round().clamp(-32767.0, 32767.0) as i16 as u16);
+            w.u8((self.car_spin[k] * 50.0).round().clamp(-127.0, 127.0) as i8 as u8);
             ccount += 1;
         }
         self.out[cpos] = ccount;

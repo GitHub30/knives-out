@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 14;
+export const PROTO = 15;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -245,7 +245,8 @@ export interface Snapshot {
   nades: { id: number; x: number; y: number; z: number }[];
   /** Cars that moved lately (plus a rotating few): driver 255 = empty, 254 = someone unseen. */
   /** hp: bodywork left in 255ths, 0 = a burnt-out wreck. */
-  cars: { id: number; x: number; y: number; z: number; yaw: number; driver: number; hp: number }[];
+  /** `vx`/`vz` (m/s) and `spin` (rad/s): how the car moves right now. */
+  cars: { id: number; x: number; y: number; z: number; yaw: number; driver: number; hp: number; vx: number; vz: number; spin: number }[];
   /** Loose crates and containers that moved lately: the middle of the underside. */
   props: { id: number; x: number; y: number; z: number; moving: boolean }[];
   /**
@@ -406,7 +407,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
   for (let i = 0; i < nn && !r.bad; i++) nades.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32() });
   const cars: Snapshot['cars'] = [];
   const nc = r.u8();
-  for (let i = 0; i < nc && !r.bad; i++) cars.push({ id: r.u8(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, driver: r.u8(), hp: r.u8() });
+  for (let i = 0; i < nc && !r.bad; i++) cars.push({ id: r.u8(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, driver: r.u8(), hp: r.u8(), vx: ((r.u16() << 16) >> 16) / 100, vz: ((r.u16() << 16) >> 16) / 100, spin: ((r.u8() << 24) >> 24) / 50 });
   const props: Snapshot['props'] = [];
   const nProps = r.u8();
   for (let i = 0; i < nProps && !r.bad; i++) props.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32(), moving: r.u8() !== 0 });

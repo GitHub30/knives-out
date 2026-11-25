@@ -20,6 +20,7 @@ import { Hud } from './hud';
 import { Sound } from './audio';
 import { Game, type MatchResult, type Settings } from './game';
 import { serverBase, WorkerTransport, WsTransport, type Transport } from './net';
+import { fmtTime, RankPanel } from './ranking';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -219,6 +220,7 @@ async function startGame(kind: 'offline' | 'online', room?: string) {
   show('pause', false);
   show('result', false);
   show('lobby', false);
+  rankPanel?.reset();
   hud.openMap(false);
   sound.unlock();
   sound.ui('click');
@@ -289,6 +291,20 @@ async function startGame(kind: 'offline' | 'online', room?: string) {
   setScreen('game');
 }
 
+/** The rankings block of the end card (built on first use). */
+let rankPanel: RankPanel | null = null;
+function rankings(): RankPanel {
+  if (!rankPanel) {
+    const card = $('result').querySelector<HTMLElement>('.result-card')!;
+    // placement next to the other figures
+    const tile = document.createElement('div');
+    tile.innerHTML = '<b id="result-place">-</b><span>順位</span>';
+    card.querySelector('.stats')!.prepend(tile);
+    rankPanel = new RankPanel(card, card.querySelector('.col'));
+  }
+  return rankPanel;
+}
+
 function showResult(r: MatchResult) {
   const won = r.won;
   $('result-title').textContent = won ? '🏆 チャンピオン！' : `#${r.place} / ${r.total}`;
@@ -301,7 +317,14 @@ function showResult(r: MatchResult) {
         : '安全地帯の外で倒れた';
   $('result-kills').textContent = String(r.kills);
   $('result-dmg').textContent = String(r.damage);
-  $('result-time').textContent = `${Math.floor(r.time / 60)}:${String(Math.floor(r.time % 60)).padStart(2, '0')}`;
+  $('result-time').textContent = fmtTime(r.time);
+  try {
+    const panel = rankings();
+    $('result-place').textContent = `${r.place} / ${r.total}`;
+    panel.show({ board: lastMode.kind === 'online' ? 'online' : 'solo', name: r.name, seconds: r.time, place: r.place, won, final: !!r.final });
+  } catch {
+    /* the rankings must never break the end card */
+  }
   $('result').classList.toggle('won', won);
   show('result', true);
   input.unlock();

@@ -91,6 +91,23 @@ pub const EV_CHUTE: u8 = 4;
 
 /// Advance one command. `speed_mult` folds in weapon weight, healing and boost.
 pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32) -> u8 {
+    let mut hits = DriveHits::default();
+    step_move_hits(w, s, c, speed_mult, dt, &mut hits)
+}
+
+/// The other cars a driven one ran into during its step, each with the
+/// closing speed it paid its share of (`CarHit::closing`).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DriveHits {
+    pub n: usize,
+    pub hits: [CarHit; CAR_HITS],
+}
+
+/// `step_move` that also tells which cars a driven car ran into, so that
+/// whoever moves them (the server, or the predicting client) gives them
+/// exactly what the driver paid for.
+pub fn step_move_hits(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32, out: &mut DriveHits) -> u8 {
+    out.n = 0;
     let mut ev = 0u8;
     let f = fwd(c.yaw);
     let r = right(c.yaw);
@@ -249,7 +266,7 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             }
             s.pos = np;
         }
-        MODE_DRIVE => step_drive(w, s, c, dt),
+        MODE_DRIVE => out.n = step_drive(w, s, c, dt, &mut out.hits),
         MODE_FLY => step_fly(w, s, c, dt),
         _ => {}
     }
@@ -284,14 +301,220 @@ pub fn car_speed(s: &MoveState) -> f32 {
     s.vel.x * f.x + s.vel.z * f.z
 }
 
+/// How heavy the vehicles are next to a police car: it decides who moves
+/// how much when two of them collide.
+pub const CAR_MASS: f32 = 1.0;
+pub const TRUCK_MASS: f32 = 3.0;
+pub const HELI_MASS: f32 = 20.0;
+/// A helicopter on the ground slower than this stands: cars do not push
+/// it about (a knock moves it a hand's breadth), and it does not shove them.
+pub const HELI_STAND_V: f32 = 3.0;
+/// How much of the closing speed two vehicles bounce apart with.
+pub const VEH_BOUNCE: f32 = 0.15;
+/// A shoved car that slides: what slows it along its wheels and across
+/// them (m/s2), the fastest it goes and turns, how much a push off its
+/// middle turns it, and the crawl below which it stands.
+pub const CAR_ROLL_FRICTION: f32 = 4.0;
+pub const CAR_SIDE_FRICTION: f32 = 11.0;
+pub const CAR_SLIDE_MAX: f32 = 45.0;
+pub const CAR_SPIN_MAX: f32 = 2.0;
+pub const CAR_SPIN_GAIN: f32 = 0.5;
+pub const CAR_REST_V: f32 = 0.3;
+pub const CAR_REST_SPIN: f32 = 0.12;
+
+pub fn car_mass(kind: u8) -> f32 {
+    if kind == VK_TRUCK {
+        TRUCK_MASS
+    } else {
+        CAR_MASS
+    }
+}
+
+/// The share of the closing speed a body of mass `m` loses when it runs
+/// into one of mass `other` (which gains `hit_share(other, m)` of it).
+#[inline]
+pub fn hit_share(m: f32, other: f32) -> f32 {
+    other * (1.0 + VEH_BOUNCE) / (m + other)
+}
+
+/// Another car touched by a car: the summed push out of it (pointing from
+/// it to the car that asked) and where they touch, weighted by `w`.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CarHit {
+    pub k: usize,
+    pub px: f32,
+    pub pz: f32,
+    pub cx: f32,
+    pub cz: f32,
+    pub w: f32,
+    /// How fast the two closed in when the driver that touched it paid for
+    /// the hit (filled by `step_drive` only; 0: they were not closing).
+    pub closing: f32,
+}
+pub const CAR_HITS: usize = 4;
+
+impl CarHit {
+    /// Unit direction from the other car to this one, and the contact point.
+    pub fn normal(&self) -> Option<(f32, f32, f32, f32)> {
+        let pl = (self.px * self.px + self.pz * self.pz).sqrt();
+        if pl < 1e-5 || self.w < 1e-6 {
+            return None;
+        }
+        Some((self.px / pl, self.pz / pl, self.cx / self.w, self.cz / self.w))
+    }
+}
+
+fn add_hit(hits: &mut [CarHit; CAR_HITS], n: &mut usize, k: usize, nx: f32, nz: f32, depth: f32, cx: f32, cz: f32) {
+    let slot = match hits[..*n].iter().position(|h| h.k == k) {
+        Some(s) => s,
+        None if *n < CAR_HITS => {
+            hits[*n] = CarHit { k, ..Default::default() };
+            *n += 1;
+            *n - 1
+        }
+        None => return,
+    };
+    let h = &mut hits[slot];
+    h.px += nx * depth;
+    h.pz += nz * depth;
+    h.cx += cx * depth;
+    h.cz += cz * depth;
+    h.w += depth;
+}
+
+/// Push the body of car `me` (of `kind`, at `np` heading `yaw`) out of
+/// walls, trees, the other cars and the helicopters: three circles along
+/// the body. Returns how far the static world and the helicopters pushed
+/// it (the sum over the circles, and as a vector) and how many other cars
+/// it touched, which are listed in `hits`.
+pub fn car_collide(w: &World, me: usize, kind: u8, np: &mut V3, yaw: f32, hits: &mut [CarHit; CAR_HITS]) -> (f32, V3, usize) {
+    let f = fwd(yaw);
+    let (circles, cr, _) = car_shape(kind);
+    let mut pushed = 0.0f32;
+    let mut solid = V3::ZERO;
+    let mut n = 0usize;
+    for _ in 0..2 {
+        for off in circles {
+            let base = V3::new(np.x + f.x * off, w.height(np.x + f.x * off, np.z + f.z * off) + 0.45, np.z + f.z * off);
+            let mut q = base;
+            // (crates do not stop a car: it knocks them flying)
+            w.collide_body_ex(&mut q, cr, 1.0, true);
+            let (mut sx, mut sz) = (q.x - base.x, q.z - base.z);
+            for (k, o) in w.cars.iter().enumerate() {
+                if k == me || (o[0] - q.x).abs() > 8.0 || (o[2] - q.z).abs() > 8.0 || (o[1] - np.y).abs() > 3.0 {
+                    continue;
+                }
+                let of = fwd(o[3]);
+                let (ocircles, ocr, _) = car_shape(*w.car_kind.get(k).unwrap_or(&0));
+                for ooff in ocircles {
+                    let (ox, oz) = (o[0] + of.x * ooff, o[2] + of.z * ooff);
+                    let (dx, dz) = (q.x - ox, q.z - oz);
+                    let d2 = dx * dx + dz * dz;
+                    let rr = cr + ocr;
+                    if d2 < rr * rr && d2 > 1e-6 {
+                        let dl = d2.sqrt();
+                        let (nx, nz) = (dx / dl, dz / dl);
+                        q.x += nx * (rr - dl);
+                        q.z += nz * (rr - dl);
+                        add_hit(hits, &mut n, k, nx, nz, rr - dl, ox + nx * ocr, oz + nz * ocr);
+                    }
+                }
+            }
+            let (bx, bz) = (q.x, q.z);
+            w.push_helis(&mut q, cr, 1.0, usize::MAX);
+            sx += q.x - bx;
+            sz += q.z - bz;
+            solid.x += sx;
+            solid.z += sz;
+            pushed += (sx * sx + sz * sz).sqrt();
+            np.x += q.x - base.x;
+            np.z += q.z - base.z;
+        }
+    }
+    (pushed, solid, n)
+}
+
+/// Push a car of `kind` (at `np` heading `yaw`) out of walls and trees
+/// only, a few rounds over its circles: what it comes to rest in is never
+/// a wall.
+pub fn car_out_of_walls(w: &World, kind: u8, np: &mut V3, yaw: f32) {
+    let f = fwd(yaw);
+    let (circles, cr, _) = car_shape(kind);
+    for _ in 0..3 {
+        let mut any = false;
+        for off in circles {
+            let base = V3::new(np.x + f.x * off, w.height(np.x + f.x * off, np.z + f.z * off) + 0.45, np.z + f.z * off);
+            let mut q = base;
+            if w.collide_body_ex(&mut q, cr, 1.0, true) {
+                np.x += q.x - base.x;
+                np.z += q.z - base.z;
+                any = true;
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+}
+
+/// How two cars (poses `a` and `b`) overlap where they overlap deepest:
+/// the direction from `b` to `a` there, and how deep.
+pub fn car_overlap(a: [f32; 4], akind: u8, b: [f32; 4], bkind: u8) -> Option<(f32, f32, f32)> {
+    let (ac, ar, _) = car_shape(akind);
+    let (bc, br, _) = car_shape(bkind);
+    let (af, bf) = (fwd(a[3]), fwd(b[3]));
+    let mut best: Option<(f32, f32, f32)> = None;
+    for ao in ac {
+        for bo in bc {
+            let (dx, dz) = (a[0] + af.x * ao - (b[0] + bf.x * bo), a[2] + af.z * ao - (b[2] + bf.z * bo));
+            let d = (dx * dx + dz * dz).sqrt();
+            let depth = ar + br - d;
+            if depth > 1e-4 && d > 1e-4 && best.map_or(true, |x| depth > x.2) {
+                best = Some((dx / d, dz / d, depth));
+            }
+        }
+    }
+    best
+}
+
+/// The other cars that car `me` (at `pos` heading `yaw`) touches or comes
+/// within `margin` of. Nothing is moved.
+pub fn car_touches(w: &World, me: usize, kind: u8, pos: V3, yaw: f32, margin: f32, hits: &mut [CarHit; CAR_HITS]) -> usize {
+    let f = fwd(yaw);
+    let (circles, cr, _) = car_shape(kind);
+    let mut n = 0usize;
+    for off in circles {
+        let (qx, qz) = (pos.x + f.x * off, pos.z + f.z * off);
+        for (k, o) in w.cars.iter().enumerate() {
+            if k == me || (o[0] - qx).abs() > 8.0 || (o[2] - qz).abs() > 8.0 || (o[1] - pos.y).abs() > 3.0 {
+                continue;
+            }
+            let of = fwd(o[3]);
+            let (ocircles, ocr, _) = car_shape(*w.car_kind.get(k).unwrap_or(&0));
+            for ooff in ocircles {
+                let (ox, oz) = (o[0] + of.x * ooff, o[2] + of.z * ooff);
+                let (dx, dz) = (qx - ox, qz - oz);
+                let d2 = dx * dx + dz * dz;
+                let rr = cr + ocr + margin;
+                if d2 < rr * rr && d2 > 1e-6 {
+                    let dl = d2.sqrt();
+                    let (nx, nz) = (dx / dl, dz / dl);
+                    add_hit(hits, &mut n, k, nx, nz, rr - dl, ox + nx * ocr, oz + nz * ocr);
+                }
+            }
+        }
+    }
+    n
+}
+
 /// One step of a driven car: `mz` is the throttle, `mx` steers, jump brakes.
-fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
+fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32, hits: &mut [CarHit; CAR_HITS]) -> usize {
     let mut yaw = if s.airtime.is_finite() { s.airtime } else { 0.0 };
     let mut v = car_speed(s);
     let (thr, steer) = (clampf(c.mz, -1.0, 1.0), clampf(c.mx, -1.0, 1.0));
     let wet = w.height(s.pos.x, s.pos.z) < WATER - 0.45;
     let kind = *w.car_kind.get(s.car as usize).unwrap_or(&0);
-    let (circles, cr, top) = car_shape(kind);
+    let (circles, _, top) = car_shape(kind);
     let power = if kind == VK_TRUCK { 7.0 } else { 11.0 };
     let vmax = if wet { 3.0 } else { top };
     if c.has(B_JUMP) {
@@ -331,40 +554,27 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
         v = approach(v, 0.0, (rise - 0.5) * 9.0 * dt);
     }
     // walls, trees and other cars against three circles along the body
-    let mut pushed = 0.0f32;
-    for _ in 0..2 {
-        for off in circles {
-            let base = V3::new(np.x + f.x * off, w.height(np.x + f.x * off, np.z + f.z * off) + 0.45, np.z + f.z * off);
-            let mut q = base;
-            // (crates do not stop a car: it knocks them flying)
-            w.collide_body_ex(&mut q, cr, 1.0, true);
-            for (k, o) in w.cars.iter().enumerate() {
-                if k == s.car as usize || (o[0] - q.x).abs() > 8.0 || (o[2] - q.z).abs() > 8.0 || (o[1] - np.y).abs() > 3.0 {
-                    continue;
-                }
-                let of = fwd(o[3]);
-                let (ocircles, ocr, _) = car_shape(*w.car_kind.get(k).unwrap_or(&0));
-                for ooff in ocircles {
-                    let (dx, dz) = (q.x - (o[0] + of.x * ooff), q.z - (o[2] + of.z * ooff));
-                    let d2 = dx * dx + dz * dz;
-                    let rr = cr + ocr;
-                    if d2 < rr * rr && d2 > 1e-6 {
-                        let dl = d2.sqrt();
-                        q.x += dx / dl * (rr - dl);
-                        q.z += dz / dl * (rr - dl);
-                    }
-                }
-            }
-            w.push_helis(&mut q, cr, 1.0, usize::MAX);
-            let (dx, dz) = (q.x - base.x, q.z - base.z);
-            np.x += dx;
-            np.z += dz;
-            pushed += (dx * dx + dz * dz).sqrt();
-        }
-    }
+    *hits = [CarHit::default(); CAR_HITS];
+    let (pushed, _, nhit) = car_collide(w, s.car as usize, kind, &mut np, yaw, hits);
     if pushed > 1e-4 {
         // scraping costs speed; a square hit stops the car
         v *= (1.0 - pushed * 1.5).clamp(0.0, 1.0);
+    }
+    // Another vehicle is shoved along instead (the server moves it): this
+    // one keeps the share of the closing speed that its weight earns it.
+    for h in hits[..nhit].iter_mut() {
+        let pl = (h.px * h.px + h.pz * h.pz).sqrt();
+        if pl < 1e-5 {
+            continue;
+        }
+        let (nx, nz) = (h.px / pl, h.pz / pl);
+        let ov = w.car_vel.get(h.k).copied().unwrap_or([0.0; 2]);
+        let closing = -((f.x * v - ov[0]) * nx + (f.z * v - ov[1]) * nz);
+        if closing > 0.0 {
+            let share = hit_share(car_mass(kind), car_mass(*w.car_kind.get(h.k).unwrap_or(&0)));
+            v += (nx * f.x + nz * f.z) * closing * share;
+            h.closing = closing;
+        }
     }
     np.x = clampf(np.x, 4.0, MAP - 4.0);
     np.z = clampf(np.z, 4.0, MAP - 4.0);
@@ -375,6 +585,170 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     s.on_ground = true;
     s.crouch = false;
     s.in_water = false;
+    nhit
+}
+
+/// How much a push of (`dvx`, `dvz`) at (`rx`, `rz`) from the middle of a
+/// vehicle of `kind` turns it (a point at r turns with the car at
+/// spin * (r.z, -r.x)).
+pub fn shove_spin(kind: u8, dvx: f32, dvz: f32, rx: f32, rz: f32) -> f32 {
+    let gyr2 = if kind == VK_TRUCK { 5.0 } else { 3.0 };
+    (dvx * rz - dvz * rx) / gyr2 * CAR_SPIN_GAIN
+}
+
+/// One step of the friction on a car that slides at (`sx`, `sz`) and turns
+/// at `spin`, heading `yaw`: rolling along its wheels is easy, sideways the
+/// tyres bite. Below a crawl it stands.
+pub fn slide_friction(sx: f32, sz: f32, spin: f32, yaw: f32, wet: bool, dt: f32) -> (f32, f32, f32) {
+    let f = fwd(yaw);
+    let wet = if wet { 2.5 } else { 1.0 };
+    let along = sx * f.x + sz * f.z;
+    let (lx, lz) = (sx - f.x * along, sz - f.z * along);
+    let ll = (lx * lx + lz * lz).sqrt();
+    let along2 = approach(along, 0.0, (CAR_ROLL_FRICTION + along.abs() * 0.25) * wet * dt);
+    let ll2 = approach(ll, 0.0, CAR_SIDE_FRICTION * wet * dt);
+    let lk = if ll > 1e-5 { ll2 / ll } else { 0.0 };
+    let (sx, sz) = (f.x * along2 + lx * lk, f.z * along2 + lz * lk);
+    let spin = approach(spin, 0.0, (2.5 + spin.abs() * 2.0) * dt);
+    (sx, sz, spin)
+}
+
+/// What the predicting client keeps about the cars besides `World.cars`
+/// and `World.car_vel`: how fast each turns, and which ones nobody drives
+/// (those slide on by themselves; a driven one is its driver's business).
+#[derive(Default, Clone)]
+pub struct CarsPred {
+    pub spin: Vec<f32>,
+    pub free: Vec<bool>,
+}
+
+/// Client prediction of what the server's `car_moved_by` does to the cars
+/// a driven car (`me`, of `kind`) ran into: they are shoved along.
+pub fn predict_shoves(w: &mut World, cp: &mut CarsPred, kind: u8, hits: &DriveHits) {
+    for h in &hits.hits[..hits.n] {
+        let Some((nx, nz, cx, cz)) = h.normal() else { continue };
+        if !(h.closing > 0.05) || h.k >= w.cars.len() || h.k >= w.car_vel.len() || h.k >= cp.spin.len() {
+            continue;
+        }
+        let jk = *w.car_kind.get(h.k).unwrap_or(&0);
+        let dv = h.closing * hit_share(car_mass(jk), car_mass(kind));
+        let c = w.cars[h.k];
+        let v = &mut w.car_vel[h.k];
+        v[0] -= nx * dv;
+        v[1] -= nz * dv;
+        let l = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        if l > CAR_SLIDE_MAX {
+            v[0] *= CAR_SLIDE_MAX / l;
+            v[1] *= CAR_SLIDE_MAX / l;
+        }
+        if cp.free[h.k] {
+            cp.spin[h.k] = clampf(cp.spin[h.k] + shove_spin(jk, -nx * dv, -nz * dv, cx - c[0], cz - c[2]), -CAR_SPIN_MAX, CAR_SPIN_MAX);
+        }
+    }
+}
+
+/// Client prediction of the server's `update_cars`: the driverless cars
+/// that move slide on for one step, slow down and stop at walls. (Cruder
+/// than the server: no damage, no people, no props; the next snapshot
+/// puts right what this gets wrong.) `me` is the car the client drives.
+pub fn predict_slides(w: &mut World, cp: &mut CarsPred, me: usize, dt: f32) {
+    for k in 0..w.cars.len().min(w.car_vel.len()).min(cp.spin.len()) {
+        let [mut sx, mut sz] = w.car_vel[k];
+        let mut spin = cp.spin[k];
+        if k == me || !cp.free[k] || (sx == 0.0 && sz == 0.0 && spin == 0.0) {
+            continue;
+        }
+        let c = w.cars[k];
+        if c[1] < -500.0 {
+            continue;
+        }
+        let kind = *w.car_kind.get(k).unwrap_or(&0);
+        let sp = (sx * sx + sz * sz).sqrt();
+        let dir = if sp > 1e-4 { V3::new(sx / sp, 0.0, sz / sp) } else { V3::ZERO };
+        let yaw = wrap_angle(c[3] + spin * dt);
+        let mut np = V3::new(c[0], c[1], c[2]);
+        let (mut ex, mut ez) = (sx * dt, sz * dt);
+        let reach = car_shape(kind).0[2] + 0.7;
+        let rise = w.height(c[0] + ex + dir.x * reach, c[2] + ez + dir.z * reach) - w.height(c[0] + ex, c[2] + ez);
+        if rise > 1.9 {
+            ex = 0.0;
+            ez = 0.0;
+            sx = 0.0;
+            sz = 0.0;
+        } else if rise > 0.5 {
+            let k2 = (1.0 - (rise - 0.5) * 9.0 * dt / sp.max(0.5)).max(0.0);
+            sx *= k2;
+            sz *= k2;
+        }
+        let mut hits = [CarHit::default(); CAR_HITS];
+        let (mut solid, mut n) = (V3::ZERO, 0);
+        let steps = ((sp * dt / 0.5).ceil() as usize).clamp(1, 4);
+        for _ in 0..steps {
+            np.x += ex / steps as f32;
+            np.z += ez / steps as f32;
+            let (_, s2, n2) = car_collide(w, k, kind, &mut np, yaw, &mut hits);
+            solid = s2;
+            n = n2;
+            if n2 > 0 || s2.x != 0.0 || s2.z != 0.0 {
+                break;
+            }
+        }
+        let sl = (solid.x * solid.x + solid.z * solid.z).sqrt();
+        if sl > 1e-4 {
+            let (nx, nz) = (solid.x / sl, solid.z / sl);
+            let into = sx * nx + sz * nz;
+            if into < 0.0 {
+                sx -= nx * into * 1.1;
+                sz -= nz * into * 1.1;
+            }
+            spin *= 0.5;
+        }
+        let mk = car_mass(kind);
+        for h in &hits[..n] {
+            let Some((nx, nz, cx, cz)) = h.normal() else { continue };
+            let ov = w.car_vel[h.k.min(w.car_vel.len() - 1)];
+            let closing = -((sx - ov[0]) * nx + (sz - ov[1]) * nz);
+            if !(closing > 0.05) {
+                continue;
+            }
+            let jk = *w.car_kind.get(h.k).unwrap_or(&0);
+            let mj = car_mass(jk);
+            let dv = closing * hit_share(mk, mj);
+            sx += nx * dv;
+            sz += nz * dv;
+            spin = clampf(spin + shove_spin(kind, nx * dv, nz * dv, cx - np.x, cz - np.z), -CAR_SPIN_MAX, CAR_SPIN_MAX);
+            if h.k < cp.free.len() && cp.free[h.k] && h.k < w.car_vel.len() {
+                let dj = closing * hit_share(mj, mk);
+                w.car_vel[h.k][0] -= nx * dj;
+                w.car_vel[h.k][1] -= nz * dj;
+            }
+        }
+        let wet = w.height(np.x, np.z) < WATER - 0.45;
+        (sx, sz, spin) = slide_friction(sx, sz, spin, yaw, wet, dt);
+        let (bx, bz) = (clampf(np.x, 4.0, MAP - 4.0), clampf(np.z, 4.0, MAP - 4.0));
+        if bx != np.x {
+            sx = 0.0;
+        }
+        if bz != np.z {
+            sz = 0.0;
+        }
+        np.x = bx;
+        np.z = bz;
+        np.y = w.height(np.x, np.z);
+        if sx * sx + sz * sz < CAR_REST_V * CAR_REST_V && spin.abs() < CAR_REST_SPIN {
+            sx = 0.0;
+            sz = 0.0;
+            spin = 0.0;
+        }
+        if !(np.finite() && sx.is_finite() && sz.is_finite() && spin.is_finite() && yaw.is_finite()) {
+            w.car_vel[k] = [0.0; 2];
+            cp.spin[k] = 0.0;
+            continue;
+        }
+        w.cars[k] = [np.x, np.y, np.z, yaw];
+        w.car_vel[k] = [sx, sz];
+        cp.spin[k] = spin;
+    }
 }
 
 pub const HELI_VMAX: f32 = 45.0;
@@ -407,16 +781,35 @@ pub fn heli_floor(w: &World, pos: V3, yaw: f32, feet: f32) -> f32 {
 /// Push the hull of helicopter `k` (at `np`, heading `yaw`) out of walls,
 /// trees, cars and the other helicopters. Returns the push applied.
 pub fn heli_collide(w: &World, k: usize, np: &mut V3, yaw: f32) -> V3 {
+    let (solid, cars, _) = heli_collide_parts(w, k, np, yaw, true);
+    solid + cars
+}
+
+/// Like `heli_collide`, but tells the push by the cars (which give way:
+/// the server shoves them along) from the rest, and how heavy the
+/// heaviest car touched is. Without `with_cars` the cars are ignored (one
+/// standing on the ground is far too heavy for a car to move aside).
+pub fn heli_collide_parts(w: &World, k: usize, np: &mut V3, yaw: f32, with_cars: bool) -> (V3, V3, f32) {
     let f = fwd(yaw);
-    let start = *np;
+    let mut solid = V3::ZERO;
+    let mut cars = V3::ZERO;
+    let mut mass = 0.0f32;
     for _ in 0..2 {
         for off in HELI_CIRCLES {
             let base = V3::new(np.x + f.x * off, np.y + 0.2, np.z + f.z * off);
             let mut q = base;
             w.collide_body(&mut q, HELI_CR, HELI_BODY_H);
-            for c in 0..w.cars.len() {
-                w.push_car(c, &mut q, HELI_CR);
+            solid.x += q.x - base.x;
+            solid.z += q.z - base.z;
+            let (bx, bz) = (q.x, q.z);
+            for c in 0..if with_cars { w.cars.len() } else { 0 } {
+                if w.push_car(c, &mut q, HELI_CR) {
+                    mass = mass.max(car_mass(*w.car_kind.get(c).unwrap_or(&0)));
+                }
             }
+            cars.x += q.x - bx;
+            cars.z += q.z - bz;
+            let (bx, bz) = (q.x, q.z);
             for (j, o) in w.helis.iter().enumerate() {
                 if j == k || (o[1] - np.y).abs() > HELI_TOP || (o[0] - q.x).abs() > 22.0 || (o[2] - q.z).abs() > 22.0 {
                     continue;
@@ -433,11 +826,13 @@ pub fn heli_collide(w: &World, k: usize, np: &mut V3, yaw: f32) -> V3 {
                     }
                 }
             }
+            solid.x += q.x - bx;
+            solid.z += q.z - bz;
             np.x += q.x - base.x;
             np.z += q.z - base.z;
         }
     }
-    *np - start
+    (solid, cars, mass)
 }
 
 /// One step of a flown helicopter: the stick moves it in the frame of its
@@ -448,6 +843,8 @@ pub fn step_fly(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     let up = c.has(B_JUMP);
     let down = c.has(B_CROUCH) && !up;
     let alt = s.pos.y - heli_floor(w, s.pos, yaw, s.pos.y);
+    // standing on its wheels (at most nudged along a little by a vehicle)
+    let standing = s.on_ground && !up && s.vel.x * s.vel.x + s.vel.z * s.vel.z < HELI_STAND_V * HELI_STAND_V;
     let mut tv = V3::ZERO;
     let mut acc = 14.0;
     if !(s.on_ground && !up) {
@@ -478,7 +875,7 @@ pub fn step_fly(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     np.x = clampf(np.x, 10.0, MAP - 10.0);
     np.z = clampf(np.z, 10.0, MAP - 10.0);
     np.y = np.y.min(HELI_CEIL);
-    let push = heli_collide(w, s.car as usize, &mut np, yaw);
+    let (push, cpush, cmass) = heli_collide_parts(w, s.car as usize, &mut np, yaw, !standing);
     let pl = push.len();
     if pl > 1e-4 {
         // what it flew into takes the speed towards it
@@ -486,6 +883,16 @@ pub fn step_fly(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
         let vn = s.vel.dot(n);
         if vn < 0.0 {
             s.vel -= n * vn;
+        }
+    }
+    let cl = cpush.len();
+    if cl > 1e-4 {
+        // a car gives way (the server shoves it along): that costs only
+        // the little speed its weight is worth
+        let n = cpush * (1.0 / cl);
+        let vn = s.vel.dot(n);
+        if vn < 0.0 {
+            s.vel -= n * (vn * hit_share(HELI_MASS, cmass.max(CAR_MASS)));
         }
     }
     let g = heli_floor(w, np, yaw, s.pos.y.max(np.y));

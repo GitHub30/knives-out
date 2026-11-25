@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the CH-47J transport helicopter (JASDF camouflage) as GLB files.
+"""Build the CH-47J transport helicopter (camouflaged, JGSDF lettering) as GLB files.
 
 Everything is generated here: the airframe is lofted from dimensioned
 sections (15.5 m fuselage, 3.7 m over the side pods, 18.3 m rotors) and the
@@ -366,12 +366,12 @@ class Sheet:
         if gloss:
             self.g.rounded_rectangle(box_, radius=rad * self.k, fill=255)
 
-    def text(self, s, u, v, height, font=FONT_EN, fill=INK, squeeze=1.0):
-        """Upright text centred on (u, v), `height` metres tall."""
+    def text(self, s, u, v, height, font=FONT_EN, fill=INK, squeeze=1.0, bold=0):
+        """Upright text centred on (u, v), `height` metres tall; `bold` thickens the strokes."""
         f = ImageFont.truetype(font, 200)
-        l, t, r, b = f.getbbox(s)
+        l, t, r, b = f.getbbox(s, stroke_width=bold)
         im = Image.new('RGBA', (r - l + 8, b - t + 8), (0, 0, 0, 0))
-        ImageDraw.Draw(im).text((4 - l, 4 - t), s, font=f, fill=fill + (255,))
+        ImageDraw.Draw(im).text((4 - l, 4 - t), s, font=f, fill=fill + (255,), stroke_width=bold, stroke_fill=fill + (255,))
         hh = max(1, int(height * self.k))
         ww = max(1, int(hh * im.width / im.height * squeeze))
         im = im.resize((ww, hh), Image.LANCZOS)
@@ -558,7 +558,11 @@ def side_sheet(side):
     sh.text('非常口ハンドル', 2.62, 0.4, 0.04, FONT_JA, INK)
     sh.text('ボタンを押して', 2.62, 0.35, 0.04, FONT_JA, INK)
     sh.text('ハンドルを回せ', 2.62, 0.3, 0.04, FONT_JA, INK)
-    sh.text('航空自衛隊', 3.45, 2.2, 0.17, FONT_JA, INK)
+    # service lettering above the hatch (port) and the crew door (starboard),
+    # clear of the hoist and the lamp behind the cockpit
+    # (a pale edge keeps it readable across the camouflage)
+    sh.text('陸上自衛隊', 5.3, 2.2, 0.382, FONT_JA, (236, 236, 230), bold=9)
+    sh.text('陸上自衛隊', 5.3, 2.2, 0.36, FONT_JA, INK, bold=3)
     # white ring emblem behind the radome
     sh.disc(0.47, 0.95, 0.075, outline=(236, 236, 230, 255), width=0.014)
     sh.disc(0.47, 0.975, 0.014, fill=(236, 236, 230, 255))

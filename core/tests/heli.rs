@@ -160,7 +160,7 @@ fn wire(buf: &[u8]) -> Wire {
     let n = r.u8() as usize;
     r.1 += n * 14;
     let n = r.u8() as usize;
-    r.1 += n * 17;
+    r.1 += n * 22;
     let n = r.u8() as usize;
     r.1 += n * 15;
     let mut helis = vec![];
@@ -678,7 +678,7 @@ fn a_pilot_who_disconnects_bails_out_and_the_helicopter_comes_down() {
 
 #[test]
 fn snapshot_carries_helicopters() {
-    assert_eq!(PROTO, 14);
+    assert_eq!(PROTO, 15);
     let (mut m, ids, o) = stage(42, 3);
     let (a, b) = (ids[0], ids[1]);
     // b watches from the far end of the open run, the third from the far corner

@@ -37,7 +37,10 @@ export interface MatchResult {
   kills: number;
   damage: number;
   won: boolean;
+  /** Seconds survived, in simulation time (what the rankings record). */
   time: number;
+  /** The player's own in-match name. */
+  name: string;
   killerName: string | null;
   /** Set when the whole match is over. */
   winnerName?: string | null;
@@ -83,10 +86,37 @@ interface Pred {
   car: number;
 }
 
-/** A car as the client draws it: two timed samples to interpolate between. */
+/** Timed samples of the last few snapshots, oldest first: what is drawn lies between two of them. */
+const TRAIL = 8;
+/**
+ * Add a sample to a trail. Something that sat still (not sent for a
+ * while) starts moving from where it stood one snapshot ago.
+ */
+function trailPush<T extends { t: number }>(h: T[], p: T, step: number) {
+  const last = h[h.length - 1];
+  if (last && p.t - last.t > 8) {
+    h.length = 0;
+    h.push({ ...last, t: p.t - step });
+  } else if (last && p.t <= last.t) h.length = 0;
+  h.push(p);
+  if (h.length > TRAIL) h.shift();
+}
+/** The two samples of a trail around tick `t` and how far between them it lies. */
+function trailAt<T extends { t: number }>(h: T[], t: number): { a: T; b: T; f: number } {
+  for (let i = h.length - 1; i > 0; i--) {
+    if (h[i - 1].t <= t) {
+      const span = h[i].t - h[i - 1].t;
+      return { a: h[i - 1], b: h[i], f: span > 0 ? clamp((t - h[i - 1].t) / span, 0, 1) : 1 };
+    }
+  }
+  return { a: h[0], b: h[0], f: 0 };
+}
+
+/** A car as the client draws it: timed samples to interpolate between (`b` is the latest, `a` the one before). */
 interface CarC {
   a: { x: number; y: number; z: number; yaw: number; t: number };
   b: { x: number; y: number; z: number; yaw: number; t: number };
+  h: { x: number; y: number; z: number; yaw: number; t: number }[];
   driver: number;
   /** 0 police car, 1 fire truck. */
   kind: number;
@@ -120,6 +150,7 @@ interface HeliPose {
 interface HeliC {
   a: HeliPose;
   b: HeliPose;
+  h: HeliPose[];
   /** From the server: rotor speed 0..1, pilot id (255 nobody, 254 unseen), hull in 255ths, missiles left. */
   rotor: number;
   pilot: number;
@@ -143,6 +174,7 @@ interface PropC {
   col: number;
   a: { x: number; y: number; z: number; t: number };
   b: { x: number; y: number; z: number; t: number };
+  h: { x: number; y: number; z: number; t: number }[];
   moving: boolean;
   /** Tumbling while it flies; it rights itself when it comes to rest. */
   rot: Q;
@@ -249,6 +281,11 @@ export class Game {
   private smoothYaw = 0;
   private lastLookAt = 0;
   private carPoses = new Float32Array(0);
+  /** Per car while I drive: its predicted pose one command ago, the offset that hides a correction, and how far it is drawn from the prediction (0..1). */
+  private carPrev = new Float32Array(0);
+  private carSm = new Float32Array(0);
+  private carPw = new Float32Array(0);
+  private carsWere: Float32Array | null = null;
   private myLandAt = -9;
   private glassPanes: Float32Array = new Float32Array(0);
   private glass = new Instances(256);
@@ -306,6 +343,9 @@ export class Game {
   private camEye: V3 = [0, 0, 0];
   private camYaw = 0;
   private matchStartTime = 0;
+  /** Play-phase time (s) the player has survived: up to the snapshot that reports its death. */
+  private aliveT = -1;
+  private deathSeen = false;
   private welcomeWait: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private visHandler = () => this.onVisibility();
   /** Keep-alive that also runs in background tabs (rAF stops there). */
@@ -438,7 +478,7 @@ export class Game {
     this.props = [];
     for (let i = 0; i + 8 <= pr.length; i += 8) {
       const at = { x: (pr[i] + pr[i + 3]) / 2, y: pr[i + 1], z: (pr[i + 2] + pr[i + 5]) / 2, t: 0 };
-      this.props.push({ hx: (pr[i + 3] - pr[i]) / 2, hy: pr[i + 4] - pr[i + 1], hz: (pr[i + 5] - pr[i + 2]) / 2, crate: pr[i + 6] > 0.5, col: pr[i + 7], a: at, b: { ...at }, moving: false, rot: qIdent(), axis: [1, 0, 0] });
+      this.props.push({ hx: (pr[i + 3] - pr[i]) / 2, hy: pr[i + 4] - pr[i + 1], hz: (pr[i + 5] - pr[i + 2]) / 2, crate: pr[i + 6] > 0.5, col: pr[i + 7], a: at, b: { ...at }, h: [{ ...at }], moving: false, rot: qIdent(), axis: [1, 0, 0] });
     }
     const c0 = core.f32(8);
     const kinds = core.bytes(9);
@@ -446,16 +486,19 @@ export class Game {
     for (let i = 0; i + 4 <= c0.length; i += 4) {
       const at = { x: c0[i], y: c0[i + 1], z: c0[i + 2], yaw: c0[i + 3], t: 0 };
       this.cars.push({
-        a: at, b: { ...at }, driver: 255, kind: Math.min(kinds[i >> 2] ?? 0, CAR_KINDS.length - 1), hp: 255, deadAt: -1,
+        a: at, b: { ...at }, h: [{ ...at }], driver: 255, kind: Math.min(kinds[i >> 2] ?? 0, CAR_KINDS.length - 1), hp: 255, deadAt: -1,
         spin: 0, steer: 0, px: at.x, pz: at.z, pyaw: at.yaw, speed: 0, trackAcc: 0, trackAt: [null, null], smokeT: 0,
       });
     }
     this.myCar = -1;
+    this.carPrev = new Float32Array(this.cars.length * 4);
+    this.carSm = new Float32Array(this.cars.length * 4);
+    this.carPw = new Float32Array(this.cars.length);
     const h0 = core.helis();
     this.helis = [];
     for (let i = 0; i + 4 <= h0.length; i += 4) {
       const at: HeliPose = { x: h0[i], y: h0[i + 1], z: h0[i + 2], yaw: h0[i + 3], pitch: 0, roll: 0, t: 0 };
-      this.helis.push({ a: at, b: { ...at }, rotor: 0, pilot: 255, hp: 255, ammo: 0, airborne: false, deadAt: -1, spin: 0, angle: i, gear: 0, smokeT: 0 });
+      this.helis.push({ a: at, b: { ...at }, h: [{ ...at }], rotor: 0, pilot: 255, hp: 255, ammo: 0, airborne: false, deadAt: -1, spin: 0, angle: i, gear: 0, smokeT: 0 });
     }
     this.myHeli = -1;
     this.missilesSeen.clear();
@@ -494,6 +537,8 @@ export class Game {
     }
     for (const e of s.events) this.onEvent(e);
     this.onPhase(s);
+    // (where my prediction had the cars, before the server's word replaces it)
+    this.carsWere = this.pred && this.pred.mode === P.MODE_DRIVE ? this.d.core.carPoses().slice() : null;
     this.onCars(s);
     this.onHelis(s);
     this.onProps(s);
@@ -509,8 +554,17 @@ export class Game {
     this.lastHealth = s.self.health;
   }
 
+  /** Seconds survived: simulation time (pauses and lag do not count), else the wall clock. */
+  private survived(): number {
+    return this.aliveT >= 0 ? this.aliveT : (performance.now() - this.matchStartTime) / 1000;
+  }
+
   private onPhase(s: P.Snapshot) {
     const hud = this.d.hud;
+    if (s.phase === P.PH_PLAY && !this.deathSeen) {
+      this.aliveT = s.phaseT;
+      this.deathSeen = !s.self.alive;
+    }
     if (s.phase === P.PH_LOBBY) {
       this.d.onLobby({ count: s.total, timeLeft: s.phaseT, isPrivate: ((this.welcome?.flags ?? 0) & 2) !== 0, slots: this.welcome?.slots ?? 30 });
     }
@@ -663,7 +717,8 @@ export class Game {
       kills: s.self.kills,
       damage: s.self.dmg,
       won: false,
-      time: (performance.now() - this.matchStartTime) / 1000,
+      time: this.survived(),
+      name: this.nameOf(this.myId),
       killerName: s.self.killer === 255 ? null : this.nameOf(s.self.killer),
     });
   }
@@ -689,7 +744,8 @@ export class Game {
           kills: s.self.kills,
           damage: s.self.dmg,
           won,
-          time: (performance.now() - this.matchStartTime) / 1000,
+          time: this.survived(),
+          name: this.nameOf(this.myId),
           killerName: s.self.killer === 255 || won ? null : this.nameOf(s.self.killer),
           winnerName,
           final: true,
@@ -755,6 +811,7 @@ export class Game {
       // a car that sat still starts moving from where it stood one snapshot ago
       k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - (this.welcome?.snapEvery ?? 2) } : k.b;
       k.b = { x: c.x, y: c.y, z: c.z, yaw: c.yaw, t: s.tick };
+      trailPush(k.h, k.b, this.welcome?.snapEvery ?? 2);
       k.driver = c.driver;
       if (c.hp === 0 && k.hp > 0) {
         // it just blew up (unless this is old news from far away)
@@ -765,12 +822,16 @@ export class Game {
       k.hp = c.hp;
       if (c.driver === this.myId) mine = c.id;
       core.setCar(c.id, c.x, c.y, c.z, c.yaw);
+      core.setCarMotion(c.id, c.vx, c.vz, c.spin, c.driver === 255);
     }
     const driving = s.self.alive && s.self.mode === P.MODE_DRIVE;
     this.myCar = driving ? (mine >= 0 ? mine : this.myCar) : -1;
     // my own car follows my prediction: keep the server's copy of it out of
     // the way of the camera and of the rays
-    if (this.myCar >= 0) core.setCar(this.myCar, 0, -1000, 0, 0);
+    if (this.myCar >= 0) {
+      core.setCar(this.myCar, 0, -1000, 0, 0);
+      core.setCarMotion(this.myCar, 0, 0, 0, false);
+    }
   }
 
   /** Helicopter poses from the server: for drawing, and solid in the core where they are now. */
@@ -783,6 +844,7 @@ export class Game {
       if (!k) continue;
       k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - step } : k.b;
       k.b = { x: h.x, y: h.y, z: h.z, yaw: h.yaw, pitch: h.pitch, roll: h.roll, t: s.tick };
+      trailPush(k.h, k.b, step);
       if (h.hp === 0 && k.hp > 0) {
         // it just blew up (unless this is old news from far away); the blast itself comes as an event
         k.deadAt = Math.hypot(h.x - this.camEye[0], h.z - this.camEye[2]) < 320 ? this.time : this.time - 1000;
@@ -818,9 +880,8 @@ export class Game {
   }
 
   private heliPose(k: number): HeliPose {
-    const h = this.helis[k];
-    const span = h.b.t - h.a.t;
-    const f = span > 0 ? clamp((this.renderTick - h.a.t) / span, 0, 1) : 1;
+    const h = trailAt(this.helis[k].h, this.renderTick);
+    const f = h.f;
     const pitch = lerp(h.a.pitch, h.b.pitch, f), roll = lerp(h.a.roll, h.b.roll, f);
     if (k === this.myHeli && this.pred && this.pred.mode === P.MODE_FLY) {
       const p = this.renderPos();
@@ -865,6 +926,7 @@ export class Game {
       if (!k) continue;
       k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - step } : k.b;
       k.b = { x: p.x, y: p.y, z: p.z, t: s.tick };
+      trailPush(k.h, k.b, step);
       if (p.moving && !k.moving) k.axis = norm([Math.random() - 0.5, (Math.random() - 0.5) * 0.4, Math.random() - 0.5]);
       k.moving = p.moving;
       this.d.core.setProp(p.id, p.x, p.y, p.z);
@@ -882,8 +944,8 @@ export class Game {
     const wood = surf(0.82, 0), steel = surf(0.5, 0.55);
     for (const k of this.props) {
       const span = k.b.t - k.a.t;
-      const f = span > 0 ? clamp((this.renderTick - k.a.t) / span, 0, 1) : 1;
-      const x = lerp(k.a.x, k.b.x, f), y = lerp(k.a.y, k.b.y, f), z = lerp(k.a.z, k.b.z, f);
+      const tr = trailAt(k.h, this.renderTick);
+      const x = lerp(tr.a.x, tr.b.x, tr.f), y = lerp(tr.a.y, tr.b.y, tr.f), z = lerp(tr.a.z, tr.b.z, tr.f);
       if ((x - eye[0]) ** 2 + (z - eye[2]) ** 2 > 300 * 300) continue;
       if (k.moving) {
         // tumbling with its speed (crates much more than containers)
@@ -927,9 +989,43 @@ export class Game {
       const a = clamp(this.cmdAcc / DT, 0, 1);
       return { x: p[0], y: p[1], z: p[2], yaw: lerpAngle(this.predPrevYaw, this.pred.airtime, a) + this.smoothYaw };
     }
-    const span = c.b.t - c.a.t;
-    const f = span > 0 ? clamp((this.renderTick - c.a.t) / span, 0, 1) : 1;
-    return { x: lerp(c.a.x, c.b.x, f), y: lerp(c.a.y, c.b.y, f), z: lerp(c.a.z, c.b.z, f), yaw: lerpAngle(c.a.yaw, c.b.yaw, f) };
+    const tr = trailAt(c.h, this.renderTick);
+    const at = { x: lerp(tr.a.x, tr.b.x, tr.f), y: lerp(tr.a.y, tr.b.y, tr.f), z: lerp(tr.a.z, tr.b.z, tr.f), yaw: lerpAngle(tr.a.yaw, tr.b.yaw, tr.f) };
+    const pw = this.carPw[k] ?? 0;
+    if (pw > 0.002 && this.pred && this.pred.mode === P.MODE_DRIVE) {
+      // a car my own (predicted) car shoves along: where my prediction
+      // has it, not where the server had it a moment ago
+      const now = this.d.core.carPoses();
+      const i = k * 4, a = clamp(this.cmdAcc / DT, 0, 1), pv = this.carPrev, sm = this.carSm;
+      at.x = lerp(at.x, lerp(pv[i], now[i], a) + sm[i], pw);
+      at.y = lerp(at.y, lerp(pv[i + 1], now[i + 1], a) + sm[i + 1], pw);
+      at.z = lerp(at.z, lerp(pv[i + 2], now[i + 2], a) + sm[i + 2], pw);
+      at.yaw = lerpAngle(at.yaw, lerpAngle(pv[i + 3], now[i + 3], a) + sm[i + 3], pw);
+    }
+    return at;
+  }
+
+  /**
+   * Which cars are drawn where my prediction has them: the driverless
+   * ones it has moved off the server's last word while I drive (shoved by
+   * my car, or sliding on). The change-over is blended in and out.
+   */
+  private blendPredictedCars(dt: number) {
+    const pw = this.carPw;
+    const driving = !!this.pred && this.pred.mode === P.MODE_DRIVE;
+    const now = driving ? this.d.core.carPoses() : null;
+    const e = Math.exp(-dt * 10), up = Math.min(1, dt * 14), down = Math.min(1, dt * 5);
+    for (let k = 0; k < pw.length; k++) {
+      const c = this.cars[k];
+      let on = false;
+      if (now && k !== this.myCar && c.driver === 255 && c.hp > 0) {
+        const i = k * 4;
+        on = Math.abs(now[i] - c.b.x) + Math.abs(now[i + 2] - c.b.z) > 0.01 || Math.abs(wrapAngle(now[i + 3] - c.b.yaw)) > 0.003;
+      }
+      pw[k] = !driving ? 0 : on ? pw[k] + (1 - pw[k]) * up : pw[k] * (1 - down);
+    }
+    const sm = this.carSm;
+    for (let i = 0; i < sm.length; i++) sm[i] *= e;
   }
 
   /** The free car a player at `me` could get into, or -1. */
@@ -964,6 +1060,11 @@ export class Game {
     if (me.debt >= 4 && !document.hidden && tnow - this.lastFrame < 150 && tnow - this.lastGapEnd > pathRtt + 600) this.stallSeenAt = tnow;
     this.pending = this.pending.filter((p) => p.cmd.seq > s.ack);
     const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND || (me.mode === P.MODE_DRIVE && this.myCar >= 0) || (me.mode === P.MODE_FLY && this.myHeli >= 0));
+    // the cars go back to where the server last said; replaying my commands
+    // at the wheel then moves the ones I shove on from there again
+    const carsWere = me.alive && me.mode === P.MODE_DRIVE ? this.carsWere : null;
+    this.carsWere = null;
+    this.d.core.predReset();
     if (!predictable) {
       this.pred = null;
       return;
@@ -980,6 +1081,21 @@ export class Game {
     let skip = 0;
     while (skip < me.debt && skip < this.pending.length && this.pending[skip].at < late) skip++;
     for (let k = skip; k < this.pending.length; k++) this.step(this.pending[k].cmd, mult, false);
+    if (this.pred.mode === P.MODE_DRIVE) {
+      const now = this.d.core.carPoses(), pv = this.carPrev, sm = this.carSm;
+      for (let i = 0; i + 4 <= pv.length; i += 4) {
+        const dx = carsWere ? carsWere[i] - now[i] : 0, dy = carsWere ? carsWere[i + 1] - now[i + 1] : 0, dz = carsWere ? carsWere[i + 2] - now[i + 2] : 0;
+        const dw = carsWere ? wrapAngle(carsWere[i + 3] - now[i + 3]) : 0;
+        if (carsWere && this.carPw[i >> 2] > 0.002 && Math.hypot(dx, dy, dz) < 3 && Math.abs(dw) < 0.5) {
+          // what the snapshot corrected is hidden and then let go, as for my own car
+          sm[i] += dx; sm[i + 1] += dy; sm[i + 2] += dz; sm[i + 3] += dw;
+          pv[i] -= dx; pv[i + 1] -= dy; pv[i + 2] -= dz; pv[i + 3] -= dw;
+        } else {
+          sm[i] = sm[i + 1] = sm[i + 2] = sm[i + 3] = 0;
+          pv[i] = now[i]; pv[i + 1] = now[i + 1]; pv[i + 2] = now[i + 2]; pv[i + 3] = now[i + 3];
+        }
+      }
+    }
     if (oldYaw !== null) {
       const dy = wrapAngle(oldYaw - this.pred.airtime);
       if (Math.abs(dy) < 0.5) {
@@ -1121,6 +1237,7 @@ export class Game {
     if (this.pred) {
       this.predPrev = [...this.pred.pos];
       this.predPrevYaw = this.pred.airtime;
+      if (this.pred.mode === P.MODE_DRIVE) this.carPrev.set(this.d.core.carPoses().subarray(0, this.carPrev.length));
       this.step(q, this.speedMult(me), true);
     }
   }
@@ -1523,6 +1640,7 @@ export class Game {
     else this.renderTick += dt * 30 + err * Math.min(1, dt * 4);
     this.smooth = scale(this.smooth, Math.exp(-dt * 10));
     this.smoothYaw *= Math.exp(-dt * 10);
+    this.blendPredictedCars(dt);
     this.shake = Math.max(0, this.shake - dt * 2);
   }
 

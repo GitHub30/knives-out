@@ -42,6 +42,12 @@ struct ClientState {
     grass: Vec<u8>,
     trees: Vec<f32>,
     props: Vec<f32>,
+    /// The cars as the server last told: pose (x y z yaw), speed (x z) and
+    /// spin. The world's own copy runs ahead of it while the player drives
+    /// (the prediction shoves cars about) and is put back from this before
+    /// each replay.
+    car_auth: Vec<[f32; 7]>,
+    cars: CarsPred,
 }
 
 #[inline]
@@ -178,6 +184,48 @@ pub extern "C" fn srv_lobby_left() -> f32 {
     server().map_or(0.0, |s| s.lobby_t)
 }
 
+// ---- results for the host's rankings (read-only) ----
+
+/// Final placement of a player: 0 while it is still alive (or unused).
+#[no_mangle]
+pub extern "C" fn srv_place(pid: u32) -> u32 {
+    match server() {
+        Some(s) if (pid as usize) < s.players.len() && s.players[pid as usize].used => s.players[pid as usize].place as u32,
+        _ => 0,
+    }
+}
+
+/// The match winner's player id, 255 while there is none.
+#[no_mangle]
+pub extern "C" fn srv_winner() -> u32 {
+    server().map_or(255, |s| s.winner as u32)
+}
+
+/// Writes the player's in-match name (UTF-8) to the input buffer; returns its length.
+#[no_mangle]
+pub extern "C" fn srv_name(pid: u32) -> u32 {
+    match server() {
+        Some(s) if (pid as usize) < s.players.len() && s.players[pid as usize].used => {
+            let b = s.players[pid as usize].name.as_bytes();
+            let n = b.len().min(IN_CAP);
+            unsafe { std::slice::from_raw_parts_mut(addr_of_mut!(INBUF) as *mut u8, n) }.copy_from_slice(&b[..n]);
+            n as u32
+        }
+        _ => 0,
+    }
+}
+
+/// Sanitises the name in the input buffer in place, by the rules joining a
+/// match uses; returns the new length (0 = nothing usable left).
+#[no_mangle]
+pub extern "C" fn name_clean(len: u32) -> u32 {
+    let clean = names::sanitize_name(&inbuf(len.min(64)).to_vec(), "");
+    let b = clean.as_bytes();
+    let n = b.len().min(IN_CAP);
+    unsafe { std::slice::from_raw_parts_mut(addr_of_mut!(INBUF) as *mut u8, n) }.copy_from_slice(&b[..n]);
+    n as u32
+}
+
 // ----------------------------------------------------------------------------
 // Client
 // ----------------------------------------------------------------------------
@@ -209,8 +257,10 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
         props.extend_from_slice(&[b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z, (b.kind == world::BK_CRATE) as u8 as f32, b.col as f32]);
     }
     let checksum = world.checksum;
+    let car_auth: Vec<[f32; 7]> = world.cars.iter().map(|c| [c[0], c[1], c[2], c[3], 0.0, 0.0, 0.0]).collect();
+    let cars = CarsPred { spin: vec![0.0; world.cars.len()], free: vec![true; world.cars.len()] };
     unsafe {
-        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass, trees, props }));
+        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass, trees, props, car_auth, cars }));
     }
     checksum
 }
@@ -323,8 +373,51 @@ pub extern "C" fn cli_set_car(k: u32, x: f32, y: f32, z: f32, yaw: f32) {
     if let Some(car) = c.world.cars.get_mut(k as usize) {
         if x.is_finite() && y.is_finite() && z.is_finite() && yaw.is_finite() {
             *car = [x, y, z, yaw];
+            if let Some(a) = c.car_auth.get_mut(k as usize) {
+                a[..4].copy_from_slice(&[x, y, z, yaw]);
+            }
         }
     }
+}
+
+/// How car `k` moves now (m/s, and rad/s of turning), and whether nobody
+/// drives it (`free`: such a car slides on by itself in the prediction).
+#[no_mangle]
+pub extern "C" fn cli_set_car_motion(k: u32, vx: f32, vz: f32, spin: f32, free: u32) {
+    let Some(c) = client() else { return };
+    let k = k as usize;
+    if k >= c.car_auth.len() || k >= c.world.car_vel.len() || k >= c.cars.spin.len() || !(vx.is_finite() && vz.is_finite() && spin.is_finite()) {
+        return;
+    }
+    c.car_auth[k][4..].copy_from_slice(&[vx, vz, spin]);
+    c.world.car_vel[k] = [vx, vz];
+    c.cars.spin[k] = spin;
+    c.cars.free[k] = free != 0;
+}
+
+/// Put the cars back where the server last said they were (before the
+/// commands it has not seen yet are replayed on top of its state).
+#[no_mangle]
+pub extern "C" fn cli_pred_reset() {
+    let Some(c) = client() else { return };
+    for (k, a) in c.car_auth.iter().enumerate() {
+        if k < c.world.cars.len() && k < c.world.car_vel.len() && k < c.cars.spin.len() {
+            c.world.cars[k] = [a[0], a[1], a[2], a[3]];
+            c.world.car_vel[k] = [a[4], a[5]];
+            c.cars.spin[k] = a[6];
+        }
+    }
+}
+
+/// The cars where the prediction has them now (f32 x4 each: x y z yaw).
+#[no_mangle]
+pub extern "C" fn cli_cars_ptr() -> *const f32 {
+    client().map_or(std::ptr::null(), |c| c.world.cars.as_ptr() as *const f32)
+}
+
+#[no_mangle]
+pub extern "C" fn cli_cars_len() -> u32 {
+    client().map_or(0, |c| c.world.cars.len() as u32)
 }
 
 /// Where helicopter `k` is now (they fly: the server sends their poses).
@@ -359,6 +452,8 @@ pub extern "C" fn cli_pred_ptr() -> *mut f32 {
 ///  12 mx_q, 13 mz_q, 14 yaw_q, 15 pitch_q, 16 buttons, 17 out events, 18 car index
 /// While driving (mode 5) pos/vel are the car's and airtime is its heading;
 /// while flying (mode 6) they are the helicopter's, and 18 is its index.
+/// A step at the wheel also moves the cars it shoves and the driverless
+/// ones that slide, the way the server will (see `cli_pred_reset`).
 #[no_mangle]
 pub extern "C" fn cli_pred_step() {
     let Some(c) = client() else { return };
@@ -378,7 +473,14 @@ pub extern "C" fn cli_pred_step() {
     }
     let cmd = Cmd::from_quant(0, 0, p[12] as i32 as i8, p[13] as i32 as i8, p[14] as u32 as u16, p[15] as i32 as i16, p[16] as u32 as u16);
     let mult = if p[11].is_finite() { p[11].clamp(0.3, 1.5) } else { 1.0 };
-    let ev = step_move(&c.world, &mut s, &cmd, mult, DT);
+    let driving = s.mode == MODE_DRIVE && (s.car as usize) < c.world.cars.len();
+    let mut hits = DriveHits::default();
+    let ev = step_move_hits(&c.world, &mut s, &cmd, mult, DT, &mut hits);
+    if driving {
+        let kind = c.world.car_kind[s.car as usize];
+        predict_shoves(&mut c.world, &mut c.cars, kind, &hits);
+        predict_slides(&mut c.world, &mut c.cars, s.car as usize, DT);
+    }
     p[0] = s.pos.x;
     p[1] = s.pos.y;
     p[2] = s.pos.z;

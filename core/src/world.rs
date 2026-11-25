@@ -180,6 +180,10 @@ pub struct World {
     pub cars: Vec<[f32; 4]>,
     /// Vehicle kind of each car (never changes during a match).
     pub car_kind: Vec<u8>,
+    /// Velocity (x, z) of each car as the server knows it, for collisions
+    /// between vehicles. All zero in a client's copy of the world, which
+    /// only hears of the poses.
+    pub car_vel: Vec<[f32; 2]>,
     /// Helicopters: x, y (the model origin: on the ground when parked), z,
     /// heading. Where they are now (they fly); generated parked.
     pub helis: Vec<[f32; 4]>,
@@ -250,6 +254,7 @@ impl World {
             roofs: Vec::new(),
             cars: Vec::new(),
             car_kind: Vec::new(),
+            car_vel: Vec::new(),
             helis: Vec::new(),
             checksum: 0,
         };
@@ -471,6 +476,7 @@ impl World {
                 let _ = lo;
                 w.cars.push([x, y, z, yaw]);
                 w.car_kind.push(kind);
+                w.car_vel.push([0.0; 2]);
                 placed += 1;
             }
             // military perimeter wall

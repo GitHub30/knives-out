@@ -327,6 +327,122 @@ kbd {
   font-size: 12px;
   color: var(--muted);
 }
+/* end card: rankings (best survival time / wins) */
+.card.result-card {
+  width: min(600px, 100%);
+}
+.rank {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.rank-label,
+.rank-status {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.rank-status {
+  padding: 10px 0;
+}
+.rank-lists {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+  text-align: left;
+}
+.rank-lists[hidden],
+.rank-status[hidden] {
+  display: none;
+}
+.rank-col {
+  min-width: 0;
+}
+.rank-col h3 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  text-align: center;
+}
+.rank-col ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.rank-col li {
+  display: flex;
+  gap: 6px;
+  padding: 0 6px;
+  border-radius: 5px;
+}
+.rank-col li.me {
+  background: rgba(255, 183, 3, 0.2);
+  color: var(--accent);
+  font-weight: 700;
+}
+.rank-col li.rank-empty {
+  justify-content: center;
+  color: var(--muted);
+}
+.rank-no {
+  flex: 0 0 1.4em;
+  text-align: right;
+  color: var(--muted);
+}
+.rank-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rank-val {
+  flex: 0 0 auto;
+}
+/* low screens (a phone in landscape): figures and buttons left, rankings right */
+@media (max-height: 560px) and (min-width: 460px) {
+  .card.result-card {
+    width: min(820px, 100%);
+    padding: 14px 18px;
+    display: grid;
+    grid-template-columns: minmax(170px, 5fr) 8fr;
+    column-gap: 18px;
+    align-content: center;
+  }
+  .result-card > * {
+    grid-column: 1;
+  }
+  .result-card > .rank {
+    grid-column: 2;
+    grid-row: 1 / span 4;
+    align-self: center;
+    margin-top: 0;
+    padding-top: 0;
+    padding-left: 16px;
+    border-top: 0;
+    border-left: 1px solid var(--line);
+  }
+  .result-card h2 {
+    font-size: 30px;
+    margin-bottom: 2px;
+  }
+  .result-card .muted {
+    margin: 0;
+    font-size: 13px;
+  }
+  .result-card .stats {
+    margin: 8px 0 2px;
+  }
+  .result-card .stats b {
+    font-size: 20px;
+  }
+  .result-card .col {
+    gap: 6px;
+    margin-top: 8px;
+  }
+}
 #rotate {
   display: none;
 }

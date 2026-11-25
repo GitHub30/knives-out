@@ -40,6 +40,10 @@ interface CoreExports {
   cli_set_car(k: number, x: number, y: number, z: number, yaw: number): void;
   cli_set_heli(k: number, x: number, y: number, z: number, yaw: number): void;
   cli_set_prop(k: number, x: number, y: number, z: number): void;
+  cli_set_car_motion(k: number, vx: number, vz: number, spin: number, free: number): void;
+  cli_pred_reset(): void;
+  cli_cars_ptr(): number;
+  cli_cars_len(): number;
   cli_pred_ptr(): number;
   cli_pred_step(): void;
 }
@@ -163,5 +167,17 @@ export class Core {
   }
   predStep() {
     this.ex.cli_pred_step();
+  }
+  /** How car `k` moves now, and whether nobody drives it (it then slides on by itself in the prediction). */
+  setCarMotion(k: number, vx: number, vz: number, spin: number, free: boolean) {
+    this.ex.cli_set_car_motion(k, vx, vz, spin, free ? 1 : 0);
+  }
+  /** Put the cars back where the server last said, before a replay. */
+  predReset() {
+    this.ex.cli_pred_reset();
+  }
+  /** The cars where the prediction has them now (x y z yaw each); a view that is only good until the next call into the core. */
+  carPoses(): Float32Array {
+    return new Float32Array(this.ex.memory.buffer, this.ex.cli_cars_ptr(), this.ex.cli_cars_len() * 4);
   }
 }

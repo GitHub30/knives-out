@@ -14,7 +14,7 @@ pub struct Brain {
     pub jump_t: f32,
     pub land: (f32, f32),
     pub goal: (f32, f32),
-    pub goal_kind: u8, // 0 none, 1 item, 2 roam, 3 zone
+    pub goal_kind: u8, // 0 none, 1 item, 2 roam, 3 zone, 4 car
     pub goal_item: u16,
     pub goal_t: f32,
     pub path: [(f32, f32); 5],
@@ -57,11 +57,50 @@ pub struct Brain {
     pub prog_t: f32,
     /// Time since landing: fresh bots loot first and only take close fights.
     pub ground_t: f32,
+    /// The seed it was made from (the drivers are chosen by it).
+    pub seed: u32,
+    /// One of the few bots that take a car when they find one.
+    pub driver: bool,
+    /// DRV_*: on foot, walking to `drv_car`, at the wheel.
+    pub drv_state: u8,
+    pub drv_car: u8,
+    /// Cars it gave up on.
+    pub drv_skip: [u8; 2],
+    /// Time until it looks for a car again.
+    pub drv_cd: f32,
+    pub drv_walk_t: f32,
+    /// This trip: its length so far, where to, and the point steered for.
+    pub drv_t: f32,
+    pub drv_dest: (f32, f32),
+    pub drv_aim: (f32, f32),
+    /// Heading and speed chosen at the last look ahead, and the side it is
+    /// passing an obstacle on.
+    pub drv_yaw: f32,
+    pub drv_vt: f32,
+    pub drv_side: f32,
+    /// Backing out of a jam: time left and steering.
+    pub drv_rev_t: f32,
+    pub drv_rev_dir: f32,
+    /// After backing out it keeps to that side for a moment.
+    pub drv_detour_t: f32,
+    /// Jams on this stretch, and where the stretch began.
+    pub drv_stuck: u8,
+    pub drv_anchor: (f32, f32),
+    /// Closest it has been to the destination, and time since that improved.
+    pub drv_best: f32,
+    pub drv_best_t: f32,
+    pub drv_wet_t: f32,
+    /// Braking to get out.
+    pub drv_leave: bool,
+    /// Running from the burning car it left.
+    pub drv_flee_t: f32,
+    /// Seconds spent at the wheel in all.
+    pub drove_t: f32,
 }
 
 impl Brain {
     pub fn new(seed: u32, skill: f32) -> Brain {
-        Brain { rng: Rng::new(seed as u64 | 1), skill, target: 255, slot: 2, ignore: [u16::MAX; 8], ..Default::default() }
+        Brain { rng: Rng::new(seed as u64 | 1), skill, target: 255, slot: 2, ignore: [u16::MAX; 8], seed, drv_car: 255, drv_skip: [255; 2], ..Default::default() }
     }
 }
 
@@ -167,6 +206,15 @@ fn logic(m: &Match, i: usize, b: &mut Brain) -> Cmd {
         }
         MODE_GROUND => {
             ground(m, i, b, &mut c);
+            c
+        }
+        MODE_DRIVE => {
+            drive(m, i, b, &mut c);
+            c
+        }
+        MODE_FLY => {
+            // (bots do not fly: out again)
+            c.buttons |= B_USE;
             c
         }
         _ => c,
@@ -582,6 +630,10 @@ fn ground(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
         }
     }
 
+    if b.driver && driver_foot(m, i, b, c) {
+        return;
+    }
+
     // ---- goals
     b.goal_t += DT;
     // an item that stays out of reach (no progress for 6 s, or 30 s in all)
@@ -828,4 +880,523 @@ pub fn nade_pitch(dist: f32) -> f32 {
         }
     }
     t[t.len() - 1].1
+}
+
+// ----------------------------------------------------------------------
+// Drivers: the few bots that take a car when they find one
+// ----------------------------------------------------------------------
+
+/// Share of the bots that are drivers: 4 of the 29 bots of a full match.
+/// (Some are killed before they reach a car, so about one bot in ten is
+/// seen at a wheel in a match.)
+pub const DRIVER_SHARE: f32 = 0.14;
+/// How far a driver walks for a car, inside the safe zone and out of it.
+pub const DRIVER_SEEK_R: f32 = 110.0;
+pub const DRIVER_SEEK_R_OUT: f32 = 60.0;
+/// A fresh driver loots this long before it looks for a car unarmed.
+pub const DRIVER_LOOT_T: f32 = 20.0;
+/// It gives up walking to a car after this long.
+pub const DRIVER_WALK_MAX: f32 = 25.0;
+/// Bots drive well below what the cars can do (24 m/s).
+pub const DRIVER_CRUISE: f32 = 13.0;
+/// It leaves a car with less bodywork than this share (it burns at 0.19).
+pub const DRIVER_BAIL_HP: f32 = 0.4;
+/// An armed driver gets out to fight an enemy on foot this close.
+pub const DRIVER_FIGHT_R: f32 = 28.0;
+/// Close enough to the destination to park.
+pub const DRIVER_ARRIVE_R: f32 = 18.0;
+/// Times it backs out of a jam on one stretch before it walks instead.
+pub const DRIVER_STUCK_MAX: u8 = 3;
+/// A stretch is 15 m; a trip that gets no nearer for this long is over.
+pub const DRIVER_STRETCH: f32 = 15.0;
+pub const DRIVER_NOPROG_T: f32 = 20.0;
+pub const DRIVER_TRIP_MAX: f32 = 80.0;
+/// Seconds between two looks ahead, in ticks.
+pub const DRIVER_LOOK_TICKS: u32 = 4;
+
+pub const DRV_NONE: u8 = 0;
+pub const DRV_WALK: u8 = 1;
+pub const DRV_DRIVE: u8 = 2;
+
+/// How many of `n` bots drive.
+pub fn driver_count(n: usize) -> usize {
+    (n as f32 * DRIVER_SHARE).round() as usize
+}
+
+/// Mark the drivers among the bots: those whose brain seeds (drawn from the
+/// match RNG) hash lowest. Nothing is drawn here, so the match is otherwise
+/// the one it would have been.
+pub fn pick_drivers(players: &mut [Player]) {
+    let mut keys: Vec<(u64, usize)> = Vec::new();
+    for (i, p) in players.iter_mut().enumerate() {
+        if p.used && p.bot {
+            p.brain.driver = false;
+            keys.push((Rng::new(p.brain.seed as u64 ^ 0xD21E_0000_0000).next(), i));
+        }
+    }
+    keys.sort_unstable();
+    for &(_, i) in keys.iter().take(driver_count(keys.len())) {
+        players[i].brain.driver = true;
+    }
+}
+
+fn car_usable(m: &Match, k: usize) -> bool {
+    k < m.w.cars.len() && m.car_driver[k] == 255 && m.car_fire[k] == 0 && m.car_hp[k] > m.car_max_hp(k) * DRIVER_BAIL_HP
+}
+
+/// The nearest car worth walking to.
+fn find_car(m: &Match, i: usize, b: &Brain) -> Option<usize> {
+    let pos = m.players[i].ms.pos;
+    let z = &m.zone;
+    let inside = dist_xz(pos.x, pos.z, z.cx, z.cz) < z.r;
+    let radius = if inside { DRIVER_SEEK_R } else { DRIVER_SEEK_R_OUT };
+    let mut best: Option<(usize, f32)> = None;
+    for (k, c) in m.w.cars.iter().enumerate() {
+        let d = dist_xz(c[0], c[2], pos.x, pos.z);
+        if d > radius || best.map_or(false, |b| d >= b.1) || (c[1] - pos.y).abs() > 6.0 || c[1] < WATER + 0.3 {
+            continue;
+        }
+        if !car_usable(m, k) || b.drv_skip.contains(&(k as u8)) {
+            continue;
+        }
+        if inside && dist_xz(c[0], c[2], z.cx, z.cz) > z.r {
+            continue;
+        }
+        best = Some((k, d));
+    }
+    best.map(|b| b.0)
+}
+
+/// What the player's own "get in" needs: within reach of the body, on its
+/// level and not through a wall (so the press cannot fall through to
+/// anything else).
+fn car_in_reach(m: &Match, k: usize, pos: V3) -> bool {
+    let c = m.w.cars[k];
+    let mut q = pos;
+    (pos.y - c[1]).abs() <= 1.5
+        && m.w.push_car(k, &mut q, 1.4)
+        && !m.w.blocked_static(pos + V3::new(0.0, 1.0, 0.0), V3::new(c[0], c[1] + 1.0, c[2]))
+}
+
+/// A driver on foot: away from a burning car, to a car, into it. True when
+/// it has taken over the bot's legs for this tick.
+fn driver_foot(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) -> bool {
+    let p = &m.players[i];
+    let pos = p.ms.pos;
+    if b.drv_state == DRV_DRIVE {
+        // just out of the car
+        b.drv_state = DRV_NONE;
+        b.drv_leave = false;
+        b.goal_kind = 0;
+        b.path_n = 0;
+        b.path_i = 0;
+        b.think_t = 0.0;
+        b.stuck_n = 0;
+        b.drv_cd = b.drv_cd.max(4.0);
+    }
+    b.drv_cd -= DT;
+    if b.drv_flee_t > 0.0 {
+        b.drv_flee_t -= DT;
+        let k = b.drv_car as usize;
+        if k < m.w.cars.len() && m.car_hp[k] > 0.0 && m.car_fire[k] != 0 {
+            let car = m.w.cars[k];
+            if dist_xz(car[0], car[2], pos.x, pos.z) < 18.0 {
+                let mut want = yaw_to(pos.x - car[0], pos.z - car[2]);
+                if b.avoid_t > 0.0 {
+                    want += b.avoid;
+                } else if (m.tick + i as u32) % 4 == 0 {
+                    let o = pos + V3::new(0.0, 0.7, 0.0);
+                    if m.w.raycast_static(o, fwd(want), 1.6).map_or(false, |h| h.2 != HIT_TERRAIN) {
+                        b.avoid = if b.rng.chance(0.5) { 1.1 } else { -1.1 };
+                        b.avoid_t = 0.7;
+                        want += b.avoid;
+                    }
+                }
+                b.yaw = turn_toward(b.yaw, want, 9.0 * DT);
+                c.yaw = b.yaw;
+                c.mz = 1.0;
+                c.buttons |= B_SPRINT;
+                stuck_logic(m, i, b, c);
+                return true;
+            }
+        } else {
+            b.drv_flee_t = 0.0;
+        }
+    }
+    if b.drv_state == DRV_WALK {
+        let k = b.drv_car as usize;
+        let ok = car_usable(m, k);
+        b.drv_walk_t += DT;
+        if !ok || b.drv_walk_t > DRIVER_WALK_MAX || p.ms.in_water {
+            if ok {
+                b.drv_skip = [b.drv_skip[1], k as u8];
+            }
+            b.drv_state = DRV_NONE;
+            b.drv_cd = 3.0;
+            b.goal_kind = 0;
+            b.path_i = b.path_n;
+            b.think_t = 0.0;
+            return false;
+        }
+        let car = m.w.cars[k];
+        let d = dist_xz(car[0], car[2], pos.x, pos.z);
+        if d < 8.0 && p.ms.on_ground && car_in_reach(m, k, pos) {
+            c.buttons |= B_USE;
+            return true;
+        }
+        let near = d < 7.0 && !m.w.blocked_static(pos + V3::new(0.0, 1.0, 0.0), V3::new(car[0], car[1] + 1.0, car[2]));
+        if near {
+            // the last steps straight at it (it is what the feelers would dodge)
+            b.yaw = turn_toward(b.yaw, yaw_to(car[0] - pos.x, car[2] - pos.z), 8.0 * DT);
+            c.yaw = b.yaw;
+            c.mz = 1.0;
+        } else {
+            if dist_xz(b.goal.0, b.goal.1, car[0], car[2]) > 2.0 || b.path_i >= b.path_n {
+                plan_path(m, b, pos, (car[0], car[2]), 4);
+            }
+            follow(m, i, b, c, None);
+        }
+        b.pitch = approach(b.pitch, -0.05, DT);
+        c.pitch = b.pitch;
+        stuck_logic(m, i, b, c);
+        return true;
+    }
+    let armed = slot_usable(p, 0) || slot_usable(p, 1);
+    let calm = b.target == 255 && b.heard_t <= 0.0 && p.hurt_t <= 0.0;
+    if b.drv_cd <= 0.0 && calm && p.ms.on_ground && !p.ms.in_water && (armed || b.ground_t > DRIVER_LOOT_T) {
+        b.drv_cd = 3.0;
+        // (not from a roof or an upper floor)
+        if pos.y - m.w.height(pos.x, pos.z) < 1.5 {
+            if let Some(k) = find_car(m, i, b) {
+                let car = m.w.cars[k];
+                b.drv_state = DRV_WALK;
+                b.drv_car = k as u8;
+                b.drv_walk_t = 0.0;
+                plan_path(m, b, pos, (car[0], car[2]), 4);
+            }
+        }
+    }
+    false
+}
+
+fn zone_urgent(m: &Match, b: &Brain, pos: V3) -> bool {
+    let z = &m.zone;
+    let in_cur = dist_xz(pos.x, pos.z, z.cx, z.cz) < z.r - 4.0;
+    let in_next = dist_xz(pos.x, pos.z, z.nx, z.nz) < z.nr - 4.0;
+    !in_cur || (!in_next && (z.shrinking || z.timer < 35.0 + 20.0 * b.skill))
+}
+
+/// Where to drive: into the next circle when the zone presses, otherwise to
+/// a town down the road that lies inside it.
+fn drive_dest(m: &Match, b: &mut Brain, pos: V3) -> (f32, f32) {
+    let z = &m.zone;
+    if !zone_urgent(m, b, pos) {
+        let n = m.w.towns.len();
+        let s = b.rng.below(n as u32) as usize;
+        for j in 0..n {
+            let t = &m.w.towns[(s + j) % n];
+            let d = dist_xz(t.x, t.z, pos.x, pos.z);
+            if d > 90.0 && d < 650.0 && dist_xz(t.x, t.z, z.nx, z.nz) < z.nr * 0.85 {
+                // park at its near edge
+                let e = t.r * 0.7 / d;
+                return (t.x + (pos.x - t.x) * e, t.z + (pos.z - t.z) * e);
+            }
+        }
+    }
+    for _ in 0..8 {
+        let a = b.rng.range(0.0, TAU);
+        let rr = b.rng.f().sqrt() * z.nr * 0.5;
+        let x = clampf(z.nx + a.cos() * rr, 20.0, MAP - 20.0);
+        let zz = clampf(z.nz + a.sin() * rr, 20.0, MAP - 20.0);
+        if m.w.height(x, zz) > 1.0 && m.w.building_at(x, zz).is_none() {
+            return (x, zz);
+        }
+    }
+    (z.nx, z.nz)
+}
+
+/// The point to steer for: along a road when one nearby leads towards the
+/// destination, else the destination itself.
+fn drive_aim(m: &Match, pos: V3, dest: (f32, f32)) -> (f32, f32) {
+    let dd = dist_xz(pos.x, pos.z, dest.0, dest.1);
+    let mut best = (45.0f32, dest);
+    for &(ax, az, bx, bz) in &m.w.roads {
+        let (dx, dz) = (bx - ax, bz - az);
+        let l = (dx * dx + dz * dz).sqrt();
+        if l < 1.0 {
+            continue;
+        }
+        let t = clampf(((pos.x - ax) * dx + (pos.z - az) * dz) / l, 0.0, l);
+        let off = dist_xz(pos.x, pos.z, ax + dx / l * t, az + dz / l * t);
+        if off >= best.0 {
+            continue;
+        }
+        // towards whichever end is nearer the destination, if that helps
+        let (da, db) = (dist_xz(ax, az, dest.0, dest.1), dist_xz(bx, bz, dest.0, dest.1));
+        let (end, t2) = if da < db { (da, (t - 20.0).max(0.0)) } else { (db, (t + 20.0).min(l)) };
+        if end < dd * 0.85 && (t2 - t).abs() > 6.0 {
+            best = (off, (ax + dx / l * t2, az + dz / l * t2));
+        }
+    }
+    best.1
+}
+
+/// How far the car can go along heading `a` before something is in the
+/// way, up to `l`: water, banks and the map edge from the ground itself,
+/// everything else from two rays off the corners of its nose.
+fn drive_clear(m: &Match, k: usize, pos: V3, yaw: f32, a: f32, l: f32) -> f32 {
+    let (hw, hl, _) = m.w.car_dims(k);
+    // (as wide as the circles it collides with, and a hand more)
+    let hw = hw.max(car_shape(m.w.car_kind[k]).1) + 0.25;
+    let (f, r, d) = (fwd(yaw), right(yaw), fwd(a));
+    let mut clear = l;
+    let mut h0 = m.w.height(pos.x + f.x * hl, pos.z + f.z * hl);
+    const N: usize = 4;
+    let step = l / N as f32;
+    for s in 1..=N {
+        let t = hl + step * s as f32;
+        let (x, z) = (pos.x + d.x * t, pos.z + d.z * t);
+        let h = m.w.height(x, z);
+        if x < 8.0 || z < 8.0 || x > MAP - 8.0 || z > MAP - 8.0 || h < WATER + 0.15 || h - h0 > 0.4 * step {
+            clear = step * (s - 1) as f32;
+            break;
+        }
+        h0 = h;
+    }
+    if clear < 0.5 {
+        return 0.0;
+    }
+    // The rays at the world start a little way back along the body (a nose
+    // already against a thin wall would start beyond it); those at the
+    // other vehicles start ahead of its own.
+    const BACK: f32 = 1.6;
+    for side in [-1.0f32, 1.0] {
+        for (lead, vehicles) in [(hl + 0.25 - BACK, false), (hl + 0.25, true)] {
+            let (ox, oz) = (pos.x + f.x * lead + r.x * side * hw, pos.z + f.z * lead + r.z * side * hw);
+            let o = V3::new(ox, m.w.height(ox, oz) + 0.6, oz);
+            let reach = clear + if vehicles { 0.0 } else { BACK };
+            let (ex, ez) = (ox + d.x * reach, oz + d.z * reach);
+            let dv = V3::new(ex - ox, m.w.height(ex, ez) + 0.6 - o.y, ez - oz);
+            let len = dv.len();
+            if len < 0.5 {
+                continue;
+            }
+            let dn = dv * (1.0 / len);
+            if vehicles {
+                let mut t = m.w.ray_cars(o, dn, len).map_or(len, |h| h.0);
+                t = m.w.ray_helis(o, dn, t, usize::MAX).map_or(t, |h| h.0);
+                clear = clear.min(t);
+            } else if let Some((t, _, kind)) = m.w.raycast_static(o, dn, len) {
+                if kind != HIT_TERRAIN {
+                    clear = clear.min((t - BACK).max(0.0));
+                }
+            }
+        }
+    }
+    clear
+}
+
+/// Look ahead and choose a heading and a speed (kept until the next look).
+fn drive_look(m: &Match, k: usize, pos: V3, yaw: f32, v: f32, b: &mut Brain) {
+    let mut want = yaw_to(b.drv_aim.0 - pos.x, b.drv_aim.1 - pos.z);
+    if b.drv_detour_t > 0.0 {
+        want += b.drv_rev_dir * 0.7;
+    }
+    let l = clampf(7.0 + v.abs() * 1.5, 10.0, 28.0);
+    let rel = clampf(wrap_angle(want - yaw), -1.25, 1.25);
+    let ahead = drive_clear(m, k, pos, yaw, yaw, l);
+    let direct = if rel.abs() < 0.06 { ahead } else { drive_clear(m, k, pos, yaw, yaw + rel, l) };
+    let mut pick = rel;
+    if direct < l - 0.01 {
+        // something in the way: the clearest heading that is not far off
+        let mut best = direct - if rel * b.drv_side < 0.0 { l * 0.15 } else { 0.0 };
+        for off in [0.0f32, 0.4, -0.4, 0.8, -0.8, 1.25, -1.25] {
+            let cl = if off == 0.0 { ahead } else { drive_clear(m, k, pos, yaw, yaw + off, l) };
+            let mut score = cl - (off - rel).abs() * l * 0.3;
+            // (keep going round the same side)
+            if (off - rel) * b.drv_side > 0.0 {
+                score += l * 0.15;
+            }
+            if score > best {
+                best = score;
+                pick = off;
+            }
+        }
+        if (pick - rel).abs() > 0.05 {
+            b.drv_side = (pick - rel).signum();
+        }
+    } else {
+        b.drv_side = 0.0;
+    }
+    b.drv_yaw = wrap_angle(yaw + pick);
+    // slow enough to stop short of what is straight ahead, and for the bend
+    let room = (ahead - 2.5).max(0.0);
+    let mut vt = DRIVER_CRUISE.min((2.0 * 8.0 * room).sqrt());
+    vt = vt.min(DRIVER_CRUISE * (1.0 - 0.55 * pick.abs().min(1.0)));
+    let dd = dist_xz(pos.x, pos.z, b.drv_dest.0, b.drv_dest.1);
+    vt = vt.min(4.0 + dd * 0.25);
+    b.drv_vt = vt.max(2.5);
+}
+
+/// An enemy on foot close enough that an armed driver gets out to fight.
+fn driver_threat(m: &Match, i: usize, pos: V3) -> Option<(f32, f32)> {
+    let eye = pos + V3::new(0.0, 1.3, 0.0);
+    for j in 0..MAX_PLAYERS {
+        let q = &m.players[j];
+        if j == i || !q.used || !q.alive || q.ms.mode != MODE_GROUND {
+            continue;
+        }
+        if dist_xz(q.ms.pos.x, q.ms.pos.z, pos.x, pos.z) < DRIVER_FIGHT_R && !m.w.blocked_static(eye, q.ms.pos + V3::new(0.0, 1.0, 0.0)) {
+            return Some((q.ms.pos.x, q.ms.pos.z));
+        }
+    }
+    None
+}
+
+/// At the wheel: the same throttle, steering, brake and "get out" a player has.
+fn drive(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
+    let p = &m.players[i];
+    let k = p.ms.car as usize;
+    let pos = p.ms.pos;
+    let yaw = p.ms.airtime;
+    let v = car_speed(&p.ms);
+    c.pitch = 0.0;
+    b.pitch = 0.0;
+    if k >= m.w.cars.len() {
+        c.buttons |= B_USE;
+        return;
+    }
+    if b.drv_state != DRV_DRIVE {
+        b.drv_state = DRV_DRIVE;
+        b.drv_car = k as u8;
+        b.drv_t = 0.0;
+        b.drv_leave = false;
+        b.drv_dest = drive_dest(m, b, pos);
+        b.drv_aim = b.drv_dest;
+        b.drv_yaw = yaw;
+        b.drv_vt = 0.0;
+        b.drv_side = 0.0;
+        b.drv_rev_t = 0.0;
+        b.drv_detour_t = 0.0;
+        b.drv_stuck = 0;
+        b.drv_anchor = (pos.x, pos.z);
+        b.drv_best = f32::MAX;
+        b.drv_best_t = 0.0;
+        b.drv_wet_t = 0.0;
+        b.check_t = 1.5;
+        b.last_pos = (pos.x, pos.z);
+        b.yaw = yaw;
+    }
+    b.drv_t += DT;
+    b.drove_t += DT;
+    b.drv_best_t += DT;
+    c.yaw = b.yaw;
+    let phase = m.tick.wrapping_add(i as u32 * 7);
+
+    // ---- reasons to get out
+    if !b.drv_leave {
+        let dd = dist_xz(pos.x, pos.z, b.drv_dest.0, b.drv_dest.1);
+        if dd < b.drv_best - 10.0 {
+            b.drv_best = dd;
+            b.drv_best_t = 0.0;
+        }
+        if dist_xz(pos.x, pos.z, b.drv_anchor.0, b.drv_anchor.1) > DRIVER_STRETCH {
+            b.drv_anchor = (pos.x, pos.z);
+            b.drv_stuck = 0;
+        }
+        b.drv_wet_t = if m.w.height(pos.x, pos.z) < WATER - 0.45 { b.drv_wet_t + DT } else { 0.0 };
+        if m.car_fire[k] != 0 || m.car_hp[k] < m.car_max_hp(k) * DRIVER_BAIL_HP {
+            // burning or about to: out, and away from it
+            b.drv_leave = true;
+            b.drv_flee_t = 8.0;
+            b.drv_skip = [b.drv_skip[1], k as u8];
+            b.drv_cd = 12.0;
+        } else if b.drv_stuck >= DRIVER_STUCK_MAX || b.drv_wet_t > 4.0 {
+            b.drv_leave = true;
+            b.drv_skip = [b.drv_skip[1], k as u8];
+            b.drv_cd = 8.0;
+        } else if dd < DRIVER_ARRIVE_R || b.drv_t > DRIVER_TRIP_MAX || b.drv_best_t > DRIVER_NOPROG_T {
+            b.drv_leave = true;
+            b.drv_cd = b.rng.range(25.0, 50.0);
+        } else if phase % 10 == 0 && b.drv_t > 2.0 && (slot_usable(p, 0) || slot_usable(p, 1)) && dist_xz(pos.x, pos.z, m.zone.cx, m.zone.cz) < m.zone.r - 3.0 {
+            if let Some((ex, ez)) = driver_threat(m, i, pos) {
+                b.drv_leave = true;
+                b.drv_cd = 20.0;
+                b.yaw = yaw_to(ex - pos.x, ez - pos.z);
+                b.heard = (ex, ez);
+                b.heard_t = 3.0;
+            }
+        }
+    }
+    if b.drv_leave {
+        c.buttons |= B_JUMP;
+        if v.abs() < 8.5 {
+            c.buttons |= B_USE;
+        }
+        return;
+    }
+    b.yaw = yaw;
+    c.yaw = yaw;
+
+    // ---- backing out of a jam
+    if b.drv_rev_t > 0.0 {
+        b.drv_rev_t -= DT;
+        c.mz = -1.0;
+        c.mx = b.drv_rev_dir;
+        if b.drv_rev_t <= 0.0 {
+            b.drv_detour_t = 2.5;
+            b.check_t = 1.5;
+            b.last_pos = (pos.x, pos.z);
+            b.drv_vt = 3.0;
+        }
+        return;
+    }
+
+    b.drv_detour_t -= DT;
+
+    // ---- where to
+    if phase % 60 == 0 {
+        let z = &m.zone;
+        if dist_xz(b.drv_dest.0, b.drv_dest.1, z.nx, z.nz) > z.nr * 0.9 && zone_urgent(m, b, pos) {
+            b.drv_dest = drive_dest(m, b, pos);
+            b.drv_best = f32::MAX;
+            b.drv_best_t = 0.0;
+        }
+    }
+    if phase % 8 == 0 {
+        b.drv_aim = drive_aim(m, pos, b.drv_dest);
+    }
+    if phase % DRIVER_LOOK_TICKS == 0 || b.drv_vt <= 0.0 {
+        drive_look(m, k, pos, yaw, v, b);
+    }
+
+    // ---- wheel and pedals
+    let err = wrap_angle(b.drv_yaw - yaw);
+    c.mx = clampf(-err * 2.5, -1.0, 1.0) * if v < -0.3 { -1.0 } else { 1.0 };
+    if v > b.drv_vt + 2.5 {
+        c.buttons |= B_JUMP;
+    } else if v < b.drv_vt {
+        c.mz = 1.0;
+    }
+
+    // ---- stuck: back out, nose swinging to the clearer side
+    b.check_t -= DT;
+    if b.check_t <= 0.0 {
+        b.check_t = 1.0;
+        if dist_xz(pos.x, pos.z, b.last_pos.0, b.last_pos.1) < 0.8 {
+            b.drv_stuck += 1;
+            b.drv_rev_t = 1.5;
+            let (cl, cr) = (drive_clear(m, k, pos, yaw, yaw + 0.8, 10.0), drive_clear(m, k, pos, yaw, yaw - 0.8, 10.0));
+            b.drv_rev_dir = if (cl - cr).abs() > 1.0 {
+                if cl > cr { 1.0 } else { -1.0 }
+            } else if err.abs() > 0.3 {
+                err.signum()
+            } else if b.rng.chance(0.5) {
+                1.0
+            } else {
+                -1.0
+            };
+        }
+        b.last_pos = (pos.x, pos.z);
+    }
 }

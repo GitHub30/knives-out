@@ -16,9 +16,18 @@ class_name = "Room"
 name = "LOBBY"
 class_name = "Lobby"
 
+# rankings: one global instance (best survival time and wins per name)
+[[durable_objects.bindings]]
+name = "RANKING"
+class_name = "Ranking"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room", "Lobby"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Ranking"]
 
 [[ratelimits]]
 name = "JOIN_LIMIT"
@@ -42,6 +51,29 @@ simple = { limit = 3, period = 60 }
 name = "REFUSE_LIMIT48"
 namespace_id = "7304"
 simple = { limit = 12, period = 60 }
+
+# self-reported solo results (POST /api/rank/solo) per network
+[[ratelimits]]
+name = "RANK_POST_LIMIT"
+namespace_id = "7305"
+simple = { limit = 6, period = 60 }
+
+# ranking reads (GET /api/rank) per network
+[[ratelimits]]
+name = "RANK_READ_LIMIT"
+namespace_id = "7306"
+simple = { limit = 60, period = 60 }
+
+# ... and both per IPv6 /48 (four /64s' worth)
+[[ratelimits]]
+name = "RANK_POST_LIMIT48"
+namespace_id = "7307"
+simple = { limit = 24, period = 60 }
+
+[[ratelimits]]
+name = "RANK_READ_LIMIT48"
+namespace_id = "7308"
+simple = { limit = 240, period = 60 }
 
 [vars]
 ALLOWED_ORIGINS = "https://github30.github.io,http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
