@@ -1,70 +1,39 @@
-// WGSL shaders. All lighting is done in linear space with a filmic tonemap.
+// WGSL shaders. The scene is lit in linear HDR (Cook-Torrance sun light, sky
+// ambient, two shadow cascades, height fog) into a float target; a post pass
+// adds bloom, tonemaps (ACES), anti-aliases (FXAA) and grades.
 
 const FRAME = /* wgsl */ `
 struct Frame {
   viewProj: mat4x4f,
-  lightVP: mat4x4f,
+  lightVP0: mat4x4f,   // near shadow cascade (the cascade being drawn, in shadow passes)
+  lightVP1: mat4x4f,   // far shadow cascade
   invViewProj: mat4x4f,
-  camPos: vec4f,     // xyz camera, w time
-  sunDir: vec4f,     // xyz toward sun, w shadows on
-  sunColor: vec4f,   // rgb, w ambient
-  fogColor: vec4f,   // rgb, w density
+  camPos: vec4f,       // xyz camera, w time
+  sunDir: vec4f,       // xyz toward sun, w shadows on
+  sunColor: vec4f,     // rgb, w ambient
+  fogColor: vec4f,     // rgb, w density
   skyTop: vec4f,
   skyHorizon: vec4f,
-  params: vec4f,     // x shadow texel, y map size, z hurt flash, w water level
-  zone: vec4f,       // cx, cz, r, visible
-  focus: vec4f,      // xyz camera target (player), w enabled
+  params: vec4f,       // x shadow texel, y map size, z hurt flash, w water level
+  zone: vec4f,         // cx, cz, r, visible
+  focus: vec4f,        // xyz camera target (player), w enabled
+  post: vec4f,         // 1/width, 1/height, bloom strength, exposure
+  ray0: vec4f,         // view ray through the screen centre ...
+  rayX: vec4f,         // ... and its change across the screen (ndc x, y)
+  rayY: vec4f,
 };
 `;
 
-const COMMON = /* wgsl */ `
-${FRAME}
-@group(0) @binding(0) var<uniform> F: Frame;
-@group(0) @binding(1) var shadowMap: texture_depth_2d;
-@group(0) @binding(2) var shadowSamp: sampler_comparison;
-
-fn shadowFactor(wp: vec3f, n: vec3f) -> f32 {
-  if (F.sunDir.w < 0.5) { return 1.0; }
-  let lp = F.lightVP * vec4f(wp + n * 0.06, 1.0);
-  let uv = lp.xy * vec2f(0.5, -0.5) + vec2f(0.5);
-  let d = lp.z;
-  if (uv.x < 0.002 || uv.y < 0.002 || uv.x > 0.998 || uv.y > 0.998 || d > 1.0) { return 1.0; }
-  let ts = F.params.x;
-  var s = 0.0;
-  for (var i = -1; i <= 1; i++) {
-    for (var j = -1; j <= 1; j++) {
-      s += textureSampleCompareLevel(shadowMap, shadowSamp, uv + vec2f(f32(i), f32(j)) * ts, d - 0.0012);
-    }
-  }
-  // fade out toward the edge of the shadow region
-  let edge = smoothstep(0.38, 0.5, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
-  return mix(s / 9.0, 1.0, edge);
-}
-
-fn lighting(albedo: vec3f, n: vec3f, wp: vec3f) -> vec3f {
-  let L = F.sunDir.xyz;
-  let ndl = max(dot(n, L), 0.0);
-  let sh = shadowFactor(wp, n);
-  let hemi = mix(vec3f(0.36, 0.33, 0.30), vec3f(0.55, 0.66, 0.85), n.y * 0.5 + 0.5);
-  return albedo * (hemi * F.sunColor.w + F.sunColor.rgb * ndl * sh);
-}
-
-fn applyFog(c: vec3f, wp: vec3f) -> vec3f {
-  let d = distance(wp, F.camPos.xyz);
-  let f = 1.0 - exp(-pow(d * F.fogColor.w, 1.6));
-  return mix(c, F.fogColor.rgb, clamp(f, 0.0, 1.0));
-}
-
-fn tonemap(c0: vec3f) -> vec3f {
-  let c = c0 * 0.8;
-  let a = c * (2.51 * c + 0.03);
-  let b = c * (2.43 * c + 0.59) + 0.14;
-  let t = clamp(a / b, vec3f(0.0), vec3f(1.0));
-  return pow(t, vec3f(1.0 / 2.2));
-}
-
+const NOISE = /* wgsl */ `
 fn hash2(p: vec2f) -> f32 {
-  return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
+  var q = fract(p * vec2f(0.1031, 0.1030));
+  q += dot(q, q.yx + 33.33);
+  return fract((q.x + q.y) * q.x);
+}
+fn hash3(p: vec3f) -> f32 {
+  var q = fract(p * 0.1031);
+  q += dot(q, q.zyx + 31.32);
+  return fract((q.x + q.y) * q.z);
 }
 fn vnoise(p: vec2f) -> f32 {
   let i = floor(p);
@@ -72,9 +41,136 @@ fn vnoise(p: vec2f) -> f32 {
   let u = f * f * (3.0 - 2.0 * f);
   return mix(mix(hash2(i), hash2(i + vec2f(1.0, 0.0)), u.x), mix(hash2(i + vec2f(0.0, 1.0)), hash2(i + vec2f(1.0, 1.0)), u.x), u.y);
 }
+fn vnoise3(p: vec3f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = mix(mix(hash3(i), hash3(i + vec3f(1.0, 0.0, 0.0)), u.x), mix(hash3(i + vec3f(0.0, 1.0, 0.0)), hash3(i + vec3f(1.0, 1.0, 0.0)), u.x), u.y);
+  let b = mix(mix(hash3(i + vec3f(0.0, 0.0, 1.0)), hash3(i + vec3f(1.0, 0.0, 1.0)), u.x), mix(hash3(i + vec3f(0.0, 1.0, 1.0)), hash3(i + vec3f(1.0, 1.0, 1.0)), u.x), u.y);
+  return mix(a, b, u.z);
+}
+fn fbm2(p: vec2f) -> f32 {
+  return vnoise(p) * 0.5 + vnoise(p * 2.03 + 17.1) * 0.25 + vnoise(p * 4.01 + 5.3) * 0.125 + vnoise(p * 8.07 + 9.7) * 0.0625;
+}
+fn fbm3(p: vec3f) -> f32 {
+  return vnoise3(p) * 0.5 + vnoise3(p * 2.03 + 7.1) * 0.25 + vnoise3(p * 4.01 + 3.3) * 0.125;
+}
 fn qrot(q: vec4f, v: vec3f) -> vec3f {
   let t = 2.0 * cross(q.xyz, v);
   return v + q.w * t + cross(q.xyz, t);
+}
+`;
+
+const COMMON = /* wgsl */ `
+${FRAME}
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var shadowMap: texture_depth_2d_array;
+@group(0) @binding(2) var shadowSamp: sampler_comparison;
+${NOISE}
+
+fn shadowCascade(lp: vec4f, layer: i32, bias: f32) -> f32 {
+  let uv = lp.xy * vec2f(0.5, -0.5) + vec2f(0.5);
+  let ts = F.params.x;
+  var s = 0.0;
+  for (var i = -1; i <= 1; i++) {
+    for (var j = -1; j <= 1; j++) {
+      s += textureSampleCompareLevel(shadowMap, shadowSamp, uv + vec2f(f32(i), f32(j)) * ts, layer, lp.z - bias);
+    }
+  }
+  return s / 9.0;
+}
+
+fn shadowFactor(wp: vec3f, n: vec3f) -> f32 {
+  if (F.sunDir.w < 0.5) { return 1.0; }
+  let slope = 1.0 - max(dot(n, F.sunDir.xyz), 0.0);
+  let lp0 = F.lightVP0 * vec4f(wp + n * (0.04 + 0.08 * slope), 1.0);
+  let e0 = max(abs(lp0.x), abs(lp0.y));
+  if (e0 < 0.96 && lp0.z < 1.0) {
+    let s0 = shadowCascade(lp0, 0, 0.0008);
+    if (e0 < 0.86) { return s0; }
+    let lp1 = F.lightVP1 * vec4f(wp + n * (0.25 + 0.5 * slope), 1.0);
+    return mix(s0, shadowCascade(lp1, 1, 0.0016), smoothstep(0.86, 0.96, e0));
+  }
+  let lp1 = F.lightVP1 * vec4f(wp + n * (0.25 + 0.5 * slope), 1.0);
+  let e1 = max(abs(lp1.x), abs(lp1.y));
+  if (e1 > 0.99 || lp1.z > 1.0) { return 1.0; }
+  return mix(shadowCascade(lp1, 1, 0.0016), 1.0, smoothstep(0.88, 0.99, e1));
+}
+
+fn skyColor(dir: vec3f) -> vec3f {
+  let h = dir.y;
+  var c = mix(F.skyHorizon.rgb, F.skyTop.rgb, pow(clamp(h, 0.0, 1.0), 0.5));
+  c = mix(c, F.fogColor.rgb, smoothstep(0.03, -0.2, h));
+  let sd = max(dot(dir, F.sunDir.xyz), 0.0);
+  // forward scattering around the sun
+  c += F.sunColor.rgb * (pow(sd, 6.0) * 0.06 + pow(sd, 48.0) * 0.18);
+  return c;
+}
+
+const PI = 3.14159265;
+
+struct Surface {
+  albedo: vec3f,
+  n: vec3f,
+  rough: f32,
+  metal: f32,
+  ao: f32,
+  trans: f32,   // foliage translucency
+};
+
+/// Cook-Torrance sun light + sky ambient (diffuse and specular), in linear HDR.
+fn shade(s: Surface, wp: vec3f) -> vec3f {
+  let L = F.sunDir.xyz;
+  let V = normalize(F.camPos.xyz - wp);
+  let n = s.n;
+  let ndl = max(dot(n, L), 0.0);
+  let ndv = max(dot(n, V), 1e-3);
+  let H = normalize(L + V);
+  let ndh = max(dot(n, H), 0.0);
+  let vdh = max(dot(V, H), 0.0);
+  let a = max(s.rough * s.rough, 0.02);
+  let a2 = a * a;
+  let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+  let D = a2 / (PI * dd * dd);
+  let k = (s.rough + 1.0) * (s.rough + 1.0) / 8.0;
+  let G = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
+  let f0 = mix(vec3f(0.04), s.albedo, s.metal);
+  let Fr = f0 + (1.0 - f0) * pow(1.0 - vdh, 5.0);
+  let diffCol = s.albedo * (1.0 - s.metal);
+  let sh = shadowFactor(wp, n);
+  let spec = Fr * (D * G / (4.0 * ndl * ndv + 1e-3));
+  var direct = (diffCol / PI * (1.0 - Fr) + spec) * ndl;
+  // light through thin leaves
+  direct += diffCol / PI * s.trans * max(dot(-n, L), 0.0) * 0.6;
+  var c = direct * F.sunColor.rgb * sh * PI;
+  // ambient: sky above, ground bounce below
+  let up = n.y * 0.5 + 0.5;
+  let ground = F.sunColor.rgb * vec3f(0.11, 0.1, 0.08);
+  let irr = mix(ground, mix(F.skyHorizon.rgb, F.skyTop.rgb, 0.5) * 0.75 + F.sunColor.rgb * 0.03, up);
+  c += diffCol * irr * F.sunColor.w * s.ao;
+  // ambient specular from the sky in the mirror direction
+  let R = reflect(-V, n);
+  let env = mix(skyColor(R), irr, clamp(s.rough * 1.15, 0.0, 1.0));
+  let fa = f0 + (max(vec3f(1.0 - s.rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+  c += env * fa * s.ao * F.sunColor.w * mix(1.0, 0.5 + 0.5 * sh, 0.6);
+  return c;
+}
+
+fn applyFog(c: vec3f, wp: vec3f) -> vec3f {
+  let v = wp - F.camPos.xyz;
+  let d = length(v);
+  // denser near the ground / sea
+  let hgt = max(0.5 * (wp.y + F.camPos.y), 0.0);
+  let dens = F.fogColor.w * (0.35 + 0.65 * exp(-hgt * 0.012));
+  let f = 1.0 - exp(-pow(d * dens, 1.35));
+  let sd = max(dot(v / max(d, 1e-3), F.sunDir.xyz), 0.0);
+  let col = F.fogColor.rgb + F.sunColor.rgb * pow(sd, 8.0) * 0.12;
+  return mix(c, col, clamp(f, 0.0, 1.0));
+}
+
+/// Bump a normal with the world-space gradient of a height function.
+fn bump(n: vec3f, grad: vec3f, k: f32) -> vec3f {
+  return normalize(n - k * (grad - n * dot(grad, n)));
 }
 `;
 
@@ -107,43 +203,163 @@ fn sway(p: vec3f, m: f32) -> vec3f {
 }
 
 @fragment fn fs_terrain(i: VOut) -> @location(0) vec4f {
-  let n = normalize(i.n);
-  var albedo = pow(i.col.rgb, vec3f(2.2)) * 0.9;
-  let nz = vnoise(i.wp.xz * 0.35) * 0.6 + vnoise(i.wp.xz * 1.7) * 0.4;
-  albedo *= 0.84 + 0.3 * nz;
-  // wet sand line + underwater darkening
+  var n = normalize(i.n);
+  let p = i.wp.xz;
+  let dist = distance(i.wp, F.camPos.xyz);
+  let detail = 1.0 - smoothstep(40.0, 160.0, dist);
+  let base = pow(i.col.rgb, vec3f(2.2));
+  let pave = i.col.a;
+  let slope = 1.0 - n.y;
   let wl = F.params.w;
-  albedo *= mix(0.55, 1.0, smoothstep(wl - 2.5, wl + 0.6, i.wp.y));
-  var c = lighting(albedo, n, i.wp);
+  // mvar variation breaks up the vertex colours
+  let mvar = fbm2(p * 0.021) * 0.6 + vnoise(p * 0.11) * 0.4;
+  // vertex colours are picked for a flat look: pull them to natural reflectance
+  let lum0 = dot(base, vec3f(0.3, 0.55, 0.15));
+  var albedo = mix(vec3f(lum0), base, 0.62) * (0.5 + 0.4 * mvar);
+  // grass blades / soil
+  let g1 = vnoise(p * 3.1);
+  let g2 = vnoise(p * 9.7 + 31.0);
+  let fine = g1 * 0.6 + g2 * 0.4;
+  let grass = (1.0 - smoothstep(0.2, 0.42, slope)) * smoothstep(1.4, 3.2, i.wp.y) * (1.0 - pave);
+  albedo = mix(albedo, albedo * mix(vec3f(0.55, 0.62, 0.42), vec3f(1.25, 1.3, 0.95), fine), grass * (0.35 + 0.65 * detail));
+  // dry patches
+  albedo = mix(albedo, albedo * vec3f(1.25, 1.12, 0.8), grass * smoothstep(0.55, 0.8, mvar) * 0.5);
+  // rock on slopes
+  let rk = fbm2(p * 0.35 + i.wp.y * 0.2);
+  let rock = smoothstep(0.24, 0.5, slope + (rk - 0.5) * 0.2) * (1.0 - pave);
+  albedo = mix(albedo, vec3f(0.26, 0.25, 0.23) * (0.6 + 0.8 * rk), rock * 0.8);
+  // paved ground: asphalt / packed dirt with fine grain and cracks
+  let grain = vnoise(p * 14.0);
+  let crack = mix(1.0, smoothstep(0.485, 0.5, abs(fbm2(p * 1.9) - 0.5) * 2.0 + 0.485 - 0.012 * grain), 0.55 * detail);
+  let asphalt = vec3f(0.085, 0.083, 0.08) * (0.8 + 0.4 * grain) * mix(0.55, 1.0, crack) * (0.85 + 0.3 * mvar);
+  albedo = mix(albedo, asphalt, clamp(pave * 1.25, 0.0, 1.0));
+  // wet sand line + underwater darkening
+  let wet = 1.0 - smoothstep(wl - 2.5, wl + 0.6, i.wp.y);
+  albedo *= mix(1.0, 0.5, wet);
+  // surface relief from the same noise
+  let e = 0.12;
+  let h0 = fine + rk * rock * 2.0;
+  let hx = (vnoise((p + vec2f(e, 0.0)) * 3.1) * 0.6 + vnoise((p + vec2f(e, 0.0)) * 9.7 + 31.0) * 0.4) + fbm2((p + vec2f(e, 0.0)) * 0.35 + i.wp.y * 0.2) * rock * 2.0;
+  let hz = (vnoise((p + vec2f(0.0, e)) * 3.1) * 0.6 + vnoise((p + vec2f(0.0, e)) * 9.7 + 31.0) * 0.4) + fbm2((p + vec2f(0.0, e)) * 0.35 + i.wp.y * 0.2) * rock * 2.0;
+  n = bump(n, vec3f((hx - h0) / e, 0.0, (hz - h0) / e), 0.09 * detail * (1.0 - 0.6 * pave));
+  var s: Surface;
+  s.albedo = albedo;
+  s.n = n;
+  s.rough = mix(mix(0.92, 0.8, rock), 0.72, pave) - wet * 0.45;
+  s.metal = 0.0;
+  s.ao = 0.75 + 0.25 * fine;
+  s.trans = 0.0;
+  var c = shade(s, i.wp);
   c = applyFog(c, i.wp);
-  return vec4f(tonemap(c), 1.0);
+  return vec4f(c, 1.0);
 }
 
-@fragment fn fs_props(i: VOut) -> @location(0) vec4f {
-  let n = normalize(i.n);
+@fragment fn fs_props(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  var n = normalize(i.n);
   var albedo = pow(i.col.rgb, vec3f(2.2));
-  if (i.col.a < 0.75) {
-    // see-through foliage between the camera and the player
+  let mat = i32(round(i.col.a * 255.0));
+  let dist = distance(i.wp, F.camPos.xyz);
+  let detail = 1.0 - smoothstep(30.0, 120.0, dist);
+  var s: Surface;
+  s.rough = 0.85;
+  s.metal = 0.0;
+  s.ao = 1.0;
+  s.trans = 0.0;
+  let wp = i.wp;
+  if (mat < 192) {
+    // foliage: see-through between the camera and the player
     if (F.focus.w > 0.5) {
       let c = F.camPos.xyz;
       let seg = F.focus.xyz - c;
       let L = length(seg);
       if (L > 0.5) {
         let dir = seg / L;
-        let t = dot(i.wp - c, dir);
+        let t = dot(wp - c, dir);
         if (t > 0.0 && t < L + 0.6) {
-          let perp = length((i.wp - c) - dir * t);
+          let perp = length((wp - c) - dir * t);
           let radius = 0.9 + 1.4 * clamp(t / L, 0.0, 1.0);
           let px = vec2i(i.clip.xy);
           if (perp < radius * 0.65 || (perp < radius && ((px.x + px.y) & 1) == 0)) { discard; }
         }
       }
     }
-    albedo *= 0.85 + 0.3 * vnoise(i.wp.xz * 2.0 + i.wp.y);
+    // leaf clusters: light and dark clumps, a little yellowing
+    let cl = vnoise3(wp * 2.6);
+    let fine = vnoise3(wp * 9.0);
+    albedo *= 0.55 + 0.75 * cl * (0.6 + 0.4 * fine);
+    albedo = mix(albedo, albedo * vec3f(1.3, 1.15, 0.6), smoothstep(0.62, 0.9, vnoise3(wp * 0.7)) * 0.35);
+    let e = 0.09;
+    let g = vec3f(vnoise3((wp + vec3f(e, 0.0, 0.0)) * 2.6) - cl, vnoise3((wp + vec3f(0.0, e, 0.0)) * 2.6) - cl, vnoise3((wp + vec3f(0.0, 0.0, e)) * 2.6) - cl) / e;
+    n = bump(n, g, 0.35 * detail);
+    s.rough = 0.62;
+    s.ao = 0.45 + 0.55 * cl;
+    s.trans = 1.0;
+  } else if (mat == 250) {
+    // roof: rows of tiles / sheet ribs
+    let u = wp.x + wp.z;
+    let rib = abs(fract(u * 1.6) - 0.5) * 2.0;
+    let row = fract(wp.x * 0.9 - wp.z * 0.9);
+    albedo *= 0.75 + 0.3 * smoothstep(0.1, 0.5, rib) + (vnoise(wp.xz * 0.8) - 0.5) * 0.25;
+    albedo *= 0.9 + 0.1 * step(0.08, row);
+    n = bump(n, vec3f(1.0, 0.0, 1.0) * (step(0.5, fract(u * 1.6)) - 0.5) * (1.0 - smoothstep(0.3, 0.5, rib)) * 2.0, 0.5 * detail);
+    s.rough = 0.6;
+  } else if (mat == 240) {
+    // wood: planks and grain
+    let ax = abs(n);
+    var uv = wp.xy;
+    if (ax.x > ax.z && ax.x > ax.y) { uv = wp.zy; } else if (ax.y > ax.z) { uv = wp.xz; }
+    let plank = fract(uv.y * 4.0);
+    let gr = vnoise(vec2f(uv.x * 2.0, uv.y * 40.0 + floor(uv.y * 4.0) * 7.0));
+    albedo *= (0.7 + 0.45 * gr) * mix(0.55, 1.0, smoothstep(0.0, 0.06, plank) * smoothstep(1.0, 0.94, plank));
+    s.rough = 0.78;
+    s.ao = mix(0.6, 1.0, smoothstep(0.0, 0.1, plank));
+  } else if (mat == 235) {
+    // painted steel with rust and chips
+    let r = fbm3(wp * 1.3);
+    let rust = smoothstep(0.58, 0.75, r + (1.0 - clamp(wp.y * 0.0 + 1.0, 0.0, 1.0)));
+    albedo = mix(albedo * (0.85 + 0.25 * vnoise3(wp * 6.0)), vec3f(0.23, 0.1, 0.045) * (0.6 + 0.8 * vnoise3(wp * 11.0)), rust * 0.75);
+    s.rough = mix(0.42, 0.85, rust);
+    s.metal = mix(0.55, 0.1, rust);
+  } else if (mat == 220 || mat == 225) {
+    // rock / bark
+    let f = select(vec3f(1.4, 1.4, 1.4), vec3f(7.0, 1.2, 7.0), mat == 225);
+    let h0 = fbm3(wp * f);
+    let e = 0.05;
+    let g = vec3f(fbm3((wp + vec3f(e, 0.0, 0.0)) * f) - h0, fbm3((wp + vec3f(0.0, e, 0.0)) * f) - h0, fbm3((wp + vec3f(0.0, 0.0, e)) * f) - h0) / e;
+    n = bump(n, g, 0.45 * detail + 0.1);
+    albedo *= 0.55 + 0.9 * h0;
+    if (mat == 220) {
+      // moss on top
+      albedo = mix(albedo, vec3f(0.09, 0.13, 0.04), smoothstep(0.55, 0.9, n.y) * smoothstep(0.45, 0.6, vnoise3(wp * 0.9)) * 0.7);
+    }
+    s.rough = 0.9;
+    s.ao = 0.6 + 0.4 * h0;
+  } else {
+    // plaster, concrete, floors: stains, streaks under the eaves, fine grain
+    let stain = fbm3(wp * vec3f(0.45, 0.25, 0.45));
+    let streak = vnoise(vec2f((wp.x + wp.z) * 2.2, wp.y * 0.35));
+    let grain = vnoise3(wp * 18.0);
+    var k = 0.78 + 0.3 * stain + (grain - 0.5) * 0.12 * detail;
+    if (abs(n.y) < 0.5) { k -= 0.18 * smoothstep(0.55, 0.85, streak) * stain; }
+    if (mat == 230) { k *= 0.9 + 0.2 * vnoise3(wp * 3.0); }
+    albedo *= k;
+    let e = 0.03;
+    var g = vec3f(vnoise3((wp + vec3f(e, 0.0, 0.0)) * 18.0) - grain, vnoise3((wp + vec3f(0.0, e, 0.0)) * 18.0) - grain, vnoise3((wp + vec3f(0.0, 0.0, e)) * 18.0) - grain) / e * 0.012;
+    if (mat == 255 && abs(n.y) < 0.5) {
+      // lap siding: boards 22 cm tall, each casting a thin shadow on the next
+      let b = fract(wp.y / 0.22);
+      albedo *= mix(0.62, 1.0, smoothstep(0.0, 0.12, b)) * (0.94 + 0.12 * hash2(vec2f(floor(wp.y / 0.22), 3.0)));
+      g.y += (smoothstep(0.0, 0.12, b) - smoothstep(0.85, 1.0, b)) * -0.9;
+    }
+    n = bump(n, g, detail);
+    s.rough = select(0.88, 0.8, mat == 245);
   }
-  var c = lighting(albedo, n, i.wp);
-  c = applyFog(c, i.wp);
-  return vec4f(tonemap(c), 1.0);
+  if (!front) { n = -n; }
+  s.albedo = albedo;
+  s.n = n;
+  var c = shade(s, wp);
+  c = applyFog(c, wp);
+  return vec4f(c, 1.0);
 }
 `;
 
@@ -152,11 +368,11 @@ ${FRAME}
 @group(0) @binding(0) var<uniform> F: Frame;
 struct VIn { @location(0) pos: vec3f, @location(1) nrm: vec4f, @location(2) col: vec4f };
 @vertex fn vs(v: VIn) -> @builtin(position) vec4f {
-  return F.lightVP * vec4f(v.pos, 1.0);
+  return F.lightVP0 * vec4f(v.pos, 1.0);
 }
 `;
 
-// ---------------------------------------------------------------- instanced boxes
+// ---------------------------------------------------------------- instanced shapes
 const BOX_IO = /* wgsl */ `
 struct BIn {
   @location(0) pos: vec3f,
@@ -165,6 +381,7 @@ struct BIn {
   @location(3) iquat: vec4f,
   @location(4) iscale: vec3f,
   @location(5) icol: vec4f,
+  @location(6) imat: vec4f,
 };
 `;
 
@@ -176,6 +393,8 @@ struct VOut {
   @location(0) wp: vec3f,
   @location(1) n: vec3f,
   @location(2) col: vec4f,
+  @location(3) mat: vec2f,
+  @location(4) lp: vec3f,
 };
 @vertex fn vs(v: BIn) -> VOut {
   var o: VOut;
@@ -184,26 +403,38 @@ struct VOut {
   o.clip = F.viewProj * vec4f(wp, 1.0);
   o.n = normalize(qrot(v.iquat, v.nrm / max(v.iscale, vec3f(1e-4))));
   o.col = v.icol;
+  o.mat = v.imat.xy;
+  o.lp = v.pos * v.iscale;
   return o;
 }
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
-  let albedo = pow(i.col.rgb, vec3f(2.2));
+  var albedo = pow(i.col.rgb, vec3f(2.2));
   let lit = i.col.a;
-  var c = lighting(albedo, normalize(i.n), i.wp) * lit + albedo * (1.0 - lit) * 3.0;
+  // a little surface grain so flat colours do not look like plastic
+  let g = vnoise3(i.lp * 60.0);
+  albedo *= 0.9 + 0.2 * g * (1.0 - i.mat.y);
+  var s: Surface;
+  s.albedo = albedo;
+  s.n = normalize(i.n);
+  s.rough = clamp(i.mat.x + (g - 0.5) * 0.12, 0.05, 1.0);
+  s.metal = i.mat.y;
+  s.ao = 1.0;
+  s.trans = 0.0;
+  var c = shade(s, i.wp) * lit + albedo * (1.0 - lit) * 6.0;
   c = applyFog(c, i.wp);
-  return vec4f(tonemap(c), 1.0);
+  return vec4f(c, 1.0);
 }
 @fragment fn fs_glow(i: VOut) -> @location(0) vec4f {
-  let albedo = pow(i.col.rgb, vec3f(2.2)) * 2.2;
+  let albedo = pow(i.col.rgb, vec3f(2.2)) * 5.0;
   let d = distance(i.wp, F.camPos.xyz);
   let fade = exp(-d * 0.002);
-  return vec4f(tonemap(albedo), i.col.a * fade);
+  return vec4f(albedo, i.col.a * fade);
 }
 @fragment fn fs_smoke(i: VOut) -> @location(0) vec4f {
   let albedo = pow(i.col.rgb, vec3f(2.2));
   var c = albedo * (0.55 + 0.45 * max(dot(normalize(i.n), F.sunDir.xyz), 0.0)) * F.sunColor.rgb;
   c = applyFog(c, i.wp);
-  return vec4f(tonemap(c), i.col.a);
+  return vec4f(c, i.col.a);
 }
 `;
 
@@ -218,7 +449,107 @@ fn qrot(q: vec4f, v: vec3f) -> vec3f {
 @vertex fn vs(v: BIn) -> @builtin(position) vec4f {
   if (v.icol.a < 0.5) { return vec4f(0.0, 0.0, -2.0, 1.0); } // emissive parts cast no shadow
   let wp = v.ipos + qrot(v.iquat, v.pos * v.iscale);
-  return F.lightVP * vec4f(wp, 1.0);
+  return F.lightVP0 * vec4f(wp, 1.0);
+}
+`;
+
+// ---------------------------------------------------------------- glTF models
+const MODEL_IO = /* wgsl */ `
+struct MIn {
+  @location(0) pos: vec3f,
+  @location(1) nrm: vec3f,
+  @location(2) tan: vec4f,
+  @location(3) uv: vec2f,
+  @location(4) ipos: vec3f,
+  @location(5) iquat: vec4f,
+};
+`;
+
+export const MODEL_WGSL = /* wgsl */ `
+${COMMON}
+${MODEL_IO}
+struct Mat {
+  base: vec4f,
+  emissive: vec4f,
+  mr: vec4f,     // metallic, roughness, has textures, unused
+};
+@group(1) @binding(0) var<uniform> M: Mat;
+@group(1) @binding(1) var samp: sampler;
+@group(1) @binding(2) var baseTex: texture_2d<f32>;
+@group(1) @binding(3) var normalTex: texture_2d<f32>;
+@group(1) @binding(4) var ormTex: texture_2d<f32>;
+@group(1) @binding(5) var emisTex: texture_2d<f32>;
+struct VOut {
+  @builtin(position) clip: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) n: vec3f,
+  @location(2) t: vec4f,
+  @location(3) uv: vec2f,
+};
+@vertex fn vs(v: MIn) -> VOut {
+  var o: VOut;
+  let wp = v.ipos + qrot(v.iquat, v.pos);
+  o.wp = wp;
+  o.clip = F.viewProj * vec4f(wp, 1.0);
+  o.n = qrot(v.iquat, v.nrm);
+  o.t = vec4f(qrot(v.iquat, v.tan.xyz), v.tan.w);
+  o.uv = v.uv;
+  return o;
+}
+fn surface(i: VOut, front: bool) -> Surface {
+  var n = normalize(i.n);
+  var s: Surface;
+  var base = M.base;
+  s.metal = M.mr.x;
+  s.rough = M.mr.y;
+  s.ao = 1.0;
+  if (M.mr.z > 0.5) {
+    base *= textureSample(baseTex, samp, i.uv);
+    let orm = textureSample(ormTex, samp, i.uv).rgb;
+    s.ao = orm.r;
+    s.rough *= orm.g;
+    s.metal *= orm.b;
+    let tn = textureSample(normalTex, samp, i.uv).xyz * 2.0 - 1.0;
+    let t = normalize(i.t.xyz - n * dot(i.t.xyz, n));
+    let b = cross(n, t) * i.t.w;
+    n = normalize(t * tn.x + b * tn.y + n * tn.z);
+  }
+  if (!front) { n = -n; }
+  s.albedo = base.rgb;
+  s.n = n;
+  s.rough = clamp(s.rough, 0.04, 1.0);
+  s.trans = 0.0;
+  return s;
+}
+@fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  let s = surface(i, front);
+  var c = shade(s, i.wp);
+  if (M.mr.z > 0.5) { c += textureSample(emisTex, samp, i.uv).rgb * M.emissive.rgb * 2.0; }
+  c = applyFog(c, i.wp);
+  return vec4f(c, 1.0);
+}
+@fragment fn fs_blend(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  let s = surface(i, front);
+  var c = shade(s, i.wp);
+  // glass: reflections stay bright where the surface is see-through
+  let V = normalize(F.camPos.xyz - i.wp);
+  let fres = 0.04 + 0.96 * pow(1.0 - max(dot(s.n, V), 0.0), 5.0);
+  let a = clamp(M.base.a + fres * 0.6, 0.0, 1.0);
+  c = applyFog(c, i.wp);
+  return vec4f(c, a);
+}
+`;
+
+export const MODEL_SHADOW_WGSL = /* wgsl */ `
+${FRAME}
+@group(0) @binding(0) var<uniform> F: Frame;
+${MODEL_IO}
+fn qrot(q: vec4f, v: vec3f) -> vec3f {
+  let t = 2.0 * cross(q.xyz, v);
+  return v + q.w * t + cross(q.xyz, t);
+}
+@vertex fn vs(v: MIn) -> @builtin(position) vec4f {
+  return F.lightVP0 * vec4f(v.ipos + qrot(v.iquat, v.pos), 1.0);
 }
 `;
 
@@ -234,21 +565,24 @@ struct VOut { @builtin(position) clip: vec4f, @location(0) ndc: vec2f };
   return o;
 }
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
-  let w = F.invViewProj * vec4f(i.ndc, 0.5, 1.0);
-  let dir = normalize(w.xyz / w.w - F.camPos.xyz);
+  let dir = normalize(F.ray0.xyz + F.rayX.xyz * i.ndc.x + F.rayY.xyz * i.ndc.y);
   let h = dir.y;
-  var c = mix(F.skyHorizon.rgb, F.skyTop.rgb, pow(clamp(h, 0.0, 1.0), 0.55));
-  c = mix(c, F.fogColor.rgb * 0.92, smoothstep(0.02, -0.25, h));
+  var c = skyColor(dir);
   let sd = max(dot(dir, F.sunDir.xyz), 0.0);
-  c += F.sunColor.rgb * (pow(sd, 900.0) * 6.0 + pow(sd, 24.0) * 0.25);
-  // drifting clouds
+  c += F.sunColor.rgb * smoothstep(0.99985, 0.99995, sd) * 40.0;
+  // layered clouds lit from the sun side
   if (h > 0.0) {
-    let uv = dir.xz / (h + 0.12) * 1.6 + vec2f(F.camPos.w * 0.008, F.camPos.w * 0.003);
-    var n = vnoise(uv) * 0.55 + vnoise(uv * 2.3) * 0.3 + vnoise(uv * 5.1) * 0.15;
-    n = smoothstep(0.52, 0.85, n) * smoothstep(0.0, 0.18, h);
-    c = mix(c, vec3f(1.0, 0.99, 0.97) * (0.85 + 0.3 * sd), n * 0.85);
+    let t = F.camPos.w;
+    let uv = dir.xz / (h + 0.1) * 1.3 + vec2f(t * 0.006, t * 0.0025);
+    let d0 = fbm2(uv) + vnoise(uv * 5.0) * 0.05 * smoothstep(0.05, 0.3, h);
+    let cover = smoothstep(0.42, 0.72, d0) * smoothstep(0.0, 0.14, h);
+    let toSun = normalize(F.sunDir.xz + vec2f(1e-4)) * 0.12;
+    let d1 = fbm2(uv + toSun);
+    let lit = clamp(0.55 + (d0 - d1) * 3.5, 0.0, 1.0);
+    let cloud = mix(F.skyTop.rgb * 0.55 + vec3f(0.25), F.sunColor.rgb * 0.95 + vec3f(0.2), lit) * (0.9 + 0.5 * pow(sd, 8.0));
+    c = mix(c, cloud, cover * 0.9);
   }
-  return vec4f(tonemap(c), 1.0);
+  return vec4f(c, 1.0);
 }
 `;
 
@@ -279,30 +613,40 @@ fn terrainH(x: f32, z: f32) -> f32 {
   let h11 = textureLoad(heightTex, i + vec2i(1, 1), 0).r;
   return mix(mix(h00, h10, t.x), mix(h01, h11, t.x), t.y);
 }
+fn waves(p: vec2f, t: f32) -> f32 {
+  return vnoise(p * 0.07 + vec2f(t * 0.22, t * 0.1)) * 1.0
+    + vnoise(p * 0.19 - vec2f(t * 0.16, t * 0.27)) * 0.5
+    + vnoise(p * 0.53 + vec2f(t * 0.35, -t * 0.3)) * 0.22
+    + vnoise(p * 1.7 - vec2f(t * 0.5, t * 0.4)) * 0.08;
+}
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
   let t = F.camPos.w;
   let p = i.wp.xz;
-  let e = 0.6;
-  let w1 = vnoise(p * 0.08 + vec2f(t * 0.25, t * 0.11));
-  let w2 = vnoise(p * 0.21 - vec2f(t * 0.17, t * 0.29));
-  let gx = (vnoise((p + vec2f(e, 0.0)) * 0.08 + vec2f(t * 0.25, t * 0.11)) - w1) + (vnoise((p + vec2f(e, 0.0)) * 0.21 - vec2f(t * 0.17, t * 0.29)) - w2) * 0.5;
-  let gz = (vnoise((p + vec2f(0.0, e)) * 0.08 + vec2f(t * 0.25, t * 0.11)) - w1) + (vnoise((p + vec2f(0.0, e)) * 0.21 - vec2f(t * 0.17, t * 0.29)) - w2) * 0.5;
-  let n = normalize(vec3f(-gx * 1.6, 1.0, -gz * 1.6));
+  let dist = distance(i.wp, F.camPos.xyz);
+  let e = 0.35 + dist * 0.004;
+  let w0 = waves(p, t);
+  let gx = waves(p + vec2f(e, 0.0), t) - w0;
+  let gz = waves(p + vec2f(0.0, e), t) - w0;
+  let amp = 1.1 / (1.0 + dist * 0.01);
+  let n = normalize(vec3f(-gx / e * amp, 1.0, -gz / e * amp));
   let v = normalize(F.camPos.xyz - i.wp);
-  let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0) * 0.85 + 0.08;
+  let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
   let depth = F.params.w - terrainH(i.wp.x, i.wp.z);
-  let deep = vec3f(0.02, 0.12, 0.2);
-  let shallow = vec3f(0.12, 0.45, 0.5);
-  var c = mix(shallow, deep, smoothstep(0.0, 9.0, depth));
+  let deep = vec3f(0.006, 0.045, 0.085);
+  let shallow = vec3f(0.035, 0.22, 0.24);
+  let sun = F.sunColor.rgb;
+  var body = mix(shallow, deep, smoothstep(0.0, 8.0, depth)) * sun * (0.45 + 0.55 * max(dot(n, F.sunDir.xyz), 0.0));
+  // light scattered back through wave crests
+  body += shallow * sun * pow(max(dot(v, -F.sunDir.xyz), 0.0), 4.0) * 0.25 * smoothstep(0.9, 1.5, w0);
   let r = reflect(-v, n);
-  let sky = mix(F.skyHorizon.rgb, F.skyTop.rgb, clamp(r.y, 0.0, 1.0));
-  c = mix(c * (0.5 + 0.5 * max(dot(n, F.sunDir.xyz), 0.0)) * F.sunColor.rgb, sky, fres);
-  c += F.sunColor.rgb * pow(max(dot(r, F.sunDir.xyz), 0.0), 220.0) * 3.0;
-  let foam = smoothstep(0.9, 0.0, depth) * (0.55 + 0.45 * sin(t * 2.0 + depth * 6.0 + w1 * 5.0));
-  c = mix(c, vec3f(0.95), clamp(foam, 0.0, 1.0) * 0.6);
+  let sky = skyColor(vec3f(r.x, abs(r.y), r.z));
+  var c = mix(body, sky, fres);
+  c += sun * pow(max(dot(r, F.sunDir.xyz), 0.0), 380.0) * 14.0 * shadowFactor(i.wp, vec3f(0.0, 1.0, 0.0));
+  let foam = smoothstep(0.85, 0.0, depth) * (0.5 + 0.5 * sin(t * 1.7 + depth * 7.0 + w0 * 4.0)) + smoothstep(1.62, 1.75, w0) * 0.25;
+  c = mix(c, sun * 0.85, clamp(foam, 0.0, 1.0) * 0.6);
   c = applyFog(c, i.wp);
-  let alpha = clamp(0.55 + depth * 0.12 + fres * 0.3, 0.0, 0.94);
-  return vec4f(tonemap(c), alpha);
+  let alpha = clamp(0.5 + depth * 0.16 + fres * 0.5, 0.0, 0.97);
+  return vec4f(c, alpha);
 }
 `;
 
@@ -321,10 +665,194 @@ struct VOut { @builtin(position) clip: vec4f, @location(0) wp: vec3f, @location(
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
   let t = F.camPos.w;
   let d = distance(i.wp.xz, F.camPos.xz);
-  let stripes = 0.5 + 0.5 * sin(i.uv.x * F.zone.z * 0.9 + i.uv.y * 0.35 - t * 2.0);
-  let near = 1.0 - smoothstep(30.0, 700.0, d);
-  let base = vec3f(0.12, 0.38, 1.0);
-  let a = (0.2 + 0.3 * stripes) * (0.45 + 0.55 * near) * F.zone.w * smoothstep(-30.0, 10.0, i.wp.y);
+  let near = 1.0 - smoothstep(30.0, 500.0, d);
+  // the moving bands fade into a flat tint far away (they would only shimmer there)
+  let stripes = mix(0.5, 0.5 + 0.5 * sin(i.uv.x * F.zone.z * 0.9 + i.uv.y * 0.35 - t * 2.0), near * near);
+  let base = vec3f(0.12, 0.38, 1.0) * 1.6;
+  let a = (0.2 + 0.3 * stripes) * (0.3 + 0.7 * near) * F.zone.w * smoothstep(-30.0, 10.0, i.wp.y);
   return vec4f(base * (0.9 + 0.8 * stripes), a * (1.0 - smoothstep(150.0, 300.0, i.wp.y)));
+}
+`;
+
+// ---------------------------------------------------------------- post
+const FULLSCREEN = /* wgsl */ `
+struct VOut { @builtin(position) clip: vec4f, @location(0) uv: vec2f };
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  var o: VOut;
+  o.clip = vec4f(p[vi], 0.0, 1.0);
+  o.uv = p[vi] * vec2f(0.5, -0.5) + vec2f(0.5);
+  return o;
+}
+`;
+
+/** Bloom downsample (13-tap would be nicer; four bilinear taps are enough here). */
+export const BLOOM_WGSL = /* wgsl */ `
+${FULLSCREEN}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+fn taps(uv: vec2f) -> vec3f {
+  let ts = 1.0 / vec2f(textureDimensions(src));
+  return (textureSampleLevel(src, samp, uv + ts * vec2f(-1.0, -1.0), 0.0).rgb
+    + textureSampleLevel(src, samp, uv + ts * vec2f(1.0, -1.0), 0.0).rgb
+    + textureSampleLevel(src, samp, uv + ts * vec2f(-1.0, 1.0), 0.0).rgb
+    + textureSampleLevel(src, samp, uv + ts * vec2f(1.0, 1.0), 0.0).rgb) * 0.25;
+}
+@fragment fn fs_first(i: VOut) -> @location(0) vec4f {
+  let c = min(taps(i.uv), vec3f(40.0));
+  let l = max(c.r, max(c.g, c.b));
+  // soft threshold: only the bright end of the range blooms
+  let k = max(l - 1.1, 0.0) / max(l, 1e-4);
+  return vec4f(c * k, 1.0);
+}
+@fragment fn fs_down(i: VOut) -> @location(0) vec4f {
+  return vec4f(taps(i.uv), 1.0);
+}
+`;
+
+/** Screen-space ambient occlusion at half resolution, from the depth buffer. */
+export const AO_WGSL = /* wgsl */ `
+${FRAME}
+${FULLSCREEN}
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var depthTex: texture_depth_2d;
+fn wpos(px: vec2i, dim: vec2f) -> vec4f {
+  let d = textureLoad(depthTex, px, 0);
+  let uv = (vec2f(px) + vec2f(0.5)) / dim;
+  let w = F.invViewProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, max(d, 1e-6), 1.0);
+  return vec4f(w.xyz / w.w, d);
+}
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  let dim = vec2f(textureDimensions(depthTex));
+  let px = vec2i(i.uv * dim);
+  let c = wpos(px, dim);
+  if (c.w <= 0.0) { return vec4f(1.0); }
+  let P = c.xyz;
+  let toCam = F.camPos.xyz - P;
+  let dist = length(toCam);
+  if (dist > 90.0) { return vec4f(1.0); }
+  // normal from the nearer neighbours on each axis (keeps edges clean)
+  let xa = wpos(px + vec2i(1, 0), dim);
+  let xb = wpos(px - vec2i(1, 0), dim);
+  let ya = wpos(px + vec2i(0, 1), dim);
+  let yb = wpos(px - vec2i(0, 1), dim);
+  var dx = xa.xyz - P;
+  if (abs(xb.w - c.w) < abs(xa.w - c.w)) { dx = P - xb.xyz; }
+  var dy = ya.xyz - P;
+  if (abs(yb.w - c.w) < abs(ya.w - c.w)) { dy = P - yb.xyz; }
+  var N = normalize(cross(dy, dx));
+  if (dot(N, toCam) < 0.0) { N = -N; }
+  let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(N.y) > 0.9);
+  let T = normalize(cross(up, N));
+  let B = cross(N, T);
+  // interleaved gradient noise turns the kernel per pixel
+  let ang = fract(52.9829189 * fract(dot(vec2f(px), vec2f(0.06711056, 0.00583715)))) * 6.2831853;
+  let ca = cos(ang);
+  let sa = sin(ang);
+  let radius = clamp(dist * 0.06, 0.25, 1.1);
+  var occ = 0.0;
+  for (var k = 0; k < 10; k++) {
+    let f = (f32(k) + 0.5) / 10.0;
+    let a = f32(k) * 2.399963;
+    let r = sqrt(f);
+    let kx = cos(a) * r;
+    let ky = sin(a) * r;
+    let dir = T * (kx * ca - ky * sa) + B * (kx * sa + ky * ca) + N * sqrt(max(1.0 - r * r, 0.0)) * 0.9 + N * 0.1;
+    let sp = P + N * 0.03 + dir * radius * (0.35 + 0.65 * f);
+    let cl = F.viewProj * vec4f(sp, 1.0);
+    if (cl.w <= 0.0) { continue; }
+    let ndc = cl.xyz / cl.w;
+    let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (suv.x < 0.0 || suv.y < 0.0 || suv.x > 1.0 || suv.y > 1.0) { continue; }
+    let td = textureLoad(depthTex, vec2i(suv * dim), 0);
+    // reversed depth: the scene is in front of the sample when its depth is larger
+    let zs = 1.0 / max(ndc.z, 1e-7);
+    let zt = 1.0 / max(td, 1e-7);
+    let gap = (zs - zt) / zs * dist;
+    occ += step(0.02, gap) * smoothstep(radius * 2.5, radius * 0.5, gap);
+  }
+  let fade = 1.0 - smoothstep(60.0, 90.0, dist);
+  return vec4f(1.0 - occ / 10.0 * 0.85 * fade);
+}
+`;
+
+export const POST_WGSL = /* wgsl */ `
+${FRAME}
+${FULLSCREEN}
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var hdr: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var b0: texture_2d<f32>;
+@group(0) @binding(4) var b1: texture_2d<f32>;
+@group(0) @binding(5) var b2: texture_2d<f32>;
+@group(0) @binding(6) var b3: texture_2d<f32>;
+@group(0) @binding(7) var aoTex: texture_2d<f32>;
+
+fn aces(x: vec3f) -> vec3f {
+  // Narkowicz fit of the ACES filmic curve
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
+}
+fn grade(c0: vec3f, bloom: vec4f) -> vec3f {
+  var c = (c0 * bloom.a + bloom.rgb) * F.post.w;
+  c = aces(c);
+  // a touch of contrast and saturation
+  let l = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  c = mix(vec3f(l), c, 1.08);
+  c = c * c * (3.0 - 2.0 * c) * 0.35 + c * 0.65;
+  return pow(clamp(c, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));
+}
+fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  let ts = F.post.xy;
+  let uv = i.uv;
+  let glow = (textureSampleLevel(b0, samp, uv, 0.0).rgb * 0.3 + textureSampleLevel(b1, samp, uv, 0.0).rgb * 0.3
+    + textureSampleLevel(b2, samp, uv, 0.0).rgb * 0.25 + textureSampleLevel(b3, samp, uv, 0.0).rgb * 0.15) * F.post.z;
+  // ambient occlusion (half resolution; four taps blur its sampling pattern)
+  let at = ts * 1.5;
+  let ao = (textureSampleLevel(aoTex, samp, uv + at * vec2f(-1.0, -1.0), 0.0).r + textureSampleLevel(aoTex, samp, uv + at * vec2f(1.0, -1.0), 0.0).r
+    + textureSampleLevel(aoTex, samp, uv + at * vec2f(-1.0, 1.0), 0.0).r + textureSampleLevel(aoTex, samp, uv + at * vec2f(1.0, 1.0), 0.0).r) * 0.25;
+  let bloom = vec4f(glow, ao);
+  // FXAA on the graded image
+  let cM = grade(textureSampleLevel(hdr, samp, uv, 0.0).rgb, bloom);
+  let cNW = grade(textureSampleLevel(hdr, samp, uv + ts * vec2f(-0.5, -0.5), 0.0).rgb, bloom);
+  let cNE = grade(textureSampleLevel(hdr, samp, uv + ts * vec2f(0.5, -0.5), 0.0).rgb, bloom);
+  let cSW = grade(textureSampleLevel(hdr, samp, uv + ts * vec2f(-0.5, 0.5), 0.0).rgb, bloom);
+  let cSE = grade(textureSampleLevel(hdr, samp, uv + ts * vec2f(0.5, 0.5), 0.0).rgb, bloom);
+  let lM = luma(cM);
+  let lNW = luma(cNW);
+  let lNE = luma(cNE);
+  let lSW = luma(cSW);
+  let lSE = luma(cSE);
+  let lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+  let lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+  var c = cM;
+  if (lMax - lMin > max(0.04, lMax * 0.125)) {
+    var dir = vec2f(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+    let reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+    let rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * rcp, vec2f(-8.0), vec2f(8.0)) * ts;
+    let a = 0.5 * (grade(textureSampleLevel(hdr, samp, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb, bloom) + grade(textureSampleLevel(hdr, samp, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb, bloom));
+    let b = a * 0.5 + 0.25 * (grade(textureSampleLevel(hdr, samp, uv - dir * 0.5, 0.0).rgb, bloom) + grade(textureSampleLevel(hdr, samp, uv + dir * 0.5, 0.0).rgb, bloom));
+    let lB = luma(b);
+    c = select(b, a, lB < lMin || lB > lMax);
+  }
+  // vignette, hurt flash, a little dither against banding
+  let q = uv - vec2f(0.5);
+  c *= 1.0 - dot(q, q) * 0.35;
+  c = mix(c, vec3f(0.6, 0.02, 0.02), clamp(F.params.z, 0.0, 1.0) * dot(q, q) * 1.6);
+  let dn = fract(sin(dot(i.clip.xy, vec2f(12.9898, 78.233))) * 43758.5453);
+  c += (dn - 0.5) / 255.0;
+  return vec4f(c, 1.0);
+}
+`;
+
+/** Mip generation for model textures. */
+export const MIP_WGSL = /* wgsl */ `
+${FULLSCREEN}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  return textureSampleLevel(src, samp, i.uv, 0.0);
 }
 `;

@@ -1,6 +1,7 @@
 import './style.css';
 import { Core, coreModule } from './core';
 import { Renderer, QUALITY_PRESETS, type Quality } from './render/renderer';
+import carModelUrl from './assets/police_crown_osaka_game.glb?url';
 import { add, dirFrom, invert, lookAt, mul, perspectiveRZ, type V3 } from './render/math';
 import { Instances } from './render/instances';
 import { emitPlane } from './render/models';
@@ -124,7 +125,15 @@ function startBackdrop() {
     const c: V3 = [512, 0, 512];
     const eye: V3 = [c[0] + Math.cos(a) * 520, 150, c[2] + Math.sin(a) * 520];
     const dir = dirFrom(Math.atan2(c[0] - eye[0], c[2] - eye[2]), -0.3);
-    const vp = mul(perspectiveRZ(1.0, renderer.aspect, 0.5), lookAt(eye, add(eye, dir), [0, 1, 0]));
+    let vp = mul(perspectiveRZ(1.0, renderer.aspect, 0.5), lookAt(eye, add(eye, dir), [0, 1, 0]));
+    // debug: a fixed camera [x, y, z, yaw, pitch] for looking at the world up close
+    const dbg = (window as unknown as { __zfCam?: number[] }).__zfCam;
+    if (dbg) {
+      eye[0] = dbg[0];
+      eye[1] = dbg[1];
+      eye[2] = dbg[2];
+      vp = mul(perspectiveRZ(1.0, renderer.aspect, 0.08), lookAt(eye, add(eye, dirFrom(dbg[3], dbg[4])), [0, 1, 0]));
+    }
     backdropInst.boxes.reset();
     const pa = t * 0.12;
     emitPlane(backdropInst.boxes, [512 + Math.cos(pa) * 300, 260, 512 + Math.sin(pa) * 300], pa + Math.PI, t);
@@ -133,7 +142,7 @@ function startBackdrop() {
       invViewProj: invert(vp),
       camPos: eye,
       time: t,
-      shadowCenter: [512 + Math.cos(pa) * 300, 230, 512 + Math.sin(pa) * 300],
+      shadowCenter: dbg ? eye : [512 + Math.cos(pa) * 300, 230, 512 + Math.sin(pa) * 300],
       zone: { cx: 512, cz: 512, r: 1, visible: false },
       hurt: 0,
       focus: null,
@@ -157,6 +166,7 @@ async function loadBackdropWorld() {
     heights: h,
     mapSize: 1024,
     waterLevel: 0,
+    cars: core.f32(8),
   });
   core.freeMeshes();
 }
@@ -351,6 +361,8 @@ async function boot() {
   }
   try {
     renderer = await Renderer.create(canvas, pickQuality(settings), new URLSearchParams(location.search).has('offscreen'));
+    // the parked cars appear once their model has loaded
+    renderer.loadCarModel(new URL(carModelUrl, document.baseURI).href).catch((e) => console.warn('car model:', e));
   } catch (e) {
     show('nogpu', true);
     show('menu', false);
@@ -379,6 +391,7 @@ async function boot() {
     (window as unknown as { __zfFrames: () => number }).__zfFrames = () => frames;
     // Test hooks for the end-to-end prediction / input harnesses.
     Object.defineProperty(window, '__game', { get: () => game });
+    Object.defineProperty(window, '__core', { get: () => core });
     Object.defineProperty(window, '__input', { get: () => input });
     Object.defineProperty(window, '__hud', { get: () => hud });
     Object.defineProperty(window, '__settings', { get: () => settings });

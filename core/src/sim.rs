@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 6;
+pub const PROTO: u16 = 7;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -768,7 +768,7 @@ impl Match {
             if name.is_empty() {
                 name = format!("Bot{}", i);
             }
-            let skill = self.rng.range(0.15, 0.85);
+            let skill = self.rng.range(0.1, 0.65);
             let seed = self.rng.u32();
             let color = self.rng.below(12) as u8;
             let p = &mut self.players[i];
@@ -2451,7 +2451,7 @@ impl Match {
                         let l = dv.len();
                         // (stopping just short of the end: walls are 0.3 m
                         // thick, and an impact on the far face is unseen)
-                        l > 0.5 && self.w.raycast(ceye, dv * (1.0 / l), (l - 0.05).max(0.0)).is_some()
+                        l > 0.5 && self.w.raycast(ceye, dv * (1.0 / l), (l - 0.03).max(0.0)).is_some()
                     };
                     if b[27] == 0 || near_wall || unseen {
                         let dir = if e.dir.len() > 0.5 { e.dir } else { (get_v3(&b, 15) - m).norm() };

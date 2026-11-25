@@ -20,6 +20,8 @@ pub const BK_FLOOR: u8 = 2;
 pub const BK_CRATE: u8 = 3;
 pub const BK_CONTAINER: u8 = 4;
 pub const BK_CONCRETE: u8 = 5;
+/// A parked car (drawn from a model by the client; two collision boxes).
+pub const BK_CAR: u8 = 6;
 
 pub const CK_TREE: u8 = 0;
 pub const CK_ROCK: u8 = 1;
@@ -112,6 +114,8 @@ pub struct World {
     pub trees: Vec<Tree>,
     pub rocks: Vec<Rock>,
     pub spots: Vec<Spot>,
+    /// Parked cars: x, y (ground), z, yaw (a multiple of a quarter turn).
+    pub cars: Vec<[f32; 4]>,
     gbox: Vec<Vec<u16>>,
     gcyl: Vec<Vec<u16>>,
     pub checksum: u32,
@@ -173,6 +177,7 @@ impl World {
             spots: Vec::new(),
             gbox: Vec::new(),
             gcyl: Vec::new(),
+            cars: Vec::new(),
             checksum: 0,
         };
 
@@ -339,6 +344,43 @@ impl World {
                 if rng.chance(0.5) && !w.spot_blocked(x + 1.2, y + 0.3, z, 0) {
                     w.spots.push(Spot { pos: V3::new(x + 1.2, y + 0.05, z), tier: t.kind });
                 }
+            }
+            // parked cars (their own random stream, so adding them moved
+            // nothing else in the world)
+            let mut crng = Rng::new((seed as u64) << 8 ^ 0xCA75 ^ ti as u64);
+            let want = 2 + crng.below(2) as usize;
+            let mut placed = 0;
+            for _ in 0..40 {
+                if placed >= want {
+                    break;
+                }
+                let a = crng.range(0.0, TAU);
+                let rr = crng.range(6.0, (t.r - 4.0).max(7.0));
+                let (x, z) = (t.x + a.cos() * rr, t.z + a.sin() * rr);
+                let quarter = crng.below(4);
+                // half extents on x / z (the car is 4.9 m long, 1.8 m wide)
+                let (hx, hz) = if quarter % 2 == 0 { (0.9, 2.45) } else { (2.45, 0.9) };
+                let m = 1.6;
+                if w.buildings.iter().any(|b| x + hx > b.x0 - m && x - hx < b.x1 + m && z + hz > b.z0 - m && z - hz < b.z1 + m) {
+                    continue;
+                }
+                if w.boxes.iter().any(|b| x + hx > b.min.x - m && x - hx < b.max.x + m && z + hz > b.min.z - m && z - hz < b.max.z + m) {
+                    continue;
+                }
+                let (lo, hi) = (w.min_height_rect(x - hx, z - hz, x + hx, z + hz), w.max_height_rect(x - hx, z - hz, x + hx, z + hz));
+                if hi - lo > 0.25 || lo < 1.0 {
+                    continue;
+                }
+                let y = hi;
+                let yaw = quarter as f32 * (TAU / 4.0);
+                // body up to the bonnet, then the cabin (set back a little)
+                w.boxes.push(Bx { min: V3::new(x - hx, lo - 0.2, z - hz), max: V3::new(x + hx, y + 0.98, z + hz), kind: BK_CAR, col: 0x1B1E22 });
+                let (f, cab) = (fwd(yaw), 1.25);
+                let (cx, cz) = (x - f.x * 0.25, z - f.z * 0.25);
+                let (chx, chz) = if quarter % 2 == 0 { (0.8, cab) } else { (cab, 0.8) };
+                w.boxes.push(Bx { min: V3::new(cx - chx, y + 0.98, cz - chz), max: V3::new(cx + chx, y + 1.45, cz + chz), kind: BK_CAR, col: 0x1B1E22 });
+                w.cars.push([x, y, z, yaw]);
+                placed += 1;
             }
             // military perimeter wall
             if t.kind == 2 {

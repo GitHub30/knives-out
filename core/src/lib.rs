@@ -203,7 +203,7 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
 }
 
 /// kind: 0 terrain verts(u32) 1 terrain indices(u32) 2 terrain chunks(f32)
-///       3 prop verts(u32) 4 prop chunks(f32) 5 minimap rgba(u8) 6 weapon defs(f32) 7 towns(f32)
+///       3 prop verts(u32) 4 prop chunks(f32) 5 minimap rgba(u8) 6 weapon defs(f32) 7 towns(f32) 8 cars(f32 x4: x y z yaw)
 #[no_mangle]
 pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
     let Some(c) = client() else { return std::ptr::null() };
@@ -216,6 +216,7 @@ pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
         5 => c.meshes.map.as_ptr(),
         6 => c.wdefs.as_ptr() as *const u8,
         7 => c.towns.as_ptr() as *const u8,
+        8 => c.world.cars.as_ptr() as *const u8,
         _ => std::ptr::null(),
     }
 }
@@ -233,6 +234,7 @@ pub extern "C" fn cli_mesh_len(kind: u32) -> u32 {
         5 => c.meshes.map.len(),
         6 => c.wdefs.len() * 4,
         7 => c.towns.len() * 4,
+        8 => c.world.cars.len() * 16,
         _ => 0,
     }) as u32
 }

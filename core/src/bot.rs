@@ -212,7 +212,7 @@ fn pick_slot(p: &Player, dist: f32) -> u8 {
 fn find_target(m: &Match, i: usize, b: &Brain) -> u8 {
     let p = &m.players[i];
     let eye = p.ms.pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
-    let view = 100.0 + 130.0 * b.skill;
+    let view = 80.0 + 110.0 * b.skill;
     let f = fwd(b.yaw);
     let mut best = (255u8, f32::MAX);
     for j in 0..MAX_PLAYERS {
@@ -673,13 +673,13 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let q = &m.players[b.target as usize];
     let pos = p.ms.pos;
     let eye = pos + V3::new(0.0, eye_h(p.ms.crouch), 0.0);
-    let aim = if b.skill > 0.7 && b.rng.chance(0.02) {
+    let aim = if b.skill > 0.7 && b.rng.chance(0.01) {
         body_pose(q.ms.pos, q.yaw, q.pitch, q.ms.crouch, q.draw_speed > SPRINT_DRAW_SPEED, q.ms.mode).head
     } else {
         q.ms.pos + V3::new(0.0, if q.ms.crouch { 0.85 } else { 1.2 }, 0.0)
     };
     // lead the target a little based on skill
-    let lead = q.ms.vel * (0.06 * b.skill);
+    let lead = q.ms.vel * (0.03 * b.skill);
     let tp = aim + lead;
     let dist = (tp - eye).len();
     // Shots leave from the shoulder camera ray (or the eye when scoped), so
@@ -697,7 +697,8 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     c.buttons = (c.buttons & !(3 << 8)) | ((b.slot as u16 + 1) << 8);
 
     if b.aim_t <= 0.0 {
-        let base = (1.15 - b.skill) * 0.1 + q.ms.vel.len_xz() * 0.004 + if p.ms.vel.len_xz() > 1.0 { 0.012 } else { 0.0 };
+        // aim wander: wide enough that a moving player is missed most of the time
+        let base = (1.15 - b.skill) * 0.17 + q.ms.vel.len_xz() * 0.008 + if p.ms.vel.len_xz() > 1.0 { 0.02 } else { 0.0 };
         b.aim_tx = b.rng.range(-base, base);
         b.aim_ty = b.rng.range(-base * 0.6, base * 0.6);
         b.aim_t = b.rng.range(0.25, 0.6);
@@ -706,7 +707,7 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     b.aim_ey = lerpf(b.aim_ey, b.aim_ty, 0.12);
     let want_yaw = yaw_to(to.x, to.z) + b.aim_ex;
     let want_pitch = (to.y / to.len_xz().max(0.1)).atan() + b.aim_ey;
-    let turn = (2.2 + 5.0 * b.skill) * DT;
+    let turn = (1.8 + 3.6 * b.skill) * DT;
     b.yaw = turn_toward(b.yaw, want_yaw, turn);
     b.pitch = approach(b.pitch, want_pitch, turn);
     c.yaw = b.yaw;
@@ -716,7 +717,7 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
     let wk = p.weapon();
     let def = WD[wk as usize];
     let mag = if p.cur < 2 { p.slots[p.cur as usize].1 } else { 0 };
-    let react = 0.95 - 0.5 * b.skill;
+    let react = 1.3 - 0.5 * b.skill;
     let in_range = if wk == W_FISTS { dist < 1.9 } else { dist < def.range * 0.8 };
     if wk != W_FISTS && dist > 22.0 && def.zoom > 1.5 && p.ms.on_ground {
         c.buttons |= B_ADS;
@@ -730,10 +731,10 @@ fn fight(m: &Match, i: usize, b: &mut Brain, c: &mut Cmd) {
         } else {
             c.buttons |= B_FIRE;
             b.burst_t += DT;
-            let burst_len = if dist < 20.0 { 1.0 } else { 0.3 + b.skill * 0.45 };
+            let burst_len = if dist < 12.0 { 0.8 } else { 0.25 + b.skill * 0.4 };
             if b.burst_t > burst_len {
                 b.burst_t = 0.0;
-                b.pause_t = b.rng.range(0.12, 0.45) * (1.4 - b.skill);
+                b.pause_t = b.rng.range(0.25, 0.7) * (1.4 - b.skill);
             }
         }
     }

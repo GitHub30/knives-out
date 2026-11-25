@@ -280,6 +280,7 @@ export class Game {
       heights: this.heightsFromCore(),
       mapSize: 1024,
       waterLevel: 0,
+      cars: core.f32(8),
     });
     this.d.hud.setMap(core.bytes(5), 512);
     core.freeMeshes();

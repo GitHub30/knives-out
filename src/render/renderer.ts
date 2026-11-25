@@ -1,21 +1,29 @@
-// Raw WebGPU renderer: shadow-mapped static world, instanced boxes, sky, water, zone wall.
+// Raw WebGPU renderer: an HDR scene pass (static world, instanced shapes, glTF
+// models, sky, water, zone wall) lit by a sun with two shadow cascades, then
+// bloom + tonemap + FXAA into the swap chain.
 
-import { BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, type M4, type V3 } from './math';
-import { Instances, INSTANCE_STRIDE } from './instances';
+import { Instances, INSTANCE_STRIDE, SHAPE_COUNT } from './instances';
+import { pill, rod, roundedBox, sphere } from './shapes';
+import { loadGlb, type GltfModel } from './gltf';
 
 export interface Quality {
   shadowSize: number; // 0 disables shadows
-  msaa: 1 | 4;
   scale: number; // render resolution multiplier (applied on top of capped DPR)
   maxDpr: number;
+  /** Upper bound of rendered pixels (the internal resolution never exceeds it). */
+  maxPixels: number;
   drawDist: number;
+  bloom: boolean;
+  ao: boolean;
 }
 
 export const QUALITY_PRESETS: Record<'low' | 'medium' | 'high', Quality> = {
-  low: { shadowSize: 0, msaa: 1, scale: 0.75, maxDpr: 1.5, drawDist: 420 },
-  medium: { shadowSize: 1024, msaa: 1, scale: 1, maxDpr: 1.75, drawDist: 560 },
-  high: { shadowSize: 2048, msaa: 4, scale: 1, maxDpr: 2, drawDist: 760 },
+  low: { shadowSize: 1024, scale: 0.8, maxDpr: 1.25, maxPixels: 1280 * 720, drawDist: 380, bloom: false, ao: false },
+  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true },
+  // 1920 x 1080 internal resolution at most
+  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true },
 };
 
 export interface WorldMeshes {
@@ -27,6 +35,8 @@ export interface WorldMeshes {
   heights: Float32Array; // 257 x 257
   mapSize: number;
   waterLevel: number;
+  /** Parked cars: x, y, z, yaw per car. */
+  cars?: Float32Array;
 }
 
 export interface FrameView {
@@ -45,6 +55,9 @@ export interface FrameView {
 }
 
 const SUN = norm([-0.42, 0.78, -0.46]);
+const HDR: GPUTextureFormat = 'rgba16float';
+const CASCADE_R = [38, 190];
+const U_FLOATS = 116;
 
 interface Chunk {
   first: number;
@@ -91,6 +104,12 @@ function cylinderVerts(seg: number): Float32Array {
   return new Float32Array(out);
 }
 
+interface ModelGpu {
+  vb: GPUBuffer;
+  ib: GPUBuffer;
+  parts: { first: number; count: number; blend: boolean; bg: GPUBindGroup }[];
+}
+
 export class Renderer {
   readonly canvas: HTMLCanvasElement;
   readonly device: GPUDevice;
@@ -98,21 +117,37 @@ export class Renderer {
   readonly format: GPUTextureFormat;
   quality: Quality;
   lost = false;
+  /** Triangles submitted in the last frame's main pass (debug overlay / tests). */
+  stats = { tris: 0, draws: 0, width: 0, height: 0, scale: 1 };
 
   private uniform: GPUBuffer;
-  private uData = new Float32Array(88);
+  private uniformSh1: GPUBuffer;
+  private uData = new Float32Array(U_FLOATS);
   private bglMain: GPUBindGroupLayout;
   private bglShadow: GPUBindGroupLayout;
   private bglWater: GPUBindGroupLayout;
-  private bgShadow: GPUBindGroup;
+  private bglMat: GPUBindGroupLayout;
+  private bglTex: GPUBindGroupLayout;
+  private bglPost: GPUBindGroupLayout;
+  private bglAo: GPUBindGroupLayout;
+  private bgAo: GPUBindGroup | null = null;
+  private aoTex: GPUTexture | null = null;
+  private bgShadow: GPUBindGroup[] = [];
   private bgMain!: GPUBindGroup;
   private bgWater!: GPUBindGroup;
+  private bgPost: GPUBindGroup | null = null;
+  private bgBloom: GPUBindGroup[] = [];
   private shadowTex!: GPUTexture;
+  private shadowViews: GPUTextureView[] = [];
   private shadowSampler: GPUSampler;
+  private linear: GPUSampler;
+  private aniso: GPUSampler;
   private depthTex: GPUTexture | null = null;
-  private msaaTex: GPUTexture | null = null;
+  private hdrTex: GPUTexture | null = null;
+  private bloomTex: GPUTexture[] = [];
   private offTex: GPUTexture | null = null;
   private pipes!: Record<string, GPURenderPipeline>;
+  private shapeVB: { buf: GPUBuffer; count: number }[] = [];
   private cubeVB: GPUBuffer;
   private zoneVB: GPUBuffer;
   private zoneCount: number;
@@ -128,6 +163,16 @@ export class Renderer {
   private width = 0;
   private height = 0;
   private captureReq: ((img: { w: number; h: number; rgba: Uint8Array }) => void) | null = null;
+  private carModel: ModelGpu | null = null;
+  private cars: Float32Array = new Float32Array(0);
+  private carInst: GPUBuffer | null = null;
+  private carData = new Float32Array(0);
+  // dynamic resolution
+  private dyn = 1;
+  private lastT = 0;
+  private slowT = 0;
+  private fastT = 0;
+  private avgMs = 16;
 
   /** Debug: render the next frame into a readable texture and return RGBA pixels. */
   capture(): Promise<{ w: number; h: number; rgba: Uint8Array }> {
@@ -165,30 +210,70 @@ export class Renderer {
       if (reported++ < 10) console.error('WebGPU error:', (e as GPUUncapturedErrorEvent).error.message);
     });
 
-    this.uniform = device.createBuffer({ size: 352, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const usize = U_FLOATS * 4;
+    this.uniform = device.createBuffer({ size: usize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uniformSh1 = device.createBuffer({ size: usize, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
     this.bglMain = device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+        { binding: 0, visibility: VF, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth', viewDimension: '2d-array' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
       ],
     });
-    this.bglShadow = device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
-    });
+    this.bglShadow = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: VF, buffer: { type: 'uniform' } }] });
     this.bglWater = device.createBindGroupLayout({
       entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } }],
     });
-    this.bgShadow = device.createBindGroup({ layout: this.bglShadow, entries: [{ binding: 0, resource: { buffer: this.uniform } }] });
+    this.bglMat = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+      ],
+    });
+    this.bglTex = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      ],
+    });
+    this.bglPost = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+      ],
+    });
+    this.bglAo = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+      ],
+    });
+    this.bgShadow = [this.uniform, this.uniformSh1].map((buffer) => device.createBindGroup({ layout: this.bglShadow, entries: [{ binding: 0, resource: { buffer } }] }));
     this.shadowSampler = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
+    this.linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+    this.aniso = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 4 });
 
-    const cube = cubeVerts();
-    this.cubeVB = device.createBuffer({ size: cube.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(this.cubeVB, 0, cube);
+    const mkVB = (data: Float32Array) => {
+      const buf = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(buf, 0, data);
+      return buf;
+    };
+    this.cubeVB = mkVB(cubeVerts());
+    for (const mesh of [roundedBox(), sphere(), pill(), rod()]) this.shapeVB.push({ buf: mkVB(mesh), count: mesh.length / 6 });
     const cyl = cylinderVerts(160);
     this.zoneCount = cyl.length / 3;
-    this.zoneVB = device.createBuffer({ size: cyl.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(this.zoneVB, 0, cyl);
+    this.zoneVB = mkVB(cyl);
 
     this.makeShadowTex();
     this.buildPipelines();
@@ -199,38 +284,43 @@ export class Renderer {
     this.shadowTex?.destroy();
     const size = Math.max(1, this.quality.shadowSize);
     this.shadowTex = this.device.createTexture({
-      size: [size, size],
+      size: [size, size, 2],
       format: 'depth32float',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+    this.shadowViews = [0, 1].map((k) => this.shadowTex.createView({ dimension: '2d', baseArrayLayer: k, arrayLayerCount: 1 }));
     this.bgMain = this.device.createBindGroup({
       layout: this.bglMain,
       entries: [
         { binding: 0, resource: { buffer: this.uniform } },
-        { binding: 1, resource: this.shadowTex.createView() },
+        { binding: 1, resource: this.shadowTex.createView({ dimension: '2d-array' }) },
         { binding: 2, resource: this.shadowSampler },
       ],
     });
   }
 
   setQuality(q: Quality) {
-    const rebuild = q.msaa !== this.quality.msaa;
     const reshadow = q.shadowSize !== this.quality.shadowSize;
     this.quality = q;
+    this.dyn = 1;
     if (reshadow) this.makeShadowTex();
-    if (rebuild) this.buildPipelines();
     this.resize(true);
   }
 
   private buildPipelines() {
     const d = this.device;
-    const sample = this.quality.msaa;
     const mod = (code: string) => d.createShaderModule({ code });
     const lit = mod(LIT_WGSL), litSh = mod(LIT_SHADOW_WGSL), box = mod(BOX_WGSL), boxSh = mod(BOX_SHADOW_WGSL);
+    const model = mod(MODEL_WGSL), modelSh = mod(MODEL_SHADOW_WGSL);
     const sky = mod(SKY_WGSL), water = mod(WATER_WGSL), zone = mod(ZONE_WGSL);
+    const bloom = mod(BLOOM_WGSL), post = mod(POST_WGSL), mip = mod(MIP_WGSL), ao = mod(AO_WGSL);
+    const layoutAo = d.createPipelineLayout({ bindGroupLayouts: [this.bglAo] });
     const layoutMain = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain] });
     const layoutShadow = d.createPipelineLayout({ bindGroupLayouts: [this.bglShadow] });
     const layoutWater = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglWater] });
+    const layoutModel = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglMat] });
+    const layoutTex = d.createPipelineLayout({ bindGroupLayouts: [this.bglTex] });
+    const layoutPost = d.createPipelineLayout({ bindGroupLayouts: [this.bglPost] });
     const litVB: GPUVertexBufferLayout = {
       arrayStride: 20,
       attributes: [
@@ -249,11 +339,31 @@ export class Renderer {
           { shaderLocation: 3, offset: 12, format: 'float32x4' },
           { shaderLocation: 4, offset: 28, format: 'float32x3' },
           { shaderLocation: 5, offset: 40, format: 'unorm8x4' },
+          { shaderLocation: 6, offset: 44, format: 'unorm8x4' },
+        ],
+      },
+    ];
+    const modelVB: GPUVertexBufferLayout[] = [
+      {
+        arrayStride: 48,
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x3' },
+          { shaderLocation: 2, offset: 24, format: 'float32x4' },
+          { shaderLocation: 3, offset: 40, format: 'float32x2' },
+        ],
+      },
+      {
+        arrayStride: 28,
+        stepMode: 'instance',
+        attributes: [
+          { shaderLocation: 4, offset: 0, format: 'float32x3' },
+          { shaderLocation: 5, offset: 12, format: 'float32x4' },
         ],
       },
     ];
     const depthMain = (write: boolean, compare: GPUCompareFunction = 'greater'): GPUDepthStencilState => ({ format: 'depth32float', depthWriteEnabled: write, depthCompare: compare });
-    const target = (blend?: GPUBlendState): GPUColorTargetState[] => [{ format: this.format, blend }];
+    const target = (blend?: GPUBlendState): GPUColorTargetState[] => [{ format: HDR, blend }];
     const alpha: GPUBlendState = {
       color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
       alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -262,24 +372,24 @@ export class Renderer {
       color: { srcFactor: 'src-alpha', dstFactor: 'one', operation: 'add' },
       alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' },
     };
-    const ms = { count: sample };
-    const shadowDepth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 3, depthBiasSlopeScale: 2.5 };
+    const shadowDepth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2.0 };
+    const tri: GPUPrimitiveState = { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' };
+    const fullscreen = (module: GPUShaderModule, entryPoint: string, layout: GPUPipelineLayout, format: GPUTextureFormat) =>
+      d.createRenderPipeline({ layout, vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint, targets: [{ format }] }, primitive: { topology: 'triangle-list' } });
     this.pipes = {
       terrain: d.createRenderPipeline({
         layout: layoutMain,
         vertex: { module: lit, entryPoint: 'vs', buffers: [litVB] },
         fragment: { module: lit, entryPoint: 'fs_terrain', targets: target() },
-        primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+        primitive: tri,
         depthStencil: depthMain(true),
-        multisample: ms,
       }),
       props: d.createRenderPipeline({
         layout: layoutMain,
         vertex: { module: lit, entryPoint: 'vs', buffers: [litVB] },
         fragment: { module: lit, entryPoint: 'fs_props', targets: target() },
-        primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+        primitive: tri,
         depthStencil: depthMain(true),
-        multisample: ms,
       }),
       litShadow: d.createRenderPipeline({
         layout: layoutShadow,
@@ -291,13 +401,32 @@ export class Renderer {
         layout: layoutMain,
         vertex: { module: box, entryPoint: 'vs', buffers: boxVB },
         fragment: { module: box, entryPoint: 'fs', targets: target() },
-        primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+        primitive: tri,
         depthStencil: depthMain(true),
-        multisample: ms,
       }),
       boxShadow: d.createRenderPipeline({
         layout: layoutShadow,
         vertex: { module: boxSh, entryPoint: 'vs', buffers: boxVB },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: shadowDepth,
+      }),
+      model: d.createRenderPipeline({
+        layout: layoutModel,
+        vertex: { module: model, entryPoint: 'vs', buffers: modelVB },
+        fragment: { module: model, entryPoint: 'fs', targets: target() },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depthMain(true),
+      }),
+      modelBlend: d.createRenderPipeline({
+        layout: layoutModel,
+        vertex: { module: model, entryPoint: 'vs', buffers: modelVB },
+        fragment: { module: model, entryPoint: 'fs_blend', targets: target(alpha) },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depthMain(false),
+      }),
+      modelShadow: d.createRenderPipeline({
+        layout: layoutShadow,
+        vertex: { module: modelSh, entryPoint: 'vs', buffers: modelVB },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: shadowDepth,
       }),
@@ -307,15 +436,13 @@ export class Renderer {
         fragment: { module: box, entryPoint: 'fs_glow', targets: target(additive) },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depthMain(false),
-        multisample: ms,
       }),
       smoke: d.createRenderPipeline({
         layout: layoutMain,
         vertex: { module: box, entryPoint: 'vs', buffers: boxVB },
         fragment: { module: box, entryPoint: 'fs_smoke', targets: target(alpha) },
-        primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+        primitive: tri,
         depthStencil: depthMain(false),
-        multisample: ms,
       }),
       sky: d.createRenderPipeline({
         layout: layoutMain,
@@ -323,7 +450,6 @@ export class Renderer {
         fragment: { module: sky, entryPoint: 'fs', targets: target() },
         primitive: { topology: 'triangle-list' },
         depthStencil: depthMain(false, 'always'),
-        multisample: ms,
       }),
       water: d.createRenderPipeline({
         layout: layoutWater,
@@ -331,7 +457,6 @@ export class Renderer {
         fragment: { module: water, entryPoint: 'fs', targets: target(alpha) },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depthMain(false),
-        multisample: ms,
       }),
       zone: d.createRenderPipeline({
         layout: layoutMain,
@@ -339,8 +464,13 @@ export class Renderer {
         fragment: { module: zone, entryPoint: 'fs', targets: target(alpha) },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depthMain(false),
-        multisample: ms,
       }),
+      bloomFirst: fullscreen(bloom, 'fs_first', layoutTex, HDR),
+      bloomDown: fullscreen(bloom, 'fs_down', layoutTex, HDR),
+      post: fullscreen(post, 'fs', layoutPost, this.format),
+      ao: fullscreen(ao, 'fs', layoutAo, 'r8unorm'),
+      mipLinear: fullscreen(mip, 'fs', layoutTex, 'rgba8unorm'),
+      mipSrgb: fullscreen(mip, 'fs', layoutTex, 'rgba8unorm-srgb'),
     };
   }
 
@@ -362,50 +492,180 @@ export class Renderer {
     this.pChunks = readChunks(w.propChunks, 8);
     this.mapSize = w.mapSize;
     this.waterLevel = w.waterLevel;
+    this.cars = w.cars ?? new Float32Array(0);
     this.heightTex?.destroy();
     this.heightTex = d.createTexture({ size: [257, 257], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     d.queue.writeTexture({ texture: this.heightTex }, w.heights.buffer, { offset: w.heights.byteOffset, bytesPerRow: 257 * 4, rowsPerImage: 257 }, [257, 257]);
     this.bgWater = d.createBindGroup({ layout: this.bglWater, entries: [{ binding: 0, resource: this.heightTex.createView() }] });
   }
 
+  // ------------------------------------------------------------------ models
+  private texture(img: ImageBitmap | null, srgb: boolean, fallback: [number, number, number, number]): GPUTexture {
+    const d = this.device;
+    const format: GPUTextureFormat = srgb ? 'rgba8unorm-srgb' : 'rgba8unorm';
+    if (!img) {
+      const t = d.createTexture({ size: [1, 1], format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      d.queue.writeTexture({ texture: t }, new Uint8Array(fallback), {}, [1, 1]);
+      return t;
+    }
+    const mips = Math.floor(Math.log2(Math.max(img.width, img.height))) + 1;
+    const t = d.createTexture({
+      size: [img.width, img.height],
+      format,
+      mipLevelCount: mips,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    d.queue.copyExternalImageToTexture({ source: img }, { texture: t }, [img.width, img.height]);
+    const enc = d.createCommandEncoder();
+    const pipe = srgb ? this.pipes.mipSrgb : this.pipes.mipLinear;
+    for (let l = 1; l < mips; l++) {
+      const bg = d.createBindGroup({
+        layout: this.bglTex,
+        entries: [
+          { binding: 0, resource: t.createView({ baseMipLevel: l - 1, mipLevelCount: 1 }) },
+          { binding: 1, resource: this.linear },
+        ],
+      });
+      const p = enc.beginRenderPass({ colorAttachments: [{ view: t.createView({ baseMipLevel: l, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store' }] });
+      p.setPipeline(pipe);
+      p.setBindGroup(0, bg);
+      p.draw(3);
+      p.end();
+    }
+    d.queue.submit([enc.finish()]);
+    return t;
+  }
+
+  private uploadModel(m: GltfModel): ModelGpu {
+    const d = this.device;
+    const vb = d.createBuffer({ size: m.verts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(vb, 0, m.verts);
+    const ib = d.createBuffer({ size: m.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(ib, 0, m.indices);
+    const parts = m.parts.map((p) => {
+      const mat = m.materials[p.material];
+      const textured = !!mat.baseTex;
+      const u = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      d.queue.writeBuffer(u, 0, new Float32Array([...mat.base, ...mat.emissive, 0, mat.metallic, mat.roughness, textured ? 1 : 0, 0]));
+      const bg = d.createBindGroup({
+        layout: this.bglMat,
+        entries: [
+          { binding: 0, resource: { buffer: u } },
+          { binding: 1, resource: this.aniso },
+          { binding: 2, resource: this.texture(mat.baseTex, true, [255, 255, 255, 255]).createView() },
+          { binding: 3, resource: this.texture(mat.normalTex, false, [128, 128, 255, 255]).createView() },
+          { binding: 4, resource: this.texture(mat.ormTex, false, [255, 255, 255, 255]).createView() },
+          { binding: 5, resource: this.texture(mat.emissiveTex, true, [0, 0, 0, 255]).createView() },
+        ],
+      });
+      return { first: p.first, count: p.count, blend: mat.blend, bg };
+    });
+    // opaque parts first
+    parts.sort((a, b) => Number(a.blend) - Number(b.blend));
+    return { vb, ib, parts };
+  }
+
+  /** Load the parked-car model (drawn at the world's car spots once it is ready). */
+  async loadCarModel(url: string): Promise<void> {
+    const m = await loadGlb(url);
+    if (this.lost) return;
+    this.carModel = this.uploadModel(m);
+  }
+
+  // ------------------------------------------------------------------ targets
   resize(force = false) {
     const dpr = Math.min(window.devicePixelRatio || 1, this.quality.maxDpr) * this.quality.scale;
-    const w = Math.max(1, Math.floor(this.canvas.clientWidth * dpr));
-    const h = Math.max(1, Math.floor(this.canvas.clientHeight * dpr));
+    let w = Math.max(1, this.canvas.clientWidth * dpr);
+    let h = Math.max(1, this.canvas.clientHeight * dpr);
+    // never above the pixel budget (1920 x 1080 on high), then the dynamic scale
+    const k = Math.min(1, Math.sqrt(this.quality.maxPixels / (w * h))) * this.dyn;
+    w = Math.max(1, Math.floor(w * k));
+    h = Math.max(1, Math.floor(h * k));
     if (!force && w === this.width && h === this.height && this.depthTex) return;
     this.width = w;
     this.height = h;
     this.canvas.width = w;
     this.canvas.height = h;
+    const d = this.device;
     this.depthTex?.destroy();
-    this.msaaTex?.destroy();
+    this.hdrTex?.destroy();
     this.offTex?.destroy();
-    this.offTex = this.ctx ? null : this.device.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT });
-    const sc = this.quality.msaa;
-    this.depthTex = this.device.createTexture({ size: [w, h], format: 'depth32float', sampleCount: sc, usage: GPUTextureUsage.RENDER_ATTACHMENT });
-    this.msaaTex = sc > 1 ? this.device.createTexture({ size: [w, h], format: this.format, sampleCount: sc, usage: GPUTextureUsage.RENDER_ATTACHMENT }) : null;
+    for (const t of this.bloomTex) t.destroy();
+    this.offTex = this.ctx ? null : d.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    this.depthTex = d.createTexture({ size: [w, h], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.aoTex?.destroy();
+    this.aoTex = d.createTexture({ size: [Math.max(1, w >> 1), Math.max(1, h >> 1)], format: 'r8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.bgAo = d.createBindGroup({ layout: this.bglAo, entries: [{ binding: 0, resource: { buffer: this.uniform } }, { binding: 1, resource: this.depthTex.createView() }] });
+    this.hdrTex = d.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.bloomTex = [];
+    for (let l = 1; l <= 4; l++) {
+      this.bloomTex.push(d.createTexture({ size: [Math.max(1, w >> l), Math.max(1, h >> l)], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }));
+    }
+    const texBg = (t: GPUTexture) =>
+      d.createBindGroup({ layout: this.bglTex, entries: [{ binding: 0, resource: t.createView() }, { binding: 1, resource: this.linear }] });
+    this.bgBloom = [texBg(this.hdrTex), texBg(this.bloomTex[0]), texBg(this.bloomTex[1]), texBg(this.bloomTex[2])];
+    this.bgPost = d.createBindGroup({
+      layout: this.bglPost,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniform } },
+        { binding: 1, resource: this.hdrTex.createView() },
+        { binding: 2, resource: this.linear },
+        ...this.bloomTex.map((t, i) => ({ binding: 3 + i, resource: t.createView() })),
+        { binding: 7, resource: this.aoTex.createView() },
+      ],
+    });
   }
 
   get aspect() {
     return this.width / Math.max(1, this.height);
   }
 
-  private instBuffer(name: string, inst: Instances): GPUBuffer | null {
-    if (inst.count === 0) return null;
-    const bytes = inst.count * INSTANCE_STRIDE;
+  /** Hold 30 fps: lower the internal resolution when frames run long, raise it back when there is room. */
+  private adapt() {
+    const now = performance.now();
+    const ms = this.lastT ? now - this.lastT : 16;
+    this.lastT = now;
+    if (!this.ctx || ms > 500) return;
+    this.avgMs += (ms - this.avgMs) * 0.1;
+    const dt = ms / 1000;
+    if (this.avgMs > 36) {
+      this.slowT += dt;
+      this.fastT = 0;
+    } else if (this.avgMs < 22) {
+      this.fastT += dt;
+      this.slowT = 0;
+    } else {
+      this.slowT = this.fastT = 0;
+    }
+    if (this.slowT > 1.5 && this.dyn > 0.5) {
+      this.dyn = Math.max(0.5, this.dyn * 0.87);
+      this.slowT = 0;
+      this.resize();
+    } else if (this.fastT > 6 && this.dyn < 1) {
+      this.dyn = Math.min(1, this.dyn / 0.93);
+      this.fastT = 0;
+      this.resize();
+    }
+  }
+
+  private instBuffer(name: string, data: ArrayBuffer, bytes: number): GPUBuffer | null {
+    if (bytes === 0) return null;
     let e = this.instBufs[name];
     if (!e || e.size < bytes) {
       e?.buf.destroy();
-      const size = Math.max(bytes, 64 * 1024) * 1.5;
-      e = { buf: this.device.createBuffer({ size: Math.ceil(size / 4) * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST }), size: Math.ceil(size / 4) * 4 };
+      const size = Math.ceil((Math.max(bytes, 16 * 1024) * 1.5) / 4) * 4;
+      e = { buf: this.device.createBuffer({ size, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST }), size };
       this.instBufs[name] = e;
     }
-    this.device.queue.writeBuffer(e.buf, 0, inst.buf, 0, bytes);
+    this.device.queue.writeBuffer(e.buf, 0, data, 0, bytes);
     return e.buf;
   }
 
-  private lightMatrix(center: V3): M4 {
-    const R = 75;
+  private shapeBuffers(name: string, inst: Instances): (GPUBuffer | null)[] {
+    return inst.lists.map((l, k) => this.instBuffer(`${name}${k}`, l.buf, l.count * INSTANCE_STRIDE));
+  }
+
+  private lightMatrix(center: V3, R: number): M4 {
     const res = Math.max(1, this.quality.shadowSize);
     const up: V3 = [0, 1, 0];
     // snap the center to shadow texels to avoid shimmering
@@ -418,89 +678,133 @@ export class Renderer {
     const sx = Math.round(px / texel) * texel - px;
     const sy = Math.round(py / texel) * texel - py;
     const c: V3 = [center[0] + x[0] * sx + y[0] * sy, center[1] + x[1] * sx + y[1] * sy, center[2] + x[2] * sx + y[2] * sy];
-    const eye: V3 = [c[0] + SUN[0] * 400, c[1] + SUN[1] * 400, c[2] + SUN[2] * 400];
+    const eye: V3 = [c[0] + SUN[0] * 500, c[1] + SUN[1] * 500, c[2] + SUN[2] * 500];
     const view = lookAt(eye, c, up);
-    const proj = ortho(-R, R, -R, R, 10, 800);
+    const proj = ortho(-R, R, -R, R, 10, 1000);
     return mul(proj, view);
   }
 
   private inflight = false;
 
   render(v: FrameView) {
-    if (this.lost || !this.depthTex || !this.terrainVB || !this.terrainIB || !this.propVB) return;
+    if (this.lost || !this.depthTex || !this.hdrTex || !this.terrainVB || !this.terrainIB || !this.propVB) return;
     // Offscreen (test) mode has no swap-chain back-pressure: keep one frame in flight.
     if (!this.ctx && this.inflight && !this.captureReq) return;
+    this.adapt();
     this.resize();
     const d = this.device;
     const shadowsOn = this.quality.shadowSize > 0;
-    const lightVP = this.lightMatrix(v.shadowCenter);
+    const lightVP = [this.lightMatrix(v.shadowCenter, CASCADE_R[0]), this.lightMatrix(v.shadowCenter, CASCADE_R[1])];
     const u = this.uData;
     u.set(v.viewProj, 0);
-    u.set(lightVP, 16);
-    u.set(v.invViewProj, 32);
-    u.set([v.camPos[0], v.camPos[1], v.camPos[2], v.time], 48);
-    u.set([SUN[0], SUN[1], SUN[2], shadowsOn ? 1 : 0], 52);
+    u.set(lightVP[0], 16);
+    u.set(lightVP[1], 32);
+    u.set(v.invViewProj, 48);
+    u.set([v.camPos[0], v.camPos[1], v.camPos[2], v.time], 64);
+    u.set([SUN[0], SUN[1], SUN[2], shadowsOn ? 1 : 0], 68);
     const lin = (c: number) => Math.pow(c, 2.2);
-    u.set([1.25, 1.17, 1.05, 0.9], 56);
-    u.set([lin(0.7), lin(0.78), lin(0.86), 1 / 1100], 60);
-    u.set([lin(0.27), lin(0.5), lin(0.84), 1], 64);
-    u.set([lin(0.74), lin(0.82), lin(0.9), 1], 68);
-    u.set([1 / Math.max(1, this.quality.shadowSize), this.mapSize, v.hurt, this.waterLevel], 72);
-    u.set([v.zone.cx, v.zone.cz, Math.max(0.01, v.zone.r), v.zone.visible ? 1 : 0], 76);
-    u.set(v.focus ? [v.focus[0], v.focus[1], v.focus[2], 1] : [0, 0, 0, 0], 80);
+    u.set([3.6, 3.3, 2.85, 1.0], 72); // sun radiance (HDR), ambient scale
+    u.set([lin(0.66), lin(0.75), lin(0.86), 1 / 1500], 76);
+    u.set([lin(0.2), lin(0.42), lin(0.82), 1], 80);
+    u.set([lin(0.62), lin(0.76), lin(0.92), 1], 84);
+    u.set([1 / Math.max(1, this.quality.shadowSize), this.mapSize, v.hurt, this.waterLevel], 88);
+    u.set([v.zone.cx, v.zone.cz, Math.max(0.01, v.zone.r), v.zone.visible ? 1 : 0], 92);
+    u.set(v.focus ? [v.focus[0], v.focus[1], v.focus[2], 1] : [0, 0, 0, 0], 96);
+    u.set([1 / this.width, 1 / this.height, this.quality.bloom ? 0.55 : 0, 0.62], 100);
+    // view rays for the sky, worked out here in double precision (the shader
+    // would lose them to cancellation next to the camera)
+    {
+      const m = v.invViewProj;
+      const at = (x: number, y: number): V3 => {
+        const z = 0.001;
+        const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+        return [(m[0] * x + m[4] * y + m[8] * z + m[12]) / w - v.camPos[0], (m[1] * x + m[5] * y + m[9] * z + m[13]) / w - v.camPos[1], (m[2] * x + m[6] * y + m[10] * z + m[14]) / w - v.camPos[2]];
+      };
+      const c = at(0, 0), rx = at(1, 0), ry = at(0, 1);
+      const l = Math.hypot(c[0], c[1], c[2]) || 1;
+      u.set([c[0] / l, c[1] / l, c[2] / l, 0], 104);
+      u.set([(rx[0] - c[0]) / l, (rx[1] - c[1]) / l, (rx[2] - c[2]) / l, 0], 108);
+      u.set([(ry[0] - c[0]) / l, (ry[1] - c[1]) / l, (ry[2] - c[2]) / l, 0], 112);
+    }
     d.queue.writeBuffer(this.uniform, 0, u);
+    // the far cascade's passes read their matrix from the same slot
+    const u1 = u.slice();
+    u1.set(lightVP[1], 16);
+    d.queue.writeBuffer(this.uniformSh1, 0, u1);
 
-    const boxBuf = this.instBuffer('box', v.boxes);
-    const glowBuf = this.instBuffer('glow', v.glow);
-    const smokeBuf = this.instBuffer('smoke', v.smoke);
+    const boxBufs = this.shapeBuffers('box', v.boxes);
+    const glowBufs = this.shapeBuffers('glow', v.glow);
+    const smokeBufs = this.shapeBuffers('smoke', v.smoke);
+
+    // cars near the camera
+    const cam = v.camPos;
+    let carCount = 0;
+    if (this.carModel && this.cars.length) {
+      if (this.carData.length < (this.cars.length / 4) * 7) this.carData = new Float32Array((this.cars.length / 4) * 7);
+      for (let i = 0; i + 4 <= this.cars.length; i += 4) {
+        const dx = this.cars[i] - cam[0], dz = this.cars[i + 2] - cam[2];
+        if (dx * dx + dz * dz > 260 * 260) continue;
+        const o = carCount * 7, half = this.cars[i + 3] * 0.5;
+        this.carData[o] = this.cars[i];
+        this.carData[o + 1] = this.cars[i + 1];
+        this.carData[o + 2] = this.cars[i + 2];
+        this.carData[o + 3] = 0;
+        this.carData[o + 4] = Math.sin(half);
+        this.carData[o + 5] = 0;
+        this.carData[o + 6] = Math.cos(half);
+        carCount++;
+      }
+      if (carCount) this.carInst = this.instBuffer('cars', this.carData.buffer as ArrayBuffer, carCount * 28);
+    }
     const enc = d.createCommandEncoder();
 
-    // ---------------- shadow pass
+    // ---------------- shadow passes (near and far cascade)
     if (shadowsOn) {
-      const sp = enc.beginRenderPass({
-        colorAttachments: [],
-        depthStencilAttachment: { view: this.shadowTex.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
-      });
-      const lp = frustumPlanes(lightVP);
-      sp.setBindGroup(0, this.bgShadow);
-      sp.setPipeline(this.pipes.litShadow);
-      sp.setVertexBuffer(0, this.terrainVB);
-      sp.setIndexBuffer(this.terrainIB, 'uint32');
-      for (const c of this.tChunks) if (aabbVisible(lp, c.min, c.max)) sp.drawIndexed(c.count, 1, c.first);
-      sp.setVertexBuffer(0, this.propVB);
-      for (const c of this.pChunks) if (aabbVisible(lp, c.min, c.max)) sp.draw(c.count, 1, c.first);
-      if (boxBuf) {
+      for (let k = 0; k < 2; k++) {
+        const sp = enc.beginRenderPass({
+          colorAttachments: [],
+          depthStencilAttachment: { view: this.shadowViews[k], depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        });
+        const lp = frustumPlanes(lightVP[k]);
+        sp.setBindGroup(0, this.bgShadow[k]);
+        sp.setPipeline(this.pipes.litShadow);
+        sp.setVertexBuffer(0, this.terrainVB);
+        sp.setIndexBuffer(this.terrainIB, 'uint32');
+        for (const c of this.tChunks) if (aabbVisible(lp, c.min, c.max)) sp.drawIndexed(c.count, 1, c.first);
+        sp.setVertexBuffer(0, this.propVB);
+        for (const c of this.pChunks) if (aabbVisible(lp, c.min, c.max)) sp.draw(c.count, 1, c.first);
         sp.setPipeline(this.pipes.boxShadow);
-        sp.setVertexBuffer(0, this.cubeVB);
-        sp.setVertexBuffer(1, boxBuf);
-        sp.draw(36, v.boxes.count);
+        for (let s = 0; s < SHAPE_COUNT; s++) {
+          const b = boxBufs[s];
+          if (!b) continue;
+          // plain cubes are enough for box shadows
+          const mesh = s === 0 ? { buf: this.cubeVB, count: 36 } : this.shapeVB[s];
+          sp.setVertexBuffer(0, mesh.buf);
+          sp.setVertexBuffer(1, b);
+          sp.draw(mesh.count, v.boxes.lists[s].count);
+        }
+        if (carCount && this.carModel && this.carInst) {
+          sp.setPipeline(this.pipes.modelShadow);
+          sp.setVertexBuffer(0, this.carModel.vb);
+          sp.setVertexBuffer(1, this.carInst);
+          sp.setIndexBuffer(this.carModel.ib, 'uint32');
+          for (const p of this.carModel.parts) if (!p.blend) sp.drawIndexed(p.count, carCount, p.first);
+        }
+        sp.end();
       }
-      sp.end();
     }
 
-    // ---------------- main pass
-    const capture = this.captureReq;
-    this.captureReq = null;
-    let capTex: GPUTexture | null = null;
-    if (capture) {
-      capTex = d.createTexture({ size: [this.width, this.height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-    }
-    const swap = capTex ? capTex.createView() : this.ctx ? this.ctx.getCurrentTexture().createView() : this.offTex!.createView();
-    const msaa = this.msaaTex;
+    // ---------------- scene pass (linear HDR)
+    let tris = 0, draws = 0;
     const pass = enc.beginRenderPass({
-      colorAttachments: [
-        msaa
-          ? { view: msaa.createView(), resolveTarget: swap, clearValue: { r: 0.7, g: 0.8, b: 0.9, a: 1 }, loadOp: 'clear', storeOp: 'discard' }
-          : { view: swap, clearValue: { r: 0.7, g: 0.8, b: 0.9, a: 1 }, loadOp: 'clear', storeOp: 'store' },
-      ],
-      depthStencilAttachment: { view: this.depthTex.createView(), depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
+      colorAttachments: [{ view: this.hdrTex.createView(), clearValue: { r: 0.3, g: 0.5, b: 0.8, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+      depthStencilAttachment: { view: this.depthTex.createView(), depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' },
     });
     pass.setBindGroup(0, this.bgMain);
     pass.setPipeline(this.pipes.sky);
     pass.draw(3);
 
     const planes = frustumPlanes(v.viewProj);
-    const cam = v.camPos;
     const far = this.quality.drawDist;
     const near = (c: Chunk) => {
       const dx = Math.max(c.min[0] - cam[0], 0, cam[0] - c.max[0]);
@@ -510,39 +814,113 @@ export class Renderer {
     pass.setPipeline(this.pipes.terrain);
     pass.setVertexBuffer(0, this.terrainVB);
     pass.setIndexBuffer(this.terrainIB, 'uint32');
-    for (const c of this.tChunks) if (near(c) && aabbVisible(planes, c.min, c.max)) pass.drawIndexed(c.count, 1, c.first);
+    for (const c of this.tChunks) {
+      if (near(c) && aabbVisible(planes, c.min, c.max)) {
+        pass.drawIndexed(c.count, 1, c.first);
+        tris += c.count / 3;
+        draws++;
+      }
+    }
     pass.setPipeline(this.pipes.props);
     pass.setVertexBuffer(0, this.propVB);
-    for (const c of this.pChunks) if (near(c) && aabbVisible(planes, c.min, c.max)) pass.draw(c.count, 1, c.first);
-    if (boxBuf) {
-      pass.setPipeline(this.pipes.box);
-      pass.setVertexBuffer(0, this.cubeVB);
-      pass.setVertexBuffer(1, boxBuf);
-      pass.draw(36, v.boxes.count);
+    for (const c of this.pChunks) {
+      if (near(c) && aabbVisible(planes, c.min, c.max)) {
+        pass.draw(c.count, 1, c.first);
+        tris += c.count / 3;
+        draws++;
+      }
     }
+    const car = carCount && this.carModel && this.carInst ? this.carModel : null;
+    if (car) {
+      pass.setPipeline(this.pipes.model);
+      pass.setVertexBuffer(0, car.vb);
+      pass.setVertexBuffer(1, this.carInst!);
+      pass.setIndexBuffer(car.ib, 'uint32');
+      for (const p of car.parts) {
+        if (p.blend) continue;
+        pass.setBindGroup(1, p.bg);
+        pass.drawIndexed(p.count, carCount, p.first);
+        tris += (p.count / 3) * carCount;
+        draws++;
+      }
+    }
+    const drawShapes = (pipe: GPURenderPipeline, bufs: (GPUBuffer | null)[], inst: Instances, cubes = false) => {
+      pass.setPipeline(pipe);
+      for (let s = 0; s < SHAPE_COUNT; s++) {
+        const b = bufs[s];
+        if (!b) continue;
+        const mesh = cubes ? { buf: this.cubeVB, count: 36 } : this.shapeVB[s];
+        pass.setVertexBuffer(0, mesh.buf);
+        pass.setVertexBuffer(1, b);
+        pass.draw(mesh.count, inst.lists[s].count);
+        tris += (mesh.count / 3) * inst.lists[s].count;
+        draws++;
+      }
+    };
+    drawShapes(this.pipes.box, boxBufs, v.boxes);
     if (this.bgWater) {
       pass.setPipeline(this.pipes.water);
       pass.setBindGroup(1, this.bgWater);
       pass.draw(6);
     }
-    if (smokeBuf) {
-      pass.setPipeline(this.pipes.smoke);
-      pass.setVertexBuffer(0, this.cubeVB);
-      pass.setVertexBuffer(1, smokeBuf);
-      pass.draw(36, v.smoke.count);
+    if (car) {
+      pass.setPipeline(this.pipes.modelBlend);
+      pass.setVertexBuffer(0, car.vb);
+      pass.setVertexBuffer(1, this.carInst!);
+      pass.setIndexBuffer(car.ib, 'uint32');
+      for (const p of car.parts) {
+        if (!p.blend) continue;
+        pass.setBindGroup(1, p.bg);
+        pass.drawIndexed(p.count, carCount, p.first);
+        draws++;
+      }
     }
+    drawShapes(this.pipes.smoke, smokeBufs, v.smoke, true);
     if (v.zone.visible) {
       pass.setPipeline(this.pipes.zone);
       pass.setVertexBuffer(0, this.zoneVB);
       pass.draw(this.zoneCount);
     }
-    if (glowBuf) {
-      pass.setPipeline(this.pipes.glow);
-      pass.setVertexBuffer(0, this.cubeVB);
-      pass.setVertexBuffer(1, glowBuf);
-      pass.draw(36, v.glow.count);
-    }
+    drawShapes(this.pipes.glow, glowBufs, v.glow, true);
     pass.end();
+    this.stats = { tris: Math.round(tris), draws, width: this.width, height: this.height, scale: this.dyn };
+
+    // ---------------- ambient occlusion (white when off)
+    {
+      const ap = enc.beginRenderPass({ colorAttachments: [{ view: this.aoTex!.createView(), clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+      if (this.quality.ao) {
+        ap.setPipeline(this.pipes.ao);
+        ap.setBindGroup(0, this.bgAo!);
+        ap.draw(3);
+      }
+      ap.end();
+    }
+
+    // ---------------- bloom chain
+    if (this.quality.bloom) {
+      for (let l = 0; l < 4; l++) {
+        const bp = enc.beginRenderPass({ colorAttachments: [{ view: this.bloomTex[l].createView(), loadOp: 'clear', storeOp: 'store' }] });
+        bp.setPipeline(l === 0 ? this.pipes.bloomFirst : this.pipes.bloomDown);
+        bp.setBindGroup(0, this.bgBloom[l]);
+        bp.draw(3);
+        bp.end();
+      }
+    }
+
+    // ---------------- tonemap + FXAA into the swap chain
+    const capture = this.captureReq;
+    this.captureReq = null;
+    let capTex: GPUTexture | null = null;
+    if (capture) {
+      capTex = d.createTexture({ size: [this.width, this.height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    }
+    const swap = capTex ? capTex.createView() : this.ctx ? this.ctx.getCurrentTexture().createView() : this.offTex!.createView();
+    const pp = enc.beginRenderPass({ colorAttachments: [{ view: swap, loadOp: 'clear', storeOp: 'store' }] });
+    pp.setPipeline(this.pipes.post);
+    pp.setBindGroup(0, this.bgPost!);
+    pp.draw(3);
+    pp.end();
+
     if (capTex && capture) {
       const bpr = Math.ceil((this.width * 4) / 256) * 256;
       const buf = d.createBuffer({ size: bpr * this.height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });

@@ -1,11 +1,15 @@
-// Procedural low-poly box models: characters, guns, loot, the drop plane.
+// Procedural models from smooth instanced shapes (bevelled boxes, ellipsoids,
+// capsules, rods): characters, guns, loot, the drop plane. The character keeps
+// the joint frames and part sizes the server's hit volumes are built from.
 
-import { Instances, rgba } from './instances';
+import { Instances, rgba, surf, SHAPE_BOX, SHAPE_PILL, SHAPE_ROD, SHAPE_SPHERE } from './instances';
 import { add, clamp, qIdent, qMul, qRot, qX, qY, qZ, type Q, type V3 } from './math';
 
 type T = { p: V3; q: Q };
 const child = (t: T, pivot: V3, q: Q): T => ({ p: add(t.p, qRot(t.q, pivot)), q: qMul(t.q, q) });
-const box = (I: Instances, t: T, c: V3, s: V3, col: number) => I.push(add(t.p, qRot(t.q, c)), t.q, s, col);
+const box = (I: Instances, t: T, c: V3, s: V3, col: number, shape = SHAPE_BOX, mat = CLOTH) => I.push(add(t.p, qRot(t.q, c)), t.q, s, col, shape, mat);
+
+const CLOTH = surf(0.9, 0), SKINM = surf(0.55, 0), GEAR = surf(0.6, 0.05), GUNMETAL = surf(0.38, 0.85), POLY = surf(0.55, 0.1), PAINT = surf(0.45, 0.4);
 
 const METAL = rgba(0x2b2e33), METAL2 = rgba(0x40464d), WOOD = rgba(0x7a4e2c), TAN = rgba(0xb39a6c), OLIVE = rgba(0x4b5a3b);
 const GLASS = rgba(0x1d3b52);
@@ -87,7 +91,12 @@ export interface CharState {
 }
 
 export function emitGun(I: Instances, t: T, wk: number, s = 1) {
-  for (const [cx, cy, cz, sx, sy, sz, col] of GUNS[wk] ?? []) box(I, t, [cx * s, cy * s, cz * s], [sx * s, sy * s, sz * s], col);
+  for (const [cx, cy, cz, sx, sy, sz, col] of GUNS[wk] ?? []) {
+    // long thin parts along the bore are barrels
+    const barrel = sz > 2.6 * Math.max(sx, sy) && sx < 0.05;
+    const metal = col === METAL || col === METAL2;
+    box(I, t, [cx * s, cy * s, cz * s], [sx * s, sy * s, sz * s], col, barrel ? SHAPE_ROD : SHAPE_BOX, metal ? GUNMETAL : POLY);
+  }
 }
 
 export function emitCharacter(I: Instances, c: CharState) {
@@ -127,22 +136,27 @@ export function emitCharacter(I: Instances, c: CharState) {
   const hips = child(T0, [0, hipH, 0], qIdent());
   const torso = child(hips, [0, 0.02, 0], qX(lean));
   box(I, torso, [0, 0.3, 0], [0.46, 0.56, 0.26], shirt);
+  // collar and belt (inside the torso volume)
+  box(I, torso, [0, 0.03, 0], [0.47, 0.07, 0.27], rgba(0x2a2622), SHAPE_BOX, GEAR);
   if (c.vest > 0) {
     const vc = c.vest === 3 ? rgba(0x3d3550) : c.vest === 2 ? rgba(0x2f4a5f) : rgba(0x6b6650);
-    box(I, torso, [0, 0.27, 0], [0.5, 0.42, 0.31], vc);
+    box(I, torso, [0, 0.27, 0], [0.5, 0.42, 0.31], vc, SHAPE_BOX, GEAR);
+    box(I, torso, [0, 0.33, 0.14], [0.3, 0.2, 0.03], rgba(0x1c1f22), SHAPE_BOX, GEAR);
   }
-  box(I, torso, [0, 0.32, -0.2], [0.34, 0.42, 0.14], rgba(0x4d4a3a));
+  box(I, torso, [0, 0.32, -0.2], [0.34, 0.42, 0.14], rgba(0x4d4a3a), SHAPE_BOX, GEAR);
   // head
   const headPitch = dead ? 0 : -pitch * 0.55 - lean * 0.6;
   const head = child(torso, [0, 0.6, 0], qX(headPitch));
-  box(I, head, [0, 0.14, 0.01], [0.25, 0.27, 0.27], skin);
-  box(I, head, [0.065, 0.16, 0.14], [0.045, 0.035, 0.01], rgba(0x111111));
-  box(I, head, [-0.065, 0.16, 0.14], [0.045, 0.035, 0.01], rgba(0x111111));
+  box(I, head, [0, 0.14, 0.01], [0.25, 0.27, 0.27], skin, SHAPE_SPHERE, SKINM);
+  // neck
+  box(I, head, [0, -0.01, 0], [0.12, 0.1, 0.12], skin, SHAPE_PILL, SKINM);
+  box(I, head, [0.065, 0.16, 0.125], [0.045, 0.03, 0.02], rgba(0x111111), SHAPE_SPHERE, surf(0.2, 0));
+  box(I, head, [-0.065, 0.16, 0.125], [0.045, 0.03, 0.02], rgba(0x111111), SHAPE_SPHERE, surf(0.2, 0));
   if (c.helm > 0) {
     const hc = c.helm === 3 ? rgba(0x2b2f2a) : c.helm === 2 ? rgba(0x45503a) : rgba(0x6a6a5a);
-    box(I, head, [0, 0.25, 0], [0.3, 0.13, 0.31], hc);
+    box(I, head, [0, 0.22, 0], [0.3, 0.19, 0.31], hc, SHAPE_SPHERE, surf(0.45, 0.25));
   } else {
-    box(I, head, [0, 0.27, -0.01], [0.26, 0.05, 0.27], rgba(0x2a1d14));
+    box(I, head, [0, 0.235, -0.015], [0.26, 0.12, 0.27], rgba(0x2a1d14), SHAPE_SPHERE, surf(0.8, 0));
   }
 
   // legs
@@ -167,10 +181,12 @@ export function emitCharacter(I: Instances, c: CharState) {
       knee = Math.max(0, -Math.cos(ph)) * amp * 1.4;
     }
     const L = child(hips, [0.12 * s, 0, 0], qX(thigh));
-    box(I, L, [0, -0.23, 0], [0.17, 0.46, 0.19], pants);
+    box(I, L, [0, -0.23, 0], [0.17, 0.5, 0.19], pants, SHAPE_PILL);
     const K = child(L, [0, -0.46, 0], qX(knee));
-    box(I, K, [0, -0.23, 0], [0.15, 0.46, 0.17], pants);
-    box(I, K, [0, -0.45, 0.05], [0.15, 0.08, 0.26], boots);
+    box(I, K, [0, -0.23, 0], [0.15, 0.5, 0.17], pants, SHAPE_PILL);
+    // knee pad
+    box(I, K, [0, -0.02, 0.06], [0.13, 0.12, 0.08], rgba(0x26282b), SHAPE_SPHERE, GEAR);
+    box(I, K, [0, -0.44, 0.045], [0.15, 0.1, 0.27], boots, SHAPE_BOX, surf(0.6, 0));
   }
 
   // arms + weapon
@@ -207,10 +223,10 @@ export function emitCharacter(I: Instances, c: CharState) {
       elbow = -0.35 - (moving ? 0.25 : 0);
     }
     const A = child(torso, [0.29 * s, 0.5, 0], q);
-    box(I, A, [0, -0.15, 0], [0.13, 0.32, 0.13], shirt);
+    box(I, A, [0, -0.15, 0], [0.13, 0.36, 0.13], shirt, SHAPE_PILL);
     const E = child(A, [0, -0.3, 0], qX(elbow));
-    box(I, E, [0, -0.14, 0], [0.12, 0.3, 0.12], shirt);
-    box(I, E, [0, -0.31, 0], [0.1, 0.1, 0.1], skin);
+    box(I, E, [0, -0.14, 0], [0.11, 0.32, 0.11], shirt, SHAPE_PILL);
+    box(I, E, [0, -0.31, 0], [0.1, 0.11, 0.1], skin, SHAPE_SPHERE, SKINM);
   }
   if (hasGun && !freefall && !para) {
     const gp: V3 = c.ads ? [-0.06, 0.52, 0.34] : [-0.13, 0.42, 0.36];
@@ -295,8 +311,8 @@ export function emitItem(I: Instances, glow: Instances, kind: number, x: number,
 export function emitPlane(I: Instances, p: V3, yaw: number, t: number) {
   const T0: T = { p, q: qY(yaw) };
   const body = rgba(0x9aa3ab), dark = rgba(0x3b434a), stripe = rgba(0xd86a2a);
-  box(I, T0, [0, 0, 0], [3.2, 3.2, 24], body);
-  box(I, T0, [0, -0.2, 13], [2.4, 2.4, 2.4], body);
+  box(I, T0, [0, 0, 0], [3.2, 3.2, 24], body, SHAPE_ROD, PAINT);
+  box(I, T0, [0, -0.2, 12.6], [2.9, 2.9, 4.5], body, SHAPE_SPHERE, PAINT);
   box(I, T0, [0, 0.7, 13.6], [2.2, 0.8, 1.2], dark);
   box(I, T0, [0, 0.3, 0], [3.25, 0.5, 20], stripe);
   box(I, T0, [0, -0.5, 1.5], [34, 0.45, 4.6], body);
@@ -304,7 +320,7 @@ export function emitPlane(I: Instances, p: V3, yaw: number, t: number) {
   box(I, T0, [0, 1.1, -11], [10, 0.35, 2.6], body);
   for (const s of [1, -1]) {
     const eng = child(T0, [7 * s, -1.0, 3.5], qIdent());
-    box(I, eng, [0, 0, 0], [1.7, 1.7, 3.6], dark);
+    box(I, eng, [0, 0, 0], [1.7, 1.7, 3.6], dark, SHAPE_ROD, PAINT);
     const prop = child(eng, [0, 0, 1.95], qZ(t * 35 * s));
     box(I, prop, [0, 0, 0], [0.3, 4.2, 0.12], rgba(0x222222));
   }

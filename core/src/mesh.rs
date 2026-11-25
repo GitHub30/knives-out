@@ -7,7 +7,16 @@ use crate::world::*;
 
 pub const CH: usize = 8; // chunks per side
 pub const CHW: f32 = MAP / CH as f32;
-pub const MAT_SOLID: u8 = 255;
+// Material ids (vertex colour alpha): the shader picks its procedural surface
+// detail from them. Anything below 192 is foliage (sways, fades near the camera).
+pub const MAT_SOLID: u8 = 255; // plaster wall
+pub const MAT_ROOF: u8 = 250;
+pub const MAT_FLOOR: u8 = 245;
+pub const MAT_WOOD: u8 = 240;
+pub const MAT_METAL: u8 = 235;
+pub const MAT_CONCRETE: u8 = 230;
+pub const MAT_BARK: u8 = 225;
+pub const MAT_ROCK: u8 = 220;
 pub const MAT_LEAF: u8 = 128;
 pub const MAP_PX: usize = 512;
 
@@ -139,33 +148,56 @@ impl Soup {
         self.quad(V3::new(x0, y0, z1), V3::new(x1, y0, z1), V3::new(x1, y1, z1), V3::new(x0, y1, z1), c, col);
         self.quad(V3::new(x0, y0, z0), V3::new(x0, y1, z0), V3::new(x1, y1, z0), V3::new(x1, y0, z0), c, col);
     }
-    fn prism(&mut self, x: f32, z: f32, y0: f32, y1: f32, r0: f32, r1: f32, sides: usize, rot: f32, col: u32) {
-        let center = V3::new(x, (y0 + y1) * 0.5, z);
+    /// Triangle with per-vertex normals (smooth shading), wound to face `out`.
+    fn tri_n(&mut self, a: (V3, V3), b: (V3, V3), c: (V3, V3), col: u32) {
+        let n = (b.0 - a.0).cross(c.0 - a.0);
+        let (b, c) = if n.dot(a.1 + b.1 + c.1) < 0.0 { (c, b) } else { (b, c) };
+        self.vert(a.0, pack_n(a.1), col);
+        self.vert(b.0, pack_n(b.1), col);
+        self.vert(c.0, pack_n(c.1), col);
+    }
+    /// Smooth tapered trunk / pole.
+    fn trunk(&mut self, x: f32, z: f32, y0: f32, y1: f32, r0: f32, r1: f32, sides: usize, lean: (f32, f32), col: u32) {
         for k in 0..sides {
-            let a0 = rot + k as f32 * TAU / sides as f32;
-            let a1 = rot + (k + 1) as f32 * TAU / sides as f32;
+            let (a0, a1) = (k as f32 * TAU / sides as f32, (k + 1) as f32 * TAU / sides as f32);
+            let n0 = V3::new(a0.cos(), 0.15, a0.sin()).norm();
+            let n1 = V3::new(a1.cos(), 0.15, a1.sin()).norm();
             let b0 = V3::new(x + a0.cos() * r0, y0, z + a0.sin() * r0);
             let b1 = V3::new(x + a1.cos() * r0, y0, z + a1.sin() * r0);
-            let t0 = V3::new(x + a0.cos() * r1, y1, z + a0.sin() * r1);
-            let t1 = V3::new(x + a1.cos() * r1, y1, z + a1.sin() * r1);
-            self.quad(b0, t0, t1, b1, center, col);
+            let t0 = V3::new(x + lean.0 + a0.cos() * r1, y1, z + lean.1 + a0.sin() * r1);
+            let t1 = V3::new(x + lean.0 + a1.cos() * r1, y1, z + lean.1 + a1.sin() * r1);
+            self.tri_n((b0, n0), (t0, n0), (t1, n1), col);
+            self.tri_n((b0, n0), (t1, n1), (b1, n1), col);
         }
     }
-    fn cone(&mut self, x: f32, z: f32, y0: f32, y1: f32, r: f32, sides: usize, rot: f32, col: u32, col_dark: u32) {
+    /// Smooth cone skirt (a pine bough layer), drooping at the rim.
+    fn skirt(&mut self, x: f32, z: f32, y0: f32, y1: f32, r: f32, sides: usize, rot: f32, seed: u32, col: u32, col_in: u32) {
+        let mut rng = Rng::new(seed as u64 | 1);
         let apex = V3::new(x, y1, z);
-        let base_c = V3::new(x, y0, z);
-        let center = V3::new(x, y0 + (y1 - y0) * 0.3, z);
+        let slope = r / (y1 - y0).max(0.1);
+        let mut rim = Vec::with_capacity(sides + 1);
         for k in 0..sides {
-            let a0 = rot + k as f32 * TAU / sides as f32;
-            let a1 = rot + (k + 1) as f32 * TAU / sides as f32;
-            let b0 = V3::new(x + a0.cos() * r, y0, z + a0.sin() * r);
-            let b1 = V3::new(x + a1.cos() * r, y0, z + a1.sin() * r);
-            self.tri(b0, apex, b1, center, if k % 2 == 0 { col } else { col_dark });
-            self.tri(base_c, b0, b1, V3::new(x, y0 + 1.0, z), col_dark);
+            let a = rot + k as f32 * TAU / sides as f32;
+            let rr = r * rng.range(0.82, 1.1);
+            let n = V3::new(a.cos(), slope * 0.8, a.sin()).norm();
+            rim.push((V3::new(x + a.cos() * rr, y0 - rng.range(0.0, 0.25) * r * 0.3, z + a.sin() * rr), n));
+        }
+        rim.push(rim[0]);
+        let up = V3::new(0.0, 1.0, 0.0);
+        for k in 0..sides {
+            let (p0, p1) = (rim[k], rim[k + 1]);
+            let na = (p0.1 + p1.1 + up).norm();
+            self.tri_n(p0, (apex, na), p1, col);
+            // underside, darker
+            let c = V3::new(x, y0 + (y1 - y0) * 0.12, z);
+            self.tri_n((p0.0, -up), (p1.0, -up), (c, -up), col_in);
         }
     }
-    fn blob(&mut self, c: V3, rx: f32, ry: f32, rz: f32, seed: u32, jitter: f32, cols: &[u32]) {
+    /// Smooth lumpy ellipsoid (foliage clump, boulder): a subdivided
+    /// icosahedron pushed in and out by noise, with smooth normals.
+    fn lump(&mut self, c: V3, rx: f32, ry: f32, rz: f32, seed: u32, rough: f32, subdiv: u32, cols: &[u32], flat_bottom: bool) {
         let t = (1.0 + 5.0f32.sqrt()) * 0.5;
+        let l = (1.0 + t * t).sqrt();
         let raw = [
             (-1.0, t, 0.0), (1.0, t, 0.0), (-1.0, -t, 0.0), (1.0, -t, 0.0),
             (0.0, -1.0, t), (0.0, 1.0, t), (0.0, -1.0, -t), (0.0, 1.0, -t),
@@ -175,16 +207,40 @@ impl Soup {
             (0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11), (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
             (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9), (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1),
         ];
-        let mut rng = Rng::new(seed as u64);
-        let l = (1.0 + t * t).sqrt();
-        let mut v = [V3::ZERO; 12];
-        for (k, &(x, y, z)) in raw.iter().enumerate() {
-            let j = 1.0 + rng.range(-jitter, jitter);
-            v[k] = c + V3::new(x / l * rx * j, y / l * ry * j, z / l * rz * j);
+        let mut tris: Vec<[V3; 3]> = faces.iter().map(|&(a, b, cc)| {
+            let v = |k: usize| V3::new(raw[k].0 / l, raw[k].1 / l, raw[k].2 / l);
+            [v(a), v(b), v(cc)]
+        }).collect();
+        for _ in 0..subdiv {
+            let mut next = Vec::with_capacity(tris.len() * 4);
+            for [a, b, cc] in tris {
+                let (ab, bc, ca) = ((a + b).norm(), (b + cc).norm(), (cc + a).norm());
+                next.extend_from_slice(&[[a, ab, ca], [ab, b, bc], [ca, bc, cc], [ab, bc, ca]]);
+            }
+            tris = next;
         }
-        for (k, &(a, b, cc)) in faces.iter().enumerate() {
-            let col = cols[(k + rng.below(cols.len() as u32) as usize) % cols.len()];
-            self.tri(v[a], v[b], v[cc], c, col);
+        let sf = seed as f32 * 0.137;
+        // radial displacement: a few sine lobes keyed by the seed (cheap, seamless)
+        let disp = |d: V3| -> f32 {
+            let a = (d.x * 3.1 + sf).sin() * (d.y * 2.7 + sf * 1.7).cos();
+            let b = (d.z * 4.3 - sf * 0.6).sin() * (d.x * 5.1 + d.y * 3.3).cos();
+            1.0 + rough * (0.6 * a + 0.4 * b)
+        };
+        let place = |d: V3| -> (V3, V3) {
+            let k = disp(d);
+            let mut y = d.y * ry * k;
+            if flat_bottom && y < -ry * 0.35 {
+                y = -ry * 0.35 + (y + ry * 0.35) * 0.25;
+            }
+            let p = c + V3::new(d.x * rx * k, y, d.z * rz * k);
+            // ellipsoid normal, bent a little by the bumps
+            let n = V3::new(d.x / rx, d.y / ry, d.z / rz).norm();
+            (p, n)
+        };
+        let mut rng = Rng::new(seed as u64 ^ 0x9E37);
+        for (k, [a, b, cc]) in tris.iter().enumerate() {
+            let col = cols[(k / 4 + rng.below(cols.len() as u32) as usize) % cols.len()];
+            self.tri_n(place(*a), place(*b), place(*cc), col);
         }
     }
     fn finish(self) -> (Vec<u32>, Vec<f32>) {
@@ -225,11 +281,25 @@ pub fn build(w: &World) -> Meshes {
             let var = clampf(0.5 + (rng.f() - 0.5) * 0.5 + ((x * 0.013).sin() * (z * 0.011).cos()) * 0.3, 0.0, 1.0);
             let col = terrain_color(w, x, z, y, n, var);
             vcol[j * NV + i] = col;
+            // alpha: how much of this vertex is road or town paving (0..255)
+            let mut pave = 0.0f32;
+            if y > 0.8 {
+                let rd = w.road_dist(x, z);
+                if rd < 4.8 {
+                    pave = smoothstep(4.8, 2.4, rd) * 0.85;
+                }
+                for t in &w.towns {
+                    let d = dist_xz(x, z, t.x, t.z);
+                    if d < t.r + 8.0 {
+                        pave = pave.max(smoothstep(t.r + 8.0, t.r - 6.0, d) * 0.75);
+                    }
+                }
+            }
             tv.push(x.to_bits());
             tv.push(y.to_bits());
             tv.push(z.to_bits());
             tv.push(pack_n(n));
-            tv.push(pack_c(col, MAT_SOLID));
+            tv.push(pack_c(col, (pave * 255.0) as u8));
         }
     }
     let per = N / CH;
@@ -273,15 +343,26 @@ pub fn build(w: &World) -> Meshes {
     for b in &w.boxes {
         s.select((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5);
         let c = rgb(b.col);
-        let col = pack_c(c, MAT_SOLID);
+        if b.kind == BK_CAR {
+            continue; // drawn from the car model by the client
+        }
+        let mat = match b.kind {
+            BK_ROOF => MAT_ROOF,
+            BK_FLOOR => MAT_FLOOR,
+            BK_CRATE => MAT_WOOD,
+            BK_CONTAINER => MAT_METAL,
+            BK_CONCRETE => MAT_CONCRETE,
+            _ => MAT_SOLID,
+        };
+        let col = pack_c(c, mat);
         match b.kind {
-            BK_ROOF => s.cuboid(b.min, b.max, pack_c(shade(c, 0.8), MAT_SOLID), true, Some(col)),
+            BK_ROOF => s.cuboid(b.min, b.max, pack_c(shade(c, 0.8), mat), true, Some(col)),
             BK_CONTAINER => {
-                s.cuboid(b.min, b.max, col, false, Some(pack_c(shade(c, 0.85), MAT_SOLID)));
+                s.cuboid(b.min, b.max, col, false, Some(pack_c(shade(c, 0.85), mat)));
                 // corrugation ribs
                 let ribs = 7;
                 let along_x = b.max.x - b.min.x > b.max.z - b.min.z;
-                let dark = pack_c(shade(c, 0.72), MAT_SOLID);
+                let dark = pack_c(shade(c, 0.72), mat);
                 for k in 1..ribs {
                     let t = k as f32 / ribs as f32;
                     if along_x {
@@ -294,8 +375,8 @@ pub fn build(w: &World) -> Meshes {
                 }
             }
             BK_CRATE => {
-                s.cuboid(b.min, b.max, col, false, Some(pack_c(shade(c, 1.1), MAT_SOLID)));
-                let dark = pack_c(shade(c, 0.7), MAT_SOLID);
+                s.cuboid(b.min, b.max, col, false, Some(pack_c(shade(c, 1.1), mat)));
+                let dark = pack_c(shade(c, 0.7), mat);
                 let e = 0.07;
                 // edge planks
                 s.cuboid(V3::new(b.min.x - 0.02, b.max.y - e, b.min.z - 0.02), V3::new(b.max.x + 0.02, b.max.y + 0.01, b.max.z + 0.02), dark, false, None);
@@ -307,42 +388,45 @@ pub fn build(w: &World) -> Meshes {
     for t in &w.trees {
         s.select(t.x, t.z);
         let mut r = Rng::new(t.seed as u64);
-        let trunk = pack_c(rgb(0x5E4630), MAT_SOLID);
+        let trunk = pack_c(rgb(0x4A3A2A), MAT_BARK);
         let rot = r.range(0.0, TAU);
         if t.kind == 0 {
-            // pine
+            // pine: a straight trunk under layered, drooping boughs
             let top = t.y + t.h;
-            s.prism(t.x, t.z, t.y - 0.4, t.y + t.h * 0.35, 0.32, 0.22, 5, rot, trunk);
-            let base = [0x2F5A2E, 0x356B34, 0x2A4F2C, 0x3D6B3A];
+            s.trunk(t.x, t.z, t.y - 0.4, t.y + t.h * 0.8, 0.3, 0.07, 8, (0.0, 0.0), trunk);
+            let base = [0x24482A, 0x2B5530, 0x213F28, 0x315A33];
             let ci = r.below(4) as usize;
             let c1 = pack_c(rgb(base[ci]), MAT_LEAF);
-            let c2 = pack_c(shade(rgb(base[ci]), 0.82), MAT_LEAF);
-            let layers = 3;
+            let c2 = pack_c(shade(rgb(base[ci]), 0.55), MAT_LEAF);
+            let layers = 5;
             for k in 0..layers {
                 let f = k as f32 / layers as f32;
-                let y0 = t.y + t.h * (0.22 + f * 0.25);
-                let y1 = if k == layers - 1 { top } else { t.y + t.h * (0.62 + f * 0.2) };
-                let rr = t.r * (1.0 - f * 0.32);
-                s.cone(t.x, t.z, y0, y1, rr, 7, rot + k as f32, c1, c2);
+                let y0 = t.y + t.h * (0.2 + f * 0.62);
+                let y1 = if k == layers - 1 { top } else { y0 + t.h * 0.3 };
+                let rr = t.r * (1.0 - f * 0.78);
+                s.skirt(t.x, t.z, y0, y1, rr, 9, rot + k as f32 * 0.7, t.seed ^ (k as u32 * 977), c1, c2);
             }
         } else {
-            s.prism(t.x, t.z, t.y - 0.4, t.y + t.h * 0.6, 0.3, 0.2, 5, rot, trunk);
-            let palettes: [[u32; 3]; 4] = [[0x4F8A35, 0x5E9A3E, 0x46782F], [0x6A9A3A, 0x7BAA45, 0x5B8A33], [0xC08A2E, 0xD39A35, 0xA8742A], [0x8FA33A, 0x9DB045, 0x7E9132]];
-            let pal = palettes[if r.chance(0.12) { 2 } else { r.below(4) as usize % 4 }];
+            let lean = (r.range(-0.4, 0.4), r.range(-0.4, 0.4));
+            s.trunk(t.x, t.z, t.y - 0.4, t.y + t.h * 0.6, 0.42, 0.2, 8, lean, trunk);
+            let palettes: [[u32; 3]; 4] = [[0x3F7A2E, 0x4C8A36, 0x356627], [0x58893A, 0x669940, 0x4A7730], [0xB07E2C, 0xC28C33, 0x966A26], [0x7A9238, 0x889F40, 0x687E2E]];
+            let pal = palettes[if r.chance(0.07) { 2 } else { [0usize, 1, 3][r.below(3) as usize] }];
             let cols = [pack_c(rgb(pal[0]), MAT_LEAF), pack_c(rgb(pal[1]), MAT_LEAF), pack_c(rgb(pal[2]), MAT_LEAF)];
-            let c = V3::new(t.x, t.y + t.h * 0.7, t.z);
-            s.blob(c, t.r, t.r * 0.85, t.r, t.seed, 0.18, &cols);
-            if r.chance(0.6) {
-                let off = V3::new(r.range(-1.0, 1.0), r.range(0.3, 1.2), r.range(-1.0, 1.0));
-                s.blob(c + off, t.r * 0.7, t.r * 0.6, t.r * 0.7, t.seed ^ 77, 0.2, &cols);
+            let c = V3::new(t.x + lean.0, t.y + t.h * 0.7, t.z + lean.1);
+            s.lump(c, t.r * 1.2, t.r * 0.95, t.r * 1.2, t.seed, 0.16, 1, &cols, false);
+            for k in 0..2u32 {
+                let a = rot + k as f32 * 2.4 + r.range(-0.4, 0.4);
+                let off = V3::new(a.cos() * t.r * 0.8, r.range(-0.4, 0.35) * t.r, a.sin() * t.r * 0.8);
+                let q = r.range(0.7, 0.95);
+                s.lump(c + off, t.r * q, t.r * q * 0.8, t.r * q, t.seed ^ (k + 3) * 7919, 0.18, 1, &cols, false);
             }
         }
     }
     for rk in &w.rocks {
         s.select(rk.x, rk.z);
-        let g = [0x8C8A84, 0x7D7B76, 0x9A968C, 0x6F6E6A];
-        let cols = [pack_c(rgb(g[0]), MAT_SOLID), pack_c(rgb(g[1]), MAT_SOLID), pack_c(rgb(g[2]), MAT_SOLID), pack_c(rgb(g[3]), MAT_SOLID)];
-        s.blob(V3::new(rk.x, rk.y + rk.h * 0.25, rk.z), rk.r, rk.h * 0.75, rk.r * 0.9, rk.seed, 0.25, &cols);
+        let g = [0x7F7D77, 0x74726D, 0x8A867D, 0x6A6965];
+        let cols = [pack_c(rgb(g[0]), MAT_ROCK), pack_c(rgb(g[1]), MAT_ROCK), pack_c(rgb(g[2]), MAT_ROCK), pack_c(rgb(g[3]), MAT_ROCK)];
+        s.lump(V3::new(rk.x, rk.y + rk.h * 0.22, rk.z), rk.r, rk.h * 0.78, rk.r * 0.92, rk.seed, 0.22, 2, &cols, true);
     }
     let (pv, pchunks) = s.finish();
 
@@ -406,6 +490,9 @@ pub fn build(w: &World) -> Meshes {
             }
             x += scale * 0.9;
         }
+    }
+    for c in &w.cars {
+        plot(c[0], c[2], rgb(0x20242A), 0.95);
     }
     Meshes { tv, ti, tchunks, pv, pchunks, map }
 }

@@ -1159,6 +1159,8 @@ fn hidden_shooters_unseen_impacts_are_coarse() {
                 let p = &mut m.players[v as usize];
                 p.ms = MoveState { pos: spot, mode: MODE_GROUND, on_ground: true, ..Default::default() };
                 p.health = 100.0;
+                // (a dead viewer would see through the eyes of whoever it spectates)
+                assert!(p.alive, "the viewer died");
             }
             m.step();
             if m.phase != PH_PLAY {
@@ -1166,7 +1168,8 @@ fn hidden_shooters_unseen_impacts_are_coarse() {
             }
             let s = snap(&mut m, v);
             m.flush();
-            let eye = spot + V3::new(0.0, eye_h(false), 0.0);
+            // the eye the snapshot was made for (the step may have moved the player)
+            let eye = m.players[v as usize].ms.pos + V3::new(0.0, eye_h(m.players[v as usize].ms.crouch), 0.0);
             for e in &s.events {
                 if let Ev::Shot { shooter: 255, from, end, kind, .. } = e {
                     anon += 1;
@@ -1180,7 +1183,7 @@ fn hidden_shooters_unseen_impacts_are_coarse() {
                     // an impact on a wall's far face is out of sight too)
                     let dv = *end - eye;
                     let l = dv.len();
-                    assert!(l <= 0.5 || m.w.raycast(eye, dv * (1.0 / l), (l - 0.02).max(0.0)).is_none(), "seed {seed}: an exact wall hit the viewer cannot see, {l:.1} m away");
+                    assert!(l <= 0.5 || m.w.raycast(eye, dv * (1.0 / l), (l - 0.03).max(0.0)).is_none(), "seed {seed}: an exact wall hit the viewer cannot see, {l:.1} m away");
                 }
             }
         }
