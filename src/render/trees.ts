@@ -29,7 +29,7 @@ struct TreeInst {
   scale: f32,
   seed: f32,       // 0..1, colour of the individual
   cardScale: f32,  // leaf cards grow as they are thinned out with distance
-  species: f32,    // 0 conifer, 1 broadleaf
+  code: f32,       // species (0 conifer, 1 broadleaf) * 2 + fade (0..1); negative: fading out
 };
 @group(1) @binding(0) var<storage, read> trees: array<TreeInst>;
 @group(1) @binding(1) var tSamp: sampler;
@@ -37,6 +37,18 @@ struct TreeInst {
 @group(1) @binding(3) var tNormal: texture_2d<f32>;
 @group(1) @binding(4) var tRTA: texture_2d<f32>;   // roughness, translucency, ao
 
+// While a tree changes its level of detail both versions are drawn, each on
+// its own share of a screen-door pattern, so the change never pops.
+fn lodKeep(code: f32, pixel: vec2f) -> bool {
+  let a = abs(code);
+  let fade = a - floor(a * 0.5 + 1e-4) * 2.0;
+  let n = fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715))));
+  if (code < 0.0) { return n >= fade; }
+  return n < fade;
+}
+fn speciesOf(code: f32) -> f32 {
+  return floor(abs(code) * 0.5 + 1e-4);
+}
 fn rotY(v: vec3f, a: f32) -> vec3f {
   let c = cos(a);
   let s = sin(a);
@@ -104,6 +116,7 @@ struct TrunkOut {
   @location(1) n: vec3f,
   @location(2) uv: vec2f,
   @location(3) tint: vec2f,   // individual seed, height above the foot
+  @location(4) @interpolate(flat) code: f32,
 };
 @vertex fn vs_trunk(v: TrunkIn) -> TrunkOut {
   let t = trees[v.ii];
@@ -112,7 +125,8 @@ struct TrunkOut {
   o.clip = F.viewProj * vec4f(o.wp, 1.0);
   o.n = rotY(v.nrm, t.yaw);
   o.uv = v.uv;
-  o.tint = vec2f(t.seed + t.species * 2.0, v.pos.y * t.scale);
+  o.tint = vec2f(t.seed, v.pos.y * t.scale);
+  o.code = t.code;
   return o;
 }
 // tangent frame from screen-space derivatives (no tangents are stored)
@@ -129,9 +143,10 @@ fn perturb(n: vec3f, wp: vec3f, uv: vec2f, tn: vec3f) -> vec3f {
   return normalize(T * inv * tn.x + B * inv * tn.y + n * tn.z);
 }
 @fragment fn fs_trunk(i: TrunkOut) -> @location(0) vec4f {
+  if (!lodKeep(i.code, i.clip.xy)) { discard; }
   let n0 = normalize(i.n);
-  let species = floor(i.tint.x * 0.5);
-  let seed = i.tint.x - species * 2.0;
+  let species = speciesOf(i.code);
+  let seed = i.tint.x;
   var albedo = textureSample(tAlbedo, tSamp, i.uv).rgb;
   // conifers: redder, flakier bark; every tree a little its own shade
   albedo *= mix(vec3f(1.12, 0.9, 0.78), vec3f(0.95, 1.0, 1.0), species) * (0.8 + 0.4 * seed);
@@ -160,6 +175,7 @@ struct LeafOut {
   @location(3) uv: vec2f,
   @location(4) aw: vec4f,
   @location(5) seed: f32,
+  @location(6) @interpolate(flat) code: f32,
 };
 @vertex fn vs_leaf(v: LeafIn) -> LeafOut {
   let t = trees[v.ii];
@@ -171,6 +187,7 @@ struct LeafOut {
   o.uv = v.uv;
   o.aw = v.aoAndWind;
   o.seed = t.seed;
+  o.code = t.code;
   return o;
 }
 fn ign(p: vec2f) -> f32 {
@@ -189,8 +206,8 @@ fn leafShade(i: LeafOut, front: bool, tex: vec4f) -> vec3f {
   let translucency = rta.g;
   let canopyAO = i.aw.x;
   // colour: each card and each tree a little different (fresh to yellowing)
-  var albedo = tex.rgb * 0.8;
-  albedo = mix(albedo * vec3f(0.82, 0.92, 0.8), albedo * vec3f(1.18, 1.08, 0.72), i.aw.w);
+  var albedo = tex.rgb;
+  albedo = mix(albedo * vec3f(0.85, 0.94, 0.84), albedo * vec3f(1.12, 1.05, 0.8), i.aw.w);
   albedo *= mix(vec3f(0.86, 0.96, 0.9), vec3f(1.12, 1.04, 0.86), i.seed);
 
   let L = F.sunDir.xyz;
@@ -216,7 +233,8 @@ fn leafShade(i: LeafOut, front: bool, tex: vec4f) -> vec3f {
   let backLightDir = normalize(L + N * 0.35);
   let sssDot = pow(clamp(dot(V, -backLightDir), 0.0, 1.0), 3.0);
   let sss = sssDot * translucency * sunColor * vec3f(0.45, 0.72, 0.12) * (0.3 + 0.7 * canopyAO);
-  c += sss * (0.3 + 0.7 * sh) * 0.45;
+  // (tinted by the leaf itself, so veins and overlaps still read against the light)
+  c += sss * albedo * 4.0 * (0.25 + 0.75 * sh) * 0.55;
   // ambient, cut deep inside the crown
   let up = N.y * 0.5 + 0.5;
   let ground = sunColor * vec3f(0.11, 0.1, 0.08);
@@ -230,12 +248,13 @@ fn leafShade(i: LeafOut, front: bool, tex: vec4f) -> vec3f {
 // no MSAA: alpha test, the threshold dithered to soften the cut edge
 @fragment fn fs_leaf(i: LeafOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   let tex = textureSample(tAlbedo, tSamp, i.uv);
-  if (tex.a < ${ALPHA_CUTOFF} + (ign(i.clip.xy) - 0.5) * 0.16) { discard; }
+  if (tex.a < ${ALPHA_CUTOFF} + (ign(i.clip.xy) - 0.5) * 0.16 || !lodKeep(i.code, i.clip.xy + 17.0)) { discard; }
   return vec4f(leafShade(i, front, tex), 1.0);
 }
 // MSAA: alpha-to-coverage on a sharpened alpha
 @fragment fn fs_leaf_a2c(i: LeafOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   let tex = textureSample(tAlbedo, tSamp, i.uv);
+  if (!lodKeep(i.code, i.clip.xy + 17.0)) { discard; }
   let a = clamp((tex.a - ${ALPHA_CUTOFF}) / max(fwidth(tex.a), 1e-4) + 0.5, 0.0, 1.0);
   return vec4f(leafShade(i, front, tex), a);
 }
@@ -481,14 +500,14 @@ function broadleaf(seed: number): TreeMesh {
       // leaf clusters along the twig and at its tip: two or three cards crossed
       for (const t of [0.3, 0.65, 1.0]) {
         const q = along(tw, t);
-        const len = 1.1 + r() * 0.6, wid = len * (0.8 + r() * 0.25);
+        const len = 0.95 + r() * 0.45, wid = len * (0.8 + r() * 0.25);
         const c = v3.add(q.p, v3.mul(q.d, len * 0.38));
         const d = v3.len(v3.sub(c, centre)) / canopyR;
         const ao = Math.max(0.16, Math.min(1, Math.pow(d, 1.6)));
         const w0 = perp(q.d, r);
         const cell = Math.floor(r() * 4);
         const phase = r(), colour = r();
-        const nc = 2;
+        const nc = 3;
         for (let m = 0; m < nc; m++) {
           const ang = (m / nc) * Math.PI + (r() - 0.5) * 0.4;
           const w = v3.norm(v3.add(v3.mul(w0, Math.cos(ang)), v3.mul(v3.cross(q.d, w0), Math.sin(ang))));
@@ -769,12 +788,12 @@ function leafAtlas(conifer: boolean): Atlas {
     const N = 14;
     for (let i = 0; i < N; i++) stems.push({ x0: stemX(i / N), y0: stemY(i / N), x1: stemX((i + 1) / N), y1: stemY((i + 1) / N), w: (conifer ? 5 : 7) * (1 - 0.75 * i / N) });
     const shoots: { x: number; y: number; ang: number; len: number }[] = [];
-    const nShoot = conifer ? 9 : 7;
+    const nShoot = conifer ? 9 : 11;
     for (let i = 0; i < nShoot; i++) {
       const t = 0.14 + 0.8 * (i / nShoot) + r() * 0.04;
       const s = i % 2 ? 1 : -1;
       const ang = -Math.PI / 2 + s * (conifer ? 0.75 + r() * 0.3 : 0.7 + r() * 0.5);
-      const len = C * (conifer ? 0.34 : 0.3) * (1 - 0.55 * t) * (0.8 + r() * 0.4);
+      const len = C * (conifer ? 0.34 : 0.36) * (1 - 0.55 * t) * (0.8 + r() * 0.4);
       shoots.push({ x: stemX(t), y: stemY(t), ang, len });
       stems.push({ x0: stemX(t), y0: stemY(t), x1: stemX(t) + Math.cos(ang) * len, y1: stemY(t) + Math.sin(ang) * len, w: conifer ? 2.5 : 3 });
     }
@@ -798,7 +817,7 @@ function leafAtlas(conifer: boolean): Atlas {
           for (const s of [1, -1]) {
             const na = ang + s * (0.75 + (r() - 0.5) * 0.5);
             const nl = (20 + r() * 12) * (1 - taper * t) * (C / 512);
-            const g = 62 + r() * 46, shade = 0.7 + r() * 0.5;
+            const g = 48 + r() * 34, shade = 0.7 + r() * 0.5;
             each((x, m) => {
               x.lineWidth = m === 1 ? 2.6 : 2.1;
               x.strokeStyle = m === 0 ? `rgb(${(20 + r() * 0 + g * 0.34) * shade},${g * shade},${(30 + g * 0.3) * shade})` : m === 1 ? grey(0.45 + 0.5 * (1 - t * 0.3)) : 'rgb(165,150,255)';
@@ -816,14 +835,14 @@ function leafAtlas(conifer: boolean): Atlas {
       // leaves: ovate, serrated, veined; drawn from the back of the cluster forward
       const leaves: { x: number; y: number; ang: number; len: number; hue: number; lit: number }[] = [];
       for (const s of shoots) {
-        const n = 4 + Math.floor(r() * 3);
+        const n = 6 + Math.floor(r() * 3);
         for (let i = 0; i < n; i++) {
-          const t = 0.25 + 0.75 * (i / (n - 1));
-          leaves.push({ x: s.x + Math.cos(s.ang) * s.len * t, y: s.y + Math.sin(s.ang) * s.len * t, ang: s.ang + (i % 2 ? 0.75 : -0.75) + (r() - 0.5) * 0.5, len: C * (0.15 + r() * 0.07), hue: r(), lit: 0.72 + r() * 0.4 });
+          const t = 0.2 + 0.8 * (i / (n - 1));
+          leaves.push({ x: s.x + Math.cos(s.ang) * s.len * t, y: s.y + Math.sin(s.ang) * s.len * t, ang: s.ang + (i % 2 ? 0.75 : -0.75) + (r() - 0.5) * 0.5, len: C * (0.085 + r() * 0.04), hue: r(), lit: 0.72 + r() * 0.4 });
         }
-        leaves.push({ x: s.x + Math.cos(s.ang) * s.len, y: s.y + Math.sin(s.ang) * s.len, ang: s.ang + (r() - 0.5) * 0.3, len: C * (0.17 + r() * 0.06), hue: r(), lit: 0.9 + r() * 0.3 });
+        leaves.push({ x: s.x + Math.cos(s.ang) * s.len, y: s.y + Math.sin(s.ang) * s.len, ang: s.ang + (r() - 0.5) * 0.3, len: C * (0.1 + r() * 0.035), hue: r(), lit: 0.9 + r() * 0.3 });
       }
-      for (let i = 0; i < 5; i++) leaves.push({ x: stemX(0.86 + i * 0.03), y: stemY(0.86 + i * 0.03), ang: -Math.PI / 2 + (i - 2) * 0.55, len: C * (0.16 + r() * 0.06), hue: r(), lit: 0.95 + r() * 0.25 });
+      for (let i = 0; i < 5; i++) leaves.push({ x: stemX(0.86 + i * 0.03), y: stemY(0.86 + i * 0.03), ang: -Math.PI / 2 + (i - 2) * 0.55, len: C * (0.1 + r() * 0.035), hue: r(), lit: 0.95 + r() * 0.25 });
       leaves.forEach((lf, li) => {
         const depth = li / leaves.length;
         // outline: half width follows a rounded profile with a saw-toothed margin
@@ -842,7 +861,7 @@ function leafAtlas(conifer: boolean): Atlas {
           if (m === 0) {
             const g = x.createLinearGradient(0, 0, lf.len, 0);
             const k = lf.lit * (0.62 + 0.38 * depth);
-            const c0 = [36 + 34 * lf.hue, 92 + 26 * lf.hue, 22 + 8 * lf.hue], c1 = [70 + 60 * lf.hue, 128 + 22 * lf.hue, 30];
+            const c0 = [30 + 22 * lf.hue, 62 + 22 * lf.hue, 18 + 8 * lf.hue], c1 = [52 + 34 * lf.hue, 92 + 24 * lf.hue, 26];
             g.addColorStop(0, `rgb(${c0[0] * k},${c0[1] * k},${c0[2] * k})`);
             g.addColorStop(1, `rgb(${c1[0] * k},${c1[1] * k},${c1[2] * k})`);
             x.fillStyle = g;
@@ -850,7 +869,7 @@ function leafAtlas(conifer: boolean): Atlas {
             x.strokeStyle = `rgba(20,45,12,0.55)`;
             x.lineWidth = 1;
             x.stroke();
-            x.strokeStyle = `rgba(${150 * k},${178 * k},${82 * k},0.85)`;
+            x.strokeStyle = `rgba(${112 * k},${138 * k},${66 * k},0.8)`;
           } else if (m === 1) {
             // a shallow dish: high along the edges, a groove at every vein
             const g = x.createLinearGradient(0, -lf.len * 0.34, 0, lf.len * 0.34);
@@ -894,7 +913,7 @@ function leafAtlas(conifer: boolean): Atlas {
   const h = new Float32Array(S * S);
   const rta = new Uint8ClampedArray(S * S * 4);
   // texels outside the leaves take a leaf colour, so filtering never bleeds black into the edges
-  const fill = conifer ? [34, 70, 40] : [52, 104, 28];
+  const fill = conifer ? [28, 56, 34] : [40, 74, 24];
   for (let i = 0; i < S * S; i++) {
     const o = i * 4;
     h[i] = (hd[o] / 255) * (albedo[o + 3] / 255);
@@ -1191,7 +1210,7 @@ export class TreeRenderer {
   /** The trees of the world: x, y, z, height, radius, kind (0 conifer), seed, - per tree. */
   setTrees(list: Float32Array) {
     this.trees = list;
-    const n = Math.max(1, list.length >> 3);
+    const n = Math.max(1, list.length >> 3) * 2;
     this.inst?.destroy();
     this.inst = this.d.createBuffer({ size: n * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.data = new Float32Array(n * 8);
@@ -1211,7 +1230,10 @@ export class TreeRenderer {
     if (!this.ready || !this.inst) return;
     const t = this.trees;
     const nV = this.variants.length;
+    // per run: tree offsets and, alongside, their fade (negative = on the way out)
     const lists: number[][] = Array.from({ length: nV * 3 }, () => []);
+    const fades: number[][] = Array.from({ length: nV * 3 }, () => []);
+    const bands = [7, 14];
     for (let i = 0; i + 8 <= t.length; i += 8) {
       const dx = t[i] - cam[0], dz = t[i + 2] - cam[2];
       const d = Math.hypot(dx, dz);
@@ -1224,6 +1246,14 @@ export class TreeRenderer {
         if (!aabbVisible(planes, [t[i] - r, t[i + 1] - 1, t[i + 2] - r], [t[i] + r, t[i + 1] + h * 1.15, t[i + 2] + r])) continue;
       }
       lists[v * 3 + level].push(i);
+      // in the last metres before a change of level the next one fades in
+      const edge = level === 0 ? lod[0] : level === 1 ? lod[1] : Infinity;
+      const f = level < 2 ? (d - (edge - bands[level])) / bands[level] : 0;
+      if (f > 0) {
+        fades[v * 3 + level].push(-Math.max(0.001, f));
+        lists[v * 3 + level + 1].push(i);
+        fades[v * 3 + level + 1].push(Math.max(0.001, f));
+      } else fades[v * 3 + level].push(1);
     }
     let n = 0;
     const out = this.data;
@@ -1234,7 +1264,9 @@ export class TreeRenderer {
       const g: Group[] = [];
       for (let level = 0; level < 3; level++) {
         const first = n;
-        for (const i of lists[v * 3 + level]) {
+        const fl = fades[v * 3 + level];
+        for (let q = 0; q < lists[v * 3 + level].length; q++) {
+          const i = lists[v * 3 + level][q];
           const o = n * 8;
           const seed = t[i + 6];
           out[o] = t[i];
@@ -1244,7 +1276,7 @@ export class TreeRenderer {
           out[o + 4] = t[i + 3] / vr.height;
           out[o + 5] = ((seed * 0.137) % 1 + 1) % 1;
           out[o + 6] = level === 1 ? 1.7 : 1;
-          out[o + 7] = vr.conifer ? 0 : 1;
+          out[o + 7] = Math.sign(fl[q]) * ((vr.conifer ? 0 : 2) + Math.min(1, Math.abs(fl[q])));
           n++;
         }
         g.push({ first, count: n - first });

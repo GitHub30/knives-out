@@ -60,8 +60,8 @@ fn terrain_color(w: &World, x: f32, z: f32, y: f32, n: V3, var: f32) -> (f32, f3
     let sand = rgb(0xD9C89A);
     let wet = rgb(0xA8996F);
     let deep = rgb(0x5E6F66);
-    let g1 = rgb(0x5C8A38);
-    let g2 = rgb(0x7FA145);
+    let g1 = rgb(0x4A6230);
+    let g2 = rgb(0x66753A);
     let alpine = rgb(0x6F7A4C);
     let rock = rgb(0x8A857A);
     let road = rgb(0x9C8B6C);

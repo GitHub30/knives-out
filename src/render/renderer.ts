@@ -994,7 +994,7 @@ export class Renderer {
     }
     this.planePose = null;
     // trees: sorted into runs by kind and distance for this frame
-    const treeLod: [number, number] = this.quality.grass >= 2 ? [36, 105] : this.quality.grass === 1 ? [26, 80] : [18, 60];
+    const treeLod: [number, number] = this.quality.grass >= 2 ? [32, 100] : this.quality.grass === 1 ? [26, 80] : [18, 60];
     this.trees?.prepare(cam, frustumPlanes(v.viewProj), treeLod, this.quality.drawDist);
     const enc = d.createCommandEncoder();
 

@@ -766,8 +766,8 @@ struct VOut {
 @fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   let t = i.tv.x;
   // dark and damp at the root, brighter and yellower towards the tip
-  var albedo = mix(vec3f(0.03, 0.075, 0.015), vec3f(0.13, 0.27, 0.045), pow(t, 0.8));
-  albedo = mix(albedo, albedo * vec3f(1.3, 1.1, 0.65), i.tv.y * 0.5);
+  var albedo = mix(vec3f(0.022, 0.045, 0.012), vec3f(0.095, 0.165, 0.04), pow(t, 0.8));
+  albedo = mix(albedo, albedo * vec3f(1.25, 1.08, 0.7), i.tv.y * 0.5);
   // dry straw-coloured stretches
   albedo = mix(albedo, vec3f(0.36, 0.31, 0.12) * (0.35 + 0.75 * t), i.tv.z * 0.75);
   var s: Surface;
