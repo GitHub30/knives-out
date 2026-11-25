@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 13;
+export const PROTO = 14;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -20,6 +20,8 @@ export const MODE_GROUND = 3;
 export const MODE_DEAD = 4;
 /** Driving a car: the self state's pos/vel are the car's and airtime is its heading. */
 export const MODE_DRIVE = 5;
+/** Flying a helicopter: the self state's position / velocity are the helicopter's (its model origin), `airtime` its heading, `onGround` = landed. */
+export const MODE_FLY = 6;
 
 export const B_FIRE = 1 << 0;
 export const B_ADS = 1 << 1;
@@ -36,6 +38,9 @@ export const WK_NADE = 200;
 export const WK_CAR = 201;
 export const WK_TRUCK = 202;
 export const WK_BOOM = 203;
+/** Kill-feed ids: a helicopter's missile, and being hit by its hull. */
+export const WK_MISSILE = 204;
+export const WK_HELI = 205;
 
 export const KILLER_ZONE = 255;
 export const ITEM_CHUNKS = 8;
@@ -243,6 +248,14 @@ export interface Snapshot {
   cars: { id: number; x: number; y: number; z: number; yaw: number; driver: number; hp: number }[];
   /** Loose crates and containers that moved lately: the middle of the underside. */
   props: { id: number; x: number; y: number; z: number; moving: boolean }[];
+  /**
+   * Helicopters in range. Angles in radians: pitch > 0 is nose down, roll > 0 is right side down
+   * (right-handed turns about the model's +X (left) and +Z (nose) axes). rotor: speed 0..1.
+   * pilot: 255 = nobody, 254 = someone unseen. hp: hull left in 255ths, 0 = a wreck. ammo: missiles left.
+   */
+  helis: { id: number; x: number; y: number; z: number; yaw: number; pitch: number; roll: number; rotor: number; pilot: number; hp: number; ammo: number; flags: number; airborne: boolean }[];
+  /** Missiles in flight, with the direction they fly in. */
+  missiles: { id: number; x: number; y: number; z: number; yaw: number; pitch: number }[];
   events: GameEvent[];
 }
 
@@ -397,6 +410,26 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
   const props: Snapshot['props'] = [];
   const nProps = r.u8();
   for (let i = 0; i < nProps && !r.bad; i++) props.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32(), moving: r.u8() !== 0 });
+  const helis: Snapshot['helis'] = [];
+  const nHelis = r.u8();
+  for (let i = 0; i < nHelis && !r.bad; i++) {
+    const id = r.u8();
+    const x = r.f32();
+    const y = r.f32();
+    const z = r.f32();
+    const yaw = (r.u16() * TAU) / 65536;
+    const pitch = ((r.u8() << 24) >> 24) / 100;
+    const roll = ((r.u8() << 24) >> 24) / 100;
+    const rotor = r.u8() / 255;
+    const pilot = r.u8();
+    const hp = r.u8();
+    const ammo = r.u8();
+    const flags = r.u8();
+    helis.push({ id, x, y, z, yaw, pitch, roll, rotor, pilot, hp, ammo, flags, airborne: (flags & 1) !== 0 });
+  }
+  const missiles: Snapshot['missiles'] = [];
+  const nMissiles = r.u8();
+  for (let i = 0; i < nMissiles && !r.bad; i++) missiles.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, pitch: (r.i16() * 1.5) / 32767 });
   const events: GameEvent[] = [];
   const ne = r.u16();
   for (let i = 0; i < ne && !r.bad; i++) {
@@ -466,7 +499,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
     }
   }
   if (r.bad) return null;
-  return { tick, ack, phase, phaseT, alive, total, winner, self, zone, plane, players, nades, cars, props, events };
+  return { tick, ack, phase, phaseT, alive, total, winner, self, zone, plane, players, nades, cars, props, helis, missiles, events };
 }
 
 export interface CmdQ {

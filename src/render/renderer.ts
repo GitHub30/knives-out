@@ -3,6 +3,7 @@
 // bloom + tonemap + FXAA into the swap chain.
 
 import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_SHADOW_WGSL, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { HELI_BLADE_CONE, HELI_BLADE_REST, HELI_GEAR, HELI_GEAR_TRAVEL, HELI_ROTORS, HELI_STRIDE } from './heli';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
@@ -167,6 +168,7 @@ function cylinderVerts(seg: number): Float32Array {
   return new Float32Array(out);
 }
 
+export { HELI_STRIDE };
 /** Floats per car handed to `setCars`. */
 export const CAR_STRIDE = 10;
 
@@ -174,10 +176,19 @@ export const CAR_STRIDE = 10;
 const FAN_AXES: V3[] = [[9.75, -3.0, 11.0], [-9.75, -3.0, 11.0]];
 const FAN_SPEED = 9;
 
+/** Floats per rotor instance: position, quaternion, tint, blade tip height, blade fade. */
+const ROTOR_INST = 10;
+
 interface ModelGpu {
   vb: GPUBuffer;
   ib: GPUBuffer;
   parts: { first: number; count: number; blend: boolean; bg: GPUBindGroup }[];
+}
+
+interface ModelDraw {
+  m: ModelGpu;
+  inst: GPUBuffer;
+  n: number;
 }
 
 export class Renderer {
@@ -253,6 +264,13 @@ export class Renderer {
   private fanModel: ModelGpu | null = null;
   private fanPose = new Float32Array(16);
   private fanInst: GPUBuffer | null = null;
+  /** Helicopter: airframe, one rotor (drawn twice), forward and aft gear units. */
+  private heliModel: { body: ModelGpu; rotor: [ModelGpu, ModelGpu]; gear: [ModelGpu, ModelGpu] } | null = null;
+  /** Per helicopter (HELI_STRIDE floats): see src/render/heli.ts. */
+  private helis: Float32Array = new Float32Array(0);
+  private heliData = { body: new Float32Array(0), rotor: [new Float32Array(0), new Float32Array(0)], disc: [new Float32Array(0), new Float32Array(0)], gear: [new Float32Array(0), new Float32Array(0)] };
+  /** Last rotor angle and time per helicopter, and the blur that follows from the speed. */
+  private heliSpin: { a: number; t: number; blur: number }[] = [];
   // dynamic resolution
   private dyn = 1;
   private lastT = 0;
@@ -459,6 +477,20 @@ export class Renderer {
         ],
       },
     ];
+    // rotors carry two more floats per instance: blade tip height, blade fade
+    const rotorVB: GPUVertexBufferLayout[] = [
+      modelVB[0],
+      {
+        arrayStride: ROTOR_INST * 4,
+        stepMode: 'instance',
+        attributes: [
+          { shaderLocation: 4, offset: 0, format: 'float32x3' },
+          { shaderLocation: 5, offset: 12, format: 'float32x4' },
+          { shaderLocation: 6, offset: 28, format: 'float32' },
+          { shaderLocation: 7, offset: 32, format: 'float32x2' },
+        ],
+      },
+    ];
     const depthMain = (write: boolean, compare: GPUCompareFunction = 'greater'): GPUDepthStencilState => ({ format: 'depth32float', depthWriteEnabled: write, depthCompare: compare });
     const target = (blend?: GPUBlendState): GPUColorTargetState[] => [{ format: HDR, blend }];
     const alpha: GPUBlendState = {
@@ -518,6 +550,26 @@ export class Renderer {
         layout: layoutModel,
         vertex: { module: model, entryPoint: 'vs', buffers: modelVB },
         fragment: { module: model, entryPoint: 'fs_blend', targets: target(alpha) },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depthMain(false),
+      }),
+      rotor: d.createRenderPipeline({
+        layout: layoutModel,
+        vertex: { module: model, entryPoint: 'vs_rotor', buffers: rotorVB },
+        fragment: { module: model, entryPoint: 'fs_rotor', targets: target() },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depthMain(true),
+      }),
+      rotorShadow: d.createRenderPipeline({
+        layout: layoutShadow,
+        vertex: { module: modelSh, entryPoint: 'vs_rotor', buffers: rotorVB },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: shadowDepth,
+      }),
+      rotorDisc: d.createRenderPipeline({
+        layout: layoutModel,
+        vertex: { module: model, entryPoint: 'vs_rotor', buffers: rotorVB },
+        fragment: { module: model, entryPoint: 'fs_disc', targets: target(alpha) },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depthMain(false),
       }),
@@ -641,6 +693,9 @@ export class Renderer {
       this.cars.set([c4[i], c4[i + 1], c4[i + 2], 0, Math.sin(c4[i + 3] * 0.5), 0, Math.cos(c4[i + 3] * 0.5), 1, 0, 0], o);
     }
     this.carKinds = w.carKinds ?? new Uint8Array(c4.length >> 2);
+    // helicopters belong to a match: none until the game hands them over
+    this.helis = new Float32Array(0);
+    this.heliSpin = [];
     this.heightTex?.destroy();
     this.heightTex = d.createTexture({ size: [257, 257], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     d.queue.writeTexture({ texture: this.heightTex }, w.heights.buffer, { offset: w.heights.byteOffset, bytesPerRow: 257 * 4, rowsPerImage: 257 }, [257, 257]);
@@ -764,6 +819,106 @@ export class Renderer {
       const fq = qMul(q, qAxis(0, 0, 1, -time * FAN_SPEED));
       this.fanPose.set([p[0] + o[0], p[1] + o[1], p[2] + o[2], fq[0], fq[1], fq[2], fq[3], 1], k * 8);
     });
+  }
+
+  /** Load the helicopter: the airframe, one rotor and the two kinds of landing-gear unit. */
+  async loadHeliModel(urls: { body: string; rotor: string; gearFront: string; gearRear: string }): Promise<void> {
+    const [b, r, gf, gr] = await Promise.all([loadGlb(urls.body), loadGlb(urls.rotor), loadGlb(urls.gearFront), loadGlb(urls.gearRear)]);
+    if (this.lost) return;
+    // The aft head is a mirror image of the forward one (it turns the other
+    // way, leading edges first): the same mesh reflected front to back, which
+    // leaves the blades where they were, with the winding turned over.
+    const mv = new Float32Array(r.verts);
+    for (let i = 0; i < mv.length; i += 12) {
+      mv[i + 2] = -mv[i + 2];
+      mv[i + 5] = -mv[i + 5];
+      mv[i + 8] = -mv[i + 8];
+      mv[i + 9] = -mv[i + 9];
+    }
+    const mi = new Uint32Array(r.indices);
+    for (let i = 0; i + 2 < mi.length; i += 3) {
+      const t = mi[i + 1];
+      mi[i + 1] = mi[i + 2];
+      mi[i + 2] = t;
+    }
+    this.heliModel = { body: this.uploadModel(b), rotor: [this.uploadModel(r), this.uploadModel({ ...r, verts: mv, indices: mi })], gear: [this.uploadModel(gf), this.uploadModel(gr)] };
+  }
+  get hasHeliModel() {
+    return !!this.heliModel;
+  }
+  /** The helicopters this frame, HELI_STRIDE floats each (see src/render/heli.ts). */
+  setHelis(data: Float32Array) {
+    this.helis = data;
+  }
+
+  /** Instances of the helicopters' parts for this frame. */
+  private heliDraws(): { solid: ModelDraw[]; rotors: ModelDraw[]; discs: ModelDraw[] } {
+    const hm = this.heliModel;
+    const n = Math.floor(this.helis.length / HELI_STRIDE);
+    if (!hm || !n) return { solid: [], rotors: [], discs: [] };
+    const D = this.heliData;
+    if (D.body.length < n * 8) {
+      D.body = new Float32Array(n * 8);
+      D.rotor = [new Float32Array(n * ROTOR_INST), new Float32Array(n * ROTOR_INST)];
+      D.disc = [new Float32Array(n * ROTOR_INST), new Float32Array(n * ROTOR_INST)];
+      D.gear = [new Float32Array(n * 16), new Float32Array(n * 16)];
+    }
+    const now = performance.now() / 1000;
+    const h = this.helis;
+    const discs = [0, 0];
+    for (let k = 0; k < n; k++) {
+      const i = k * HELI_STRIDE;
+      const p: V3 = [h[i], h[i + 1], h[i + 2]];
+      const q: Q = [h[i + 3], h[i + 4], h[i + 5], h[i + 6]];
+      const tint = h[i + 7], angle = h[i + 8], gear = Math.min(2, Math.max(0, h[i + 9]));
+      for (let j = 0; j < 8; j++) D.body[k * 8 + j] = h[i + j];
+      // how fast the rotors turn, from one frame to the next, unless the caller says
+      const sp = (this.heliSpin[k] ??= { a: angle, t: now, blur: 0 });
+      const dt = now - sp.t;
+      if (dt > 1e-3) {
+        const da = Math.abs(Math.atan2(Math.sin(angle - sp.a), Math.cos(angle - sp.a)));
+        const want = dt < 0.5 ? Math.min(1, Math.max(0, (da / dt - 5) / 11)) : 0;
+        sp.blur += (want - sp.blur) * Math.min(1, dt * 8);
+        sp.a = angle;
+        sp.t = now;
+      }
+      const speed = h[i + 10] > 0 ? Math.min(1, h[i + 10]) : sp.blur;
+      // blades hang at rest and cone up with speed; they thin out into the disc as it rises
+      const lift = speed * speed * (3 - 2 * speed);
+      const tip = HELI_BLADE_REST + (HELI_BLADE_CONE - HELI_BLADE_REST) * lift;
+      // (never quite: a ghost of the blades keeps the rotor readable edge-on, where the disc has no thickness)
+      const fade = Math.min(0.86, Math.max(0, (speed - 0.3) / 0.35));
+      const show = tint > 0.5 ? Math.min(1, Math.max(0, (speed - 0.25) / 0.4)) : 0;
+      HELI_ROTORS.forEach((r, ri) => {
+        const o = qRot(q, r.pos);
+        const rq = qMul(q, qMul(qAxis(1, 0, 0, r.tilt), qAxis(0, 1, 0, r.dir * angle + r.phase)));
+        const row = [p[0] + o[0], p[1] + o[1], p[2] + o[2], rq[0], rq[1], rq[2], rq[3]];
+        D.rotor[ri].set([...row, tint, tip, tint > 0.5 ? fade : 0], k * ROTOR_INST);
+        if (show > 0.01) D.disc[ri].set([...row, show, tip, 0], discs[ri]++ * ROTOR_INST);
+      });
+      const cnt = [0, 0];
+      // 0..1 the oleo struts extend, 1..2 the unit slides up into its well
+      const stow = Math.max(0, gear - 1), ease = stow * stow * (3 - 2 * stow);
+      for (const g of HELI_GEAR) {
+        const drop = -HELI_GEAR_TRAVEL * Math.min(1, gear) + (g.retract + HELI_GEAR_TRAVEL) * ease;
+        const o = qRot(q, [g.pos[0], g.pos[1] + drop, g.pos[2]]);
+        const kind = g.rear ? 1 : 0;
+        D.gear[kind].set([p[0] + o[0], p[1] + o[1], p[2] + o[2], q[0], q[1], q[2], q[3], tint], (k * 2 + cnt[kind]++) * 8);
+      }
+    }
+    const solid: ModelDraw[] = [], rotors: ModelDraw[] = [], dd: ModelDraw[] = [];
+    const put = (to: ModelDraw[], name: string, m: ModelGpu, data: Float32Array, count: number, stride = 8) => {
+      const inst = this.instBuffer(name, data.buffer as ArrayBuffer, count * stride * 4);
+      if (inst) to.push({ m, inst, n: count });
+    };
+    put(solid, 'heli', hm.body, D.body, n);
+    put(solid, 'heliGear0', hm.gear[0], D.gear[0], n * 2);
+    put(solid, 'heliGear1', hm.gear[1], D.gear[1], n * 2);
+    for (let ri = 0; ri < 2; ri++) {
+      put(rotors, `heliRotor${ri}`, hm.rotor[ri], D.rotor[ri], n, ROTOR_INST);
+      put(dd, `heliDisc${ri}`, hm.rotor[ri], D.disc[ri], discs[ri], ROTOR_INST);
+    }
+    return { solid, rotors, discs: dd };
   }
 
   async loadCarModel(url: string, kind = 0): Promise<void> {
@@ -987,6 +1142,7 @@ export class Renderer {
         if (wi) carDraws.push({ m: g.m, inst: wi, n: n * g.at.length });
       });
     }
+    const heli = this.heliDraws();
     const planeOn = !!(this.planeModel && this.planePose);
     if (planeOn) {
       this.planeInst = this.instBuffer('plane', this.planePose!.buffer as ArrayBuffer, 32);
@@ -1030,8 +1186,15 @@ export class Renderer {
           sp.setBindGroup(1, this.bgGrass);
           sp.draw(15, GRASS_NEAR * GRASS_NEAR, 0, 65536);
         }
-        for (const c of carDraws) {
+        for (const c of [...carDraws, ...heli.solid]) {
           sp.setPipeline(this.pipes.modelShadow);
+          sp.setVertexBuffer(0, c.m.vb);
+          sp.setVertexBuffer(1, c.inst);
+          sp.setIndexBuffer(c.m.ib, 'uint32');
+          for (const p of c.m.parts) if (!p.blend) sp.drawIndexed(p.count, c.n, p.first);
+        }
+        for (const c of heli.rotors) {
+          sp.setPipeline(this.pipes.rotorShadow);
           sp.setVertexBuffer(0, c.m.vb);
           sp.setVertexBuffer(1, c.inst);
           sp.setIndexBuffer(c.m.ib, 'uint32');
@@ -1097,11 +1260,24 @@ export class Renderer {
       draws += 2;
     }
     const models: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
-    models.push(...carDraws);
+    models.push(...carDraws, ...heli.solid);
     if (planeOn && this.planeInst) models.push({ m: this.planeModel!, inst: this.planeInst, n: 1 });
     if (planeOn && this.fanModel && this.fanInst) models.push({ m: this.fanModel, inst: this.fanInst, n: 2 });
     for (const { m, inst, n } of models) {
       pass.setPipeline(this.pipes.model);
+      pass.setVertexBuffer(0, m.vb);
+      pass.setVertexBuffer(1, inst);
+      pass.setIndexBuffer(m.ib, 'uint32');
+      for (const p of m.parts) {
+        if (p.blend) continue;
+        pass.setBindGroup(1, p.bg);
+        pass.drawIndexed(p.count, n, p.first);
+        tris += (p.count / 3) * n;
+        draws++;
+      }
+    }
+    for (const { m, inst, n } of heli.rotors) {
+      pass.setPipeline(this.pipes.rotor);
       pass.setVertexBuffer(0, m.vb);
       pass.setVertexBuffer(1, inst);
       pass.setIndexBuffer(m.ib, 'uint32');
@@ -1134,6 +1310,19 @@ export class Renderer {
     }
     for (const c of carDraws) {
       pass.setPipeline(this.pipes.modelBlend);
+      pass.setVertexBuffer(0, c.m.vb);
+      pass.setVertexBuffer(1, c.inst);
+      pass.setIndexBuffer(c.m.ib, 'uint32');
+      for (const p of c.m.parts) {
+        if (!p.blend) continue;
+        pass.setBindGroup(1, p.bg);
+        pass.drawIndexed(p.count, c.n, p.first);
+        draws++;
+      }
+    }
+    // the blur of turning rotor blades
+    for (const c of heli.discs) {
+      pass.setPipeline(this.pipes.rotorDisc);
       pass.setVertexBuffer(0, c.m.vb);
       pass.setVertexBuffer(1, c.inst);
       pass.setIndexBuffer(c.m.ib, 'uint32');

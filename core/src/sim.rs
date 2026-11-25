@@ -8,11 +8,24 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 13;
+pub const PROTO: u16 = 14;
 /// A car catches fire below this share of its bodywork, and then explodes
 /// after the fuse (5 s) whatever happens.
 pub const CAR_FIRE_AT: f32 = 0.19;
 pub const CAR_FUSE_TICKS: u32 = 150;
+/// Helicopters: hull strength, missiles carried, seconds between launches,
+/// missile speed (m/s) and life (ticks).
+pub const HELI_HP: f32 = 1500.0;
+pub const HELI_AMMO: u8 = 16;
+pub const MISSILE_CD: f32 = 0.8;
+pub const MISSILE_SPEED: f32 = 95.0;
+pub const MISSILE_LIFE: u32 = 120;
+/// A missile's blast: radius, damage to a player / a vehicle at its centre.
+pub const MISSILE_R: f32 = 9.5;
+pub const MISSILE_DMG: f32 = 160.0;
+pub const MISSILE_CAR_DMG: f32 = 900.0;
+/// Where the missiles leave the hull, in its frame (x = right, y up, z = nose).
+pub const MISSILE_POD: [f32; 3] = [2.16, 1.29, 2.45];
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -206,6 +219,48 @@ pub struct Nade {
     pub vel: V3,
     pub fuse: f32,
     pub owner: u8,
+    pub id: u16,
+}
+
+/// What a match knows of a helicopter besides its pose (`World::helis`).
+#[derive(Clone, Copy, Debug)]
+pub struct Heli {
+    /// Who flies it (255 = nobody).
+    pub pilot: u8,
+    /// Hull left (0 = a wreck) and who damaged it last.
+    pub hp: f32,
+    pub hit_by: u8,
+    pub ammo: u8,
+    /// Seconds until the next missile may leave.
+    pub cd: f32,
+    /// Rotor speed 0..1 (for show: it winds up with a pilot aboard).
+    pub rotor: f32,
+    pub vel: V3,
+    /// Off the ground.
+    pub air: bool,
+    /// Attitude for show, radians: pitch > 0 is nose down, roll > 0 is
+    /// right side down.
+    pub pitch: f32,
+    pub roll: f32,
+    /// Which pod fires next.
+    side: bool,
+}
+
+impl Heli {
+    fn parked() -> Heli {
+        Heli { pilot: 255, hp: HELI_HP, hit_by: 255, ammo: HELI_AMMO, cd: 0.0, rotor: 0.0, vel: V3::ZERO, air: false, pitch: 0.0, roll: 0.0, side: false }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Missile {
+    pub pos: V3,
+    pub dir: V3,
+    /// Ticks left to fly.
+    pub life: u32,
+    pub owner: u8,
+    /// The helicopter that launched it (it cannot hit that one).
+    pub heli: u8,
     pub id: u16,
 }
 
@@ -479,6 +534,12 @@ pub struct Match {
     pub car_fire: Vec<u32>,
     pub props: Vec<Prop>,
     car0: Vec<[f32; 4]>,
+    /// Helicopters (poses in `w.helis`), where they are parked at the start
+    /// of a match, and the missiles in flight.
+    pub helis: Vec<Heli>,
+    heli0: Vec<[f32; 4]>,
+    pub missiles: Vec<Missile>,
+    missile_seq: u16,
 }
 
 impl Match {
@@ -497,6 +558,7 @@ impl Match {
         let slots = slots.clamp(2, MAX_PLAYERS);
         let ncar = w.cars.len();
         let car0 = w.cars.clone();
+        let heli0 = w.helis.clone();
         let mut m = Match {
             w,
             rng: Rng::new(secret ^ (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED),
@@ -543,6 +605,10 @@ impl Match {
             car_fire: vec![0; ncar],
             props: Vec::new(),
             car0,
+            helis: vec![Heli::parked(); heli0.len()],
+            heli0,
+            missiles: Vec::new(),
+            missile_seq: 0,
         };
         m.car_hp = (0..ncar).map(|k| m.car_max_hp(k)).collect();
         m.props = m.w.props.iter().map(|&i| {
@@ -764,8 +830,9 @@ impl Match {
             self.ev_pinfo(i, true);
             self.players[i] = Player::default();
         } else {
-            // AI takes over the abandoned character (bots do not drive).
+            // AI takes over the abandoned character (bots do not drive or fly).
             self.exit_car(i);
+            self.leave_heli(i);
             let seed = self.rng.u32();
             let pl = self.plane;
             let p = &mut self.players[i];
@@ -869,6 +936,11 @@ impl Match {
             self.car_hit_by[k] = 255;
             self.car_fire[k] = 0;
         }
+        self.w.helis = self.heli0.clone();
+        for h in self.helis.iter_mut() {
+            *h = Heli::parked();
+        }
+        self.missiles.clear();
         self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
         self.pick_next_zone();
         let ppos = self.plane.pos();
@@ -987,6 +1059,17 @@ impl Match {
             self.exit_car(i);
             return;
         }
+        if mode == MODE_FLY {
+            let ms = self.players[i].ms;
+            // out only once it has landed and stands still
+            if use_ && ms.on_ground && ms.vel.len() < 1.5 {
+                self.exit_heli(i);
+                return;
+            }
+            step_move(&self.w, &mut self.players[i].ms, &c, 1.0, DT);
+            self.heli_moved_by(i, ms.vel, &c);
+            return;
+        }
         let mult = self.players[i].speed_mult();
         let w = &self.w;
         let p = &mut self.players[i];
@@ -1039,7 +1122,7 @@ impl Match {
                 p.reload_t = 0.0;
             }
         }
-        if use_ && self.enter_car(i) {
+        if use_ && (self.enter_car(i) || self.enter_heli(i)) {
             return;
         }
         // leaning on a crate slides it along
@@ -1216,7 +1299,7 @@ impl Match {
             p.vel.y -= 20.0 * DT;
             let mut np = p.pos + p.vel * DT;
             let mut q = V3::new(np.x, np.y + 0.05, np.z);
-            if self.w.collide_body(&mut q, r, hy) | self.w.push_cars(&mut q, r, usize::MAX) {
+            if self.w.collide_body(&mut q, r, hy) | self.w.push_cars(&mut q, r, usize::MAX) | self.w.push_helis(&mut q, r, hy, usize::MAX) {
                 // off a wall, a car or another prop: most of the speed is lost
                 let (dx, dz) = (q.x - np.x, q.z - np.z);
                 let l = (dx * dx + dz * dz).sqrt().max(1e-4);
@@ -1337,7 +1420,7 @@ impl Match {
         let radius = 8.5;
         for j in 0..MAX_PLAYERS {
             let q = &self.players[j];
-            if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_FLY {
                 continue;
             }
             let at = q.ms.pos + V3::new(0.0, 0.9, 0.0);
@@ -1360,6 +1443,7 @@ impl Match {
                 self.hurt_car(o, 520.0 * (1.0 - d / radius), by);
             }
         }
+        self.blast_helis(pos, radius, 520.0, 1.0, by);
     }
 
     /// The car `i` drives, if any.
@@ -1402,6 +1486,7 @@ impl Match {
             let mut q = at;
             self.w.collide_body(&mut q, P_RADIUS, 1.8);
             self.w.push_cars(&mut q, P_RADIUS, usize::MAX);
+            self.w.push_helis(&mut q, P_RADIUS, 1.8, usize::MAX);
             let moved = (q - at).len();
             if moved < least {
                 least = moved;
@@ -1461,6 +1546,431 @@ impl Match {
                 // the hit costs the car some speed
                 let p = &mut self.players[i];
                 p.ms.vel = p.ms.vel * 0.85;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Helicopters
+    // ------------------------------------------------------------------
+    /// The helicopter `i` flies, if any.
+    fn heli_of(&self, i: usize) -> Option<usize> {
+        let p = &self.players[i];
+        let k = p.ms.car as usize;
+        (p.ms.mode == MODE_FLY && k < self.helis.len() && self.helis[k].pilot == i as u8).then_some(k)
+    }
+
+    /// Board the nearest landed, unpiloted, intact helicopter within reach.
+    fn enter_heli(&mut self, i: usize) -> bool {
+        let pos = self.players[i].ms.pos;
+        let mut best: Option<(usize, f32)> = None;
+        for k in 0..self.helis.len() {
+            let h = self.helis[k];
+            if h.pilot != 255 || h.hp <= 0.0 || h.air {
+                continue;
+            }
+            let c = self.w.helis[k];
+            if (pos.y - c[1]).abs() > 1.6 {
+                continue;
+            }
+            // distance to the hull: how far a 1.8 m circle overlaps it
+            let mut q = pos;
+            if !self.w.push_heli(k, &mut q, 1.8, 1.8) {
+                continue;
+            }
+            // not through a wall
+            if self.w.blocked_static(pos + V3::new(0.0, 1.0, 0.0), q + V3::new(0.0, 1.0, 0.0)) {
+                continue;
+            }
+            let d = (q - pos).len();
+            if best.map_or(true, |b| d > b.1) {
+                best = Some((k, d));
+            }
+        }
+        let Some((k, _)) = best else { return false };
+        let c = self.w.helis[k];
+        self.helis[k].pilot = i as u8;
+        self.helis[k].vel = V3::ZERO;
+        let p = &mut self.players[i];
+        p.ms = MoveState { pos: V3::new(c[0], c[1], c[2]), mode: MODE_FLY, on_ground: true, airtime: c[3], car: k as u8, ..Default::default() };
+        p.ads = false;
+        p.reload_t = 0.0;
+        p.heal_t = 0.0;
+        p.firing_t = 0.0;
+        true
+    }
+
+    /// Step out beside the landed helicopter.
+    fn exit_heli(&mut self, i: usize) {
+        let Some(k) = self.heli_of(i) else {
+            if self.players[i].ms.mode == MODE_FLY {
+                self.players[i].ms.mode = MODE_GROUND;
+            }
+            return;
+        };
+        self.helis[k].pilot = 255;
+        self.helis[k].vel = V3::ZERO;
+        let c = self.w.helis[k];
+        let (f, r) = (fwd(c[3]), right(c[3]));
+        let (ds, dl) = (HELI_HW + 0.75, HELI_HL + 0.75);
+        // by the cockpit on the right, then on the left, further back, and
+        // off the nose or the tail (never through a wall it stands against;
+        // with every side walled in, out of the middle)
+        let mid = V3::new(c[0], c[1] + 1.0, c[2]);
+        let mut out = V3::new(c[0], c[1], c[2]);
+        let mut least = f32::MAX;
+        for (sx, sz) in [(ds, 4.5), (-ds, 4.5), (ds, 0.0), (-ds, 0.0), (ds, -4.5), (-ds, -4.5), (0.0, dl), (0.0, -dl)] {
+            let (x, z) = (c[0] + r.x * sx + f.x * sz, c[2] + r.z * sx + f.z * sz);
+            let y = self.w.ground_below(x, z, c[1] + 1.0, P_RADIUS);
+            if (y - c[1]).abs() > 1.6 {
+                continue;
+            }
+            let at = V3::new(x, y, z);
+            if self.w.blocked_static(mid, at + V3::new(0.0, 1.0, 0.0)) {
+                continue;
+            }
+            let mut q = at;
+            self.w.collide_body(&mut q, P_RADIUS, 1.8);
+            self.w.push_cars(&mut q, P_RADIUS, usize::MAX);
+            self.w.push_helis(&mut q, P_RADIUS, 1.8, usize::MAX);
+            let moved = (q - at).len();
+            if moved < least {
+                least = moved;
+                out = q;
+            }
+            if moved < 0.01 {
+                break;
+            }
+        }
+        let p = &mut self.players[i];
+        p.ms = MoveState { pos: out, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+        p.switch_t = p.switch_t.max(0.35);
+    }
+
+    /// The pilot goes whatever the helicopter is doing (its player left the
+    /// match): beside it when it has landed, under a parachute when it is
+    /// in the air. The empty helicopter then comes down by itself
+    /// (`update_helis`).
+    fn leave_heli(&mut self, i: usize) {
+        let Some(k) = self.heli_of(i) else {
+            if self.players[i].ms.mode == MODE_FLY {
+                self.players[i].ms.mode = MODE_GROUND;
+            }
+            return;
+        };
+        if !self.helis[k].air {
+            self.exit_heli(i);
+            return;
+        }
+        let ms = self.players[i].ms;
+        self.helis[k].pilot = 255;
+        self.helis[k].vel = ms.vel;
+        let r = right(ms.airtime);
+        let mut at = ms.pos + r * (HELI_HW + 2.5) + V3::new(0.0, 1.0, 0.0);
+        self.w.collide_body(&mut at, P_RADIUS, 1.8);
+        at.y = at.y.max(self.w.ground_below(at.x, at.z, at.y, P_RADIUS));
+        let p = &mut self.players[i];
+        p.ms = MoveState { pos: at, vel: V3::new(ms.vel.x * 0.5, -2.0, ms.vel.z * 0.5), mode: MODE_PARA, ..Default::default() };
+    }
+
+    /// Damage the hull of helicopter `k`; it blows up when nothing is left.
+    pub fn hurt_heli(&mut self, k: usize, dmg: f32, by: u8) {
+        if k >= self.helis.len() || self.helis[k].hp <= 0.0 || dmg <= 0.0 || self.phase != PH_PLAY {
+            return;
+        }
+        self.helis[k].hp -= dmg;
+        self.helis[k].hit_by = by;
+        if self.helis[k].hp <= 0.0 {
+            self.explode_heli(k);
+        }
+    }
+
+    /// Helicopters within `radius` of a blast at `pos` take up to `dmg`.
+    fn blast_helis(&mut self, pos: V3, radius: f32, dmg: f32, pw: f32, by: u8) {
+        for k in 0..self.helis.len() {
+            let c = self.w.helis[k];
+            // distance to the hull: to its axis, less its girth
+            let f = fwd(c[3]);
+            let along = clampf((pos.x - c[0]) * f.x + (pos.z - c[2]) * f.z, -6.0, 6.0);
+            let d = ((V3::new(c[0] + f.x * along, c[1] + 1.8, c[2] + f.z * along) - pos).len() - 1.7).max(0.0);
+            if d < radius {
+                self.hurt_heli(k, dmg * (1.0 - d / radius).powf(pw), by);
+            }
+        }
+    }
+
+    /// Helicopter `k` blows up: its pilot dies, people and vehicles nearby
+    /// are hurt, and a wreck is left (it falls if it was flying).
+    fn explode_heli(&mut self, k: usize) {
+        let c = self.w.helis[k];
+        let by = self.helis[k].hit_by;
+        self.helis[k].hp = 0.0;
+        self.helis[k].ammo = 0;
+        let pos = V3::new(c[0], c[1] + 1.8, c[2]);
+        let dr = self.helis[k].pilot as usize;
+        if dr < MAX_PLAYERS {
+            let who = if (by as usize) < MAX_PLAYERS { by } else { dr as u8 };
+            self.damage(dr, who, 1.0e6, false, WK_BOOM, pos);
+        }
+        self.helis[k].pilot = 255;
+        let start = self.ev_begin();
+        let mut w = Wr::new(&mut self.ev);
+        w.u8(E_BOOM);
+        w.f32(pos.x);
+        w.f32(pos.y);
+        w.f32(pos.z);
+        self.ev_end(start, 255, Some(pos));
+        let radius = 11.0;
+        for j in 0..MAX_PLAYERS {
+            let q = &self.players[j];
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_FLY {
+                continue;
+            }
+            let at = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+            let d = (at - pos).len();
+            // the wreck itself is no cover from its own blast
+            if d > radius || self.w.blocked_static(pos, at) {
+                continue;
+            }
+            let dmg = 130.0 * (1.0 - d / radius).powf(1.3);
+            if dmg > 1.0 {
+                let who = if (by as usize) < MAX_PLAYERS { by } else { j as u8 };
+                self.damage(j, who, dmg, false, WK_BOOM, pos);
+            }
+        }
+        self.blast_props(pos, radius + 1.5);
+        for o in 0..self.w.cars.len() {
+            let oc = self.w.cars[o];
+            let d = (V3::new(oc[0], oc[1] + 0.7, oc[2]) - pos).len();
+            if d < radius {
+                self.hurt_car(o, 600.0 * (1.0 - d / radius), by);
+            }
+        }
+        // (the wreck itself has nothing left to lose)
+        self.blast_helis(pos, radius, 600.0, 1.0, by);
+    }
+
+    /// After the pilot's step: move the helicopter with them, dent it when
+    /// it flew into something, shove people aside and launch missiles.
+    fn heli_moved_by(&mut self, i: usize, v0: V3, c: &Cmd) {
+        let Some(k) = self.heli_of(i) else {
+            self.exit_heli(i);
+            return;
+        };
+        let tick = self.tick;
+        let ms = self.players[i].ms;
+        let old = self.w.helis[k];
+        self.w.helis[k] = [ms.pos.x, ms.pos.y, ms.pos.z, ms.airtime];
+        {
+            // attitude, for show: nose down with forward speed and thrust,
+            // banking into a turn and with a sideways slide
+            let (f, r) = (fwd(ms.airtime), right(ms.airtime));
+            let a = (ms.vel - v0) * (1.0 / DT);
+            let (vf, vs) = (ms.vel.dot(f), ms.vel.dot(r));
+            let turn = wrap_angle(ms.airtime - old[3]) / DT;
+            let (tp, tr) = if ms.on_ground {
+                (0.0, 0.0)
+            } else {
+                (clampf(vf / HELI_VMAX * 0.12 + a.dot(f) * 0.014, -0.3, 0.3), clampf(vs / HELI_VSIDE * 0.08 + a.dot(r) * 0.014 - turn * vf * 0.004, -0.35, 0.35))
+            };
+            let h = &mut self.helis[k];
+            h.pitch = lerpf(h.pitch, tp, 0.12);
+            h.roll = lerpf(h.roll, tr, 0.12);
+            h.vel = ms.vel;
+            h.air = !ms.on_ground;
+        }
+        // a crash: the speed lost in one step (a wall, a tree, the ground
+        // taken at speed) dents the hull
+        let lost = v0.len() - ms.vel.len();
+        if lost > 2.0 {
+            self.hurt_heli(k, (lost - 2.0) * 40.0, i as u8);
+            if self.helis[k].hp <= 0.0 {
+                return;
+            }
+        }
+        let v = ms.vel.len();
+        for j in 0..MAX_PLAYERS {
+            let q = &self.players[j];
+            if j == i || !q.used || !q.alive || q.ms.mode != MODE_GROUND {
+                continue;
+            }
+            let hgt = body_h(q.ms.crouch);
+            let mut at = q.ms.pos;
+            if !self.w.push_heli(k, &mut at, P_RADIUS, hgt) {
+                continue;
+            }
+            self.w.collide_body(&mut at, P_RADIUS, hgt);
+            let q = &mut self.players[j];
+            q.ms.pos.x = at.x;
+            q.ms.pos.z = at.z;
+            if v > 4.0 && tick.wrapping_sub(q.ram_tick) > 24 {
+                q.ram_tick = tick;
+                self.damage(j, i as u8, 12.0 + (v - 4.0) * 5.0, false, WK_HELI, ms.pos);
+            }
+        }
+        if c.has(B_FIRE) {
+            self.fire_missile(i, k);
+        }
+    }
+
+    /// Launch a missile from helicopter `k` along its pilot's aim, if one
+    /// is ready. The pods fire in turn.
+    fn fire_missile(&mut self, i: usize, k: usize) {
+        let h = self.helis[k];
+        if h.cd > 0.0 || h.ammo == 0 || h.hp <= 0.0 {
+            return;
+        }
+        let c = self.w.helis[k];
+        let p = &self.players[i];
+        // only ahead: within 60 degrees of the nose, and not straight up
+        let off = clampf(wrap_angle(p.yaw - c[3]), -1.05, 1.05);
+        let d = dir_from(c[3] + off, clampf(p.pitch, -1.3, 0.6));
+        let (f, r) = (fwd(c[3]), right(c[3]));
+        let pos = V3::new(c[0], c[1], c[2]);
+        let side = if h.side { 1.0 } else { -1.0 };
+        let from = pos + r * (side * MISSILE_POD[0]) + V3::UP * MISSILE_POD[1] + f * MISSILE_POD[2];
+        // Both pods converge on what the line from the middle of the hull
+        // along the aim meets (the world only: vehicles move).
+        let mid = pos + V3::new(0.0, 2.0, 0.0);
+        let reach = MISSILE_SPEED * MISSILE_LIFE as f32 * DT;
+        let t = self.w.raycast_static(mid, d, reach).map_or(reach, |x| x.0).max(30.0);
+        let dir = (mid + d * t - from).norm();
+        self.missile_seq = self.missile_seq.wrapping_add(1);
+        let id = self.missile_seq;
+        self.missiles.push(Missile { pos: from, dir, life: MISSILE_LIFE, owner: i as u8, heli: k as u8, id });
+        let h = &mut self.helis[k];
+        h.ammo -= 1;
+        h.cd = MISSILE_CD;
+        h.side = !h.side;
+    }
+
+    /// Missiles fly straight and go off on the world, a vehicle, close to
+    /// a player, or at the end of their run.
+    fn update_missiles(&mut self) {
+        let mut k = 0;
+        while k < self.missiles.len() {
+            let mut m = self.missiles[k];
+            let mut lim = MISSILE_SPEED * DT;
+            let mut hit = false;
+            if let Some((t, _, _)) = self.w.raycast_static(m.pos, m.dir, lim) {
+                lim = t;
+                hit = true;
+            }
+            if let Some((t, _, _)) = self.w.ray_cars(m.pos, m.dir, lim) {
+                lim = t;
+                hit = true;
+            }
+            if let Some((t, _, _)) = self.w.ray_helis(m.pos, m.dir, lim, m.heli as usize) {
+                lim = t;
+                hit = true;
+            }
+            // the sea
+            if m.dir.y < -1e-4 && m.pos.y > WATER && (m.pos.y - WATER) / -m.dir.y < lim {
+                lim = (m.pos.y - WATER) / -m.dir.y;
+                hit = true;
+            }
+            // passing within a metre of somebody on foot or in the air
+            for j in 0..MAX_PLAYERS {
+                let q = &self.players[j];
+                if j == m.owner as usize || !q.used || !q.alive || !matches!(q.ms.mode, MODE_GROUND | MODE_FALL | MODE_PARA) {
+                    continue;
+                }
+                let c = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+                let along = clampf((c - m.pos).dot(m.dir), 0.0, lim);
+                if (m.pos + m.dir * along - c).len() < 1.1 {
+                    lim = (along - 0.4).max(0.0).min(lim);
+                    hit = true;
+                }
+            }
+            m.pos += m.dir * lim;
+            m.life = m.life.saturating_sub(1);
+            let out = m.pos.x < 1.0 || m.pos.z < 1.0 || m.pos.x > MAP - 1.0 || m.pos.z > MAP - 1.0;
+            if hit || out || m.life == 0 || !m.pos.finite() {
+                self.missiles.swap_remove(k);
+                // one that leaves the map is simply gone: a blast at the edge
+                // would wreck the helicopter that fired it from there
+                if m.pos.finite() && (hit || !out) {
+                    // (just short of what it hit, so the blast is not inside it)
+                    self.blast(m.pos - m.dir * 0.25, m.owner, MISSILE_R, MISSILE_DMG, 1.4, MISSILE_CAR_DMG, WK_MISSILE);
+                }
+                continue;
+            }
+            self.missiles[k] = m;
+            k += 1;
+        }
+    }
+
+    /// Per tick: cooldowns, rotors, and helicopters nobody flies coming
+    /// down. An intact one left in the air autorotates: it sinks, slows
+    /// and settles gently where it is; a wreck drops.
+    fn update_helis(&mut self) {
+        for k in 0..self.helis.len() {
+            let pi = self.helis[k].pilot as usize;
+            if pi < MAX_PLAYERS && self.heli_of(pi).is_none() {
+                // the pilot is gone (dead, or put out of it)
+                self.helis[k].pilot = 255;
+            }
+            let c = self.w.helis[k];
+            let mut h = self.helis[k];
+            h.cd = (h.cd - DT).max(0.0);
+            h.rotor = if h.hp <= 0.0 {
+                (h.rotor - DT / 2.0).max(0.0)
+            } else if h.pilot != 255 {
+                (h.rotor + DT / 3.0).min(1.0)
+            } else if h.air {
+                approach(h.rotor, 0.7, DT / 4.0)
+            } else {
+                (h.rotor - DT / 8.0).max(0.0)
+            };
+            if h.pilot != 255 {
+                self.helis[k] = h;
+                continue;
+            }
+            h.pitch = lerpf(h.pitch, 0.0, 0.08);
+            h.roll = lerpf(h.roll, 0.0, 0.08);
+            if !h.air {
+                h.vel = V3::ZERO;
+                self.helis[k] = h;
+                continue;
+            }
+            let pos = V3::new(c[0], c[1], c[2]);
+            let mut impact = 0.0;
+            if h.hp > 0.0 {
+                let mut ms = MoveState { pos, vel: h.vel, mode: MODE_FLY, airtime: c[3], car: k as u8, ..Default::default() };
+                step_fly(&self.w, &mut ms, &Cmd { yaw: c[3], buttons: B_CROUCH, ..Default::default() }, DT);
+                self.w.helis[k] = [ms.pos.x, ms.pos.y, ms.pos.z, c[3]];
+                h.vel = ms.vel;
+                h.air = !ms.on_ground;
+            } else {
+                h.vel.y = (h.vel.y - 14.0 * DT).max(-40.0);
+                h.vel.x *= 0.99;
+                h.vel.z *= 0.99;
+                let mut np = pos + h.vel * DT;
+                np.x = clampf(np.x, 10.0, MAP - 10.0);
+                np.z = clampf(np.z, 10.0, MAP - 10.0);
+                let push = heli_collide(&self.w, k, &mut np, c[3]);
+                if push.len2() > 1e-8 {
+                    h.vel.x = 0.0;
+                    h.vel.z = 0.0;
+                }
+                let g = heli_floor(&self.w, np, c[3], pos.y.max(np.y));
+                if np.y <= g {
+                    np.y = g;
+                    impact = h.vel.len();
+                    h.vel = V3::ZERO;
+                    h.air = false;
+                }
+                if !np.finite() {
+                    np = pos;
+                    h.air = false;
+                }
+                self.w.helis[k] = [np.x, np.y, np.z, c[3]];
+            }
+            self.helis[k] = h;
+            if impact > 12.0 {
+                // the wreck hits the ground
+                let at = V3::new(self.w.helis[k][0], self.w.helis[k][1] + 1.5, self.w.helis[k][2]);
+                self.blast(at, h.hit_by, 7.0, 90.0, 1.3, 300.0, WK_BOOM);
             }
         }
     }
@@ -1585,7 +2095,7 @@ impl Match {
                 continue;
             }
             let q = &self.players[j];
-            if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_DRIVE {
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_DRIVE || q.ms.mode == MODE_FLY {
                 continue;
             }
             let h = if self.players[shooter].bot { HistE::of(q) } else {
@@ -1694,6 +2204,13 @@ impl Match {
                     }
                     // and the car itself wears down until it blows up
                     self.hurt_car(k, def.dmg * fall, i as u8);
+                }
+            }
+            if victim.is_none() && hit_kind == 3 && wh.map_or(false, |h| h.2 == BK_HELI) && (end - alt).len2() < 0.01 {
+                // a helicopter's hull stops the bullet and wears down
+                if let Some((_, _, k)) = self.w.ray_helis(o, d, tw + 0.05, usize::MAX) {
+                    let fall = if tw <= def.f0 { 1.0 } else if tw >= def.f1 { def.fmin } else { lerpf(1.0, def.fmin, (tw - def.f0) / (def.f1 - def.f0)) };
+                    self.hurt_heli(k, def.dmg * fall, i as u8);
                 }
             }
             if let Some((j, dist, head)) = victim {
@@ -1842,44 +2359,52 @@ impl Match {
     }
 
     fn explode(&mut self, n: Nade) {
+        self.blast(n.pos, n.owner, 7.5, 115.0, 1.4, 460.0, WK_NADE);
+    }
+
+    /// An explosion at `pos`: players in sight of it within `radius` are
+    /// hurt (`pdmg` at the centre, falling off with the power `pw`), props
+    /// fly, vehicles take up to `cdmg`.
+    fn blast(&mut self, pos: V3, owner: u8, radius: f32, pdmg: f32, pw: f32, cdmg: f32, wk: u8) {
         let start = self.ev_begin();
         let mut w = Wr::new(&mut self.ev);
         w.u8(E_BOOM);
-        w.f32(n.pos.x);
-        w.f32(n.pos.y);
-        w.f32(n.pos.z);
-        self.ev_end(start, 255, Some(n.pos));
-        let radius = 7.5;
+        w.f32(pos.x);
+        w.f32(pos.y);
+        w.f32(pos.z);
+        self.ev_end(start, 255, Some(pos));
         for j in 0..MAX_PLAYERS {
             let q = &self.players[j];
-            if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
+            // (a pilot is behind the hull: the helicopter takes it)
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_FLY {
                 continue;
             }
             // a driver is reached over the roof, and shielded a little
             let driving = q.ms.mode == MODE_DRIVE;
             let roof = if driving { self.w.car_dims(q.ms.car as usize).2 + 0.3 } else { 0.9 };
             let c = q.ms.pos + V3::new(0.0, roof, 0.0);
-            let d = (c - n.pos).len();
+            let d = (c - pos).len();
             if d > radius {
                 continue;
             }
-            if self.w.blocked(n.pos + V3::new(0.0, 0.3, 0.0), c) {
+            if self.w.blocked(pos + V3::new(0.0, 0.3, 0.0), c) {
                 continue;
             }
             let k = 1.0 - d / radius;
-            let dmg = 115.0 * k.powf(1.4) * if driving { 0.7 } else { 1.0 };
+            let dmg = pdmg * k.powf(pw) * if driving { 0.7 } else { 1.0 };
             if dmg > 1.0 {
-                self.damage(j, n.owner, dmg, false, 200, n.pos);
+                self.damage(j, owner, dmg, false, wk, pos);
             }
         }
-        self.blast_props(n.pos, radius);
+        self.blast_props(pos, radius);
         for k in 0..self.w.cars.len() {
             let c = self.w.cars[k];
-            let d = (V3::new(c[0], c[1] + 0.7, c[2]) - n.pos).len();
+            let d = (V3::new(c[0], c[1] + 0.7, c[2]) - pos).len();
             if d < radius {
-                self.hurt_car(k, 460.0 * (1.0 - d / radius).powf(1.2), n.owner);
+                self.hurt_car(k, cdmg * (1.0 - d / radius).powf(1.2), owner);
             }
         }
+        self.blast_helis(pos, radius, cdmg, 1.2, owner);
     }
 
     /// Apply damage. attacker 255 = zone. weapon 200 = grenade.
@@ -1967,11 +2492,21 @@ impl Match {
                     self.car_moved[k] = tick;
                 }
             }
+            let mut at = q.ms.pos;
+            if q.ms.mode == MODE_FLY {
+                let k = q.ms.car as usize;
+                if k < self.helis.len() && self.helis[k].pilot == j as u8 {
+                    self.helis[k].pilot = 255;
+                    // what the pilot carried lands beside the hull, not in it
+                    let r = right(self.w.helis[k][3]);
+                    at = at + r * -(HELI_HW + 1.3);
+                }
+            }
             q.ms.mode = MODE_DEAD;
             q.ms.vel = V3::ZERO;
             q.reload_t = 0.0;
             q.heal_t = 0.0;
-            pos = q.ms.pos;
+            pos = at;
         }
         let follow = if (attacker as usize) < MAX_PLAYERS && attacker as usize != j { attacker } else { 255 };
         self.set_spect(j, follow);
@@ -2492,7 +3027,8 @@ impl Match {
                         c.mx = 0.0;
                         c.mz = 0.0;
                     }
-                    c.buttons &= B_CROUCH | B_ADS | B_SPRINT;
+                    // (a pilot's climb is a held control, like its descent)
+                    c.buttons &= B_CROUCH | B_ADS | B_SPRINT | if p.ms.mode == MODE_FLY { B_JUMP } else { 0 };
                     p.idle_run = p.idle_run.saturating_add(1);
                     self.apply_cmd(i, c);
                 }
@@ -2562,6 +3098,8 @@ impl Match {
                 self.auto_pickups();
                 self.update_nades();
                 self.update_car_fires();
+                self.update_helis();
+                self.update_missiles();
                 self.update_props();
                 self.update_zone();
                 self.zone_damage();
@@ -2778,6 +3316,8 @@ impl Match {
         } else {
             (me.ms.pos + V3::new(0.0, eye_h(me.ms.crouch), 0.0), i)
         };
+        // looking out of a helicopter (flying it, or watching its pilot)
+        let fly_view = self.players[cskip].ms.mode == MODE_FLY;
         let mut send = [false; MAX_PLAYERS];
         for j in 0..MAX_PLAYERS {
             if j == i {
@@ -2809,7 +3349,15 @@ impl Match {
                 let lift = if q.ms.mode == MODE_DRIVE { self.w.car_dims(q.ms.car as usize).2 - 0.7 } else { 0.0 };
                 let head = q.ms.pos + V3::new(0.0, eye_h(q.ms.crouch) + 0.1 + lift, 0.0);
                 let chest = q.ms.pos + V3::new(0.0, 0.9 + lift, 0.0);
-                let visible = !self.w.blocked(ceye, head) || !self.w.blocked(ceye, chest);
+                let visible = if q.ms.mode == MODE_FLY || fly_view {
+                    // A pilot is seen as its helicopter is (the top of the
+                    // hull, or its middle), and sees from inside one: only
+                    // the world itself hides anything, never a vehicle.
+                    let (top, mid) = if q.ms.mode == MODE_FLY { (q.ms.pos + V3::new(0.0, HELI_TOP, 0.0), q.ms.pos + V3::new(0.0, 2.0, 0.0)) } else { (head, chest) };
+                    !self.w.blocked_static(ceye, top) || !self.w.blocked_static(ceye, mid)
+                } else {
+                    !self.w.blocked(ceye, head) || !self.w.blocked(ceye, chest)
+                };
                 let pv = &mut self.players[i];
                 pv.vis_check[j] = tick;
                 if visible {
@@ -2934,6 +3482,56 @@ impl Match {
             pcount += 1;
         }
         self.out[ppos] = pcount;
+        let mut w = Wr::new(&mut self.out);
+        // ---- helicopters: loud and plain to see, so every one within
+        // range is sent; who flies it only as for the driver of a car
+        let hpos = w.len();
+        w.u8(0);
+        let mut hcount = 0u8;
+        for k in 0..self.helis.len().min(255) {
+            let c = self.w.helis[k];
+            let h = self.helis[k];
+            if h.pilot as usize != i && dist_xz(c[0], c[2], center.x, center.z) > INTEREST {
+                continue;
+            }
+            w.u8(k as u8);
+            w.f32(c[0]);
+            w.f32(c[1]);
+            w.f32(c[2]);
+            w.u16(q_yaw(c[3]));
+            w.u8(((h.pitch * 100.0).round().clamp(-127.0, 127.0) as i8) as u8);
+            w.u8(((h.roll * 100.0).round().clamp(-127.0, 127.0) as i8) as u8);
+            w.u8((h.rotor * 255.0).round().clamp(0.0, 255.0) as u8);
+            let dr = h.pilot;
+            w.u8(if dr as usize == i { dr } else if (dr as usize) < MAX_PLAYERS && send[dr as usize] { dr } else if dr != 255 { 254 } else { 255 });
+            // hull left in 255ths (0 only for a wreck)
+            w.u8(if h.hp <= 0.0 { 0 } else { ((h.hp / HELI_HP) * 255.0).ceil().clamp(1.0, 255.0) as u8 });
+            w.u8(h.ammo);
+            w.u8(h.air as u8);
+            hcount += 1;
+        }
+        self.out[hpos] = hcount;
+        let mut w = Wr::new(&mut self.out);
+        // ---- missiles in flight
+        let mpos = w.len();
+        w.u8(0);
+        let mut mcount = 0u8;
+        for m in &self.missiles {
+            if mcount >= 60 {
+                break;
+            }
+            if dist_xz(m.pos.x, m.pos.z, center.x, center.z) > INTEREST {
+                continue;
+            }
+            w.u16(m.id);
+            w.f32(m.pos.x);
+            w.f32(m.pos.y);
+            w.f32(m.pos.z);
+            w.u16(q_yaw(yaw_to(m.dir.x, m.dir.z)));
+            w.i16(q_pitch(m.dir.y.clamp(-1.0, 1.0).asin()));
+            mcount += 1;
+        }
+        self.out[mpos] = mcount;
         let mut w = Wr::new(&mut self.out);
         // ---- events
         let cpos = w.len();

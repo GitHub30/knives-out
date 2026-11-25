@@ -992,6 +992,15 @@ kbd {
   border-color: var(--accent);
   background: rgba(255, 183, 3, 0.25);
 }
+.tb-jump.fly::after,
+.tb-crouch.fly::after {
+  content: attr(data-label);
+  position: absolute;
+  bottom: -18px;
+  font-size: 12px;
+  font-weight: 800;
+  text-shadow: 0 1px 3px #000;
+}
 .tb-jump.big::after {
   content: attr(data-label);
   position: absolute;

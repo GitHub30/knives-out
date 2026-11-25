@@ -12,6 +12,10 @@ pub const MODE_DEAD: u8 = 4;
 /// Driving a car: `MoveState.pos`/`vel` are the car's, `airtime` holds its
 /// heading and `car` its index.
 pub const MODE_DRIVE: u8 = 5;
+/// Flying a helicopter: `MoveState.pos`/`vel` are the helicopter's (its
+/// model origin), `airtime` holds its heading, `car` its index and
+/// `on_ground` says that it has landed.
+pub const MODE_FLY: u8 = 6;
 
 // Command buttons (held state unless noted as edge).
 pub const B_FIRE: u16 = 1 << 0;
@@ -25,7 +29,7 @@ pub const B_SPECT: u16 = 1 << 7; // edge
 // bits 8-9: slot request edge (0 none, 1 = slot A, 2 = slot B, 3 = fists)
 // bits 10-11: heal request edge (0 none, 1 bandage, 2 medkit, 3 drink)
 pub const B_NADE: u16 = 1 << 12; // edge
-pub const B_USE: u16 = 1 << 13; // edge: enter / leave a car
+pub const B_USE: u16 = 1 << 13; // edge: enter / leave a car or a helicopter
 pub const B_MASK: u16 = 0x3FFF;
 
 /// Kill-feed weapon ids that are not guns.
@@ -34,6 +38,9 @@ pub const WK_CAR: u8 = 201;
 pub const WK_TRUCK: u8 = 202;
 /// A vehicle blowing up.
 pub const WK_BOOM: u8 = 203;
+/// A helicopter's missile, and being hit by its hull.
+pub const WK_MISSILE: u8 = 204;
+pub const WK_HELI: u8 = 205;
 
 pub const W_FISTS: u8 = 0;
 pub const W_PISTOL: u8 = 1;

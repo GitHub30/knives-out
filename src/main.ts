@@ -5,6 +5,10 @@ import carModelUrl from './assets/police_crown_osaka_game.glb?url';
 import truckModelUrl from './assets/fire_truck_osaka_st_game.glb?url';
 import planeModelUrl from './assets/b777_300er.glb?url';
 import planeFanUrl from './assets/b777_300er_fan.glb?url';
+import heliModelUrl from './assets/ch47j.glb?url';
+import heliRotorUrl from './assets/ch47j_rotor.glb?url';
+import heliGearFrontUrl from './assets/ch47j_gear_front.glb?url';
+import heliGearRearUrl from './assets/ch47j_gear_rear.glb?url';
 import g1Url from './assets/unitree_g1.bin?url';
 import { setG1Shapes } from './render/models';
 import { add, dirFrom, invert, lookAt, mul, perspectiveRZ, type V3 } from './render/math';
@@ -145,6 +149,12 @@ function startBackdrop() {
     const dbgPlane = (window as unknown as { __zfPlane?: number[] }).__zfPlane;
     if (dbgPlane) drawPlane(renderer, backdropInst.boxes, [dbgPlane[0], dbgPlane[1], dbgPlane[2]], dbgPlane[3], t, dbgPlane[4] ?? 0);
     else drawPlane(renderer, backdropInst.boxes, [512 + Math.cos(pa) * 300, 260, 512 + Math.sin(pa) * 300], pa + Math.PI, t, -0.2);
+    // debug: one helicopter [x, y, z, yaw, rotorAngle, gear, rotor speed (rad/s), tint] in the menu scene
+    const dbgHeli = (window as unknown as { __zfHeli?: number[] }).__zfHeli;
+    if (dbgHeli) {
+      const hy = dbgHeli[3] ?? 0;
+      renderer.setHelis(new Float32Array([dbgHeli[0], dbgHeli[1], dbgHeli[2], 0, Math.sin(hy * 0.5), 0, Math.cos(hy * 0.5), dbgHeli[7] ?? 1, (dbgHeli[4] ?? 0) + (dbgHeli[6] ?? 0) * t, dbgHeli[5] ?? 0, Math.min(1, Math.abs(dbgHeli[6] ?? 0) / 23.6)]));
+    }
     renderer.render({
       viewProj: vp,
       invViewProj: invert(vp),
@@ -393,6 +403,8 @@ async function boot() {
     renderer.loadCarModel(new URL(carModelUrl, document.baseURI).href).catch((e) => console.warn('car model:', e));
     renderer.loadCarModel(new URL(truckModelUrl, document.baseURI).href, 1).catch((e) => console.warn('truck model:', e));
     renderer.loadPlaneModel(new URL(planeModelUrl, document.baseURI).href, new URL(planeFanUrl, document.baseURI).href).catch((e) => console.warn('plane model:', e));
+    const asset = (u: string) => new URL(u, document.baseURI).href;
+    renderer.loadHeliModel({ body: asset(heliModelUrl), rotor: asset(heliRotorUrl), gearFront: asset(heliGearFrontUrl), gearRear: asset(heliGearRearUrl) }).catch((e) => console.warn('helicopter model:', e));
   } catch (e) {
     show('nogpu', true);
     show('menu', false);

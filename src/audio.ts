@@ -1,4 +1,9 @@
-// Procedural WebAudio sound effects (no audio assets needed).
+// WebAudio sound effects: procedural, except the helicopter's rotor (a recording).
+
+import rotorUrl from './assets/ch47j_rotor.m4a?url';
+
+/** The rotor recording repeats seamlessly between these times (s); what lies outside is padding for the codec. */
+const ROTOR_LOOP: [number, number] = [0.5, 10.5];
 
 const SHOT: { f: number; q: number; decay: number; thump: number; gain: number }[] = [
   { f: 900, q: 0.7, decay: 0.08, thump: 0.3, gain: 0.5 }, // fists
@@ -17,6 +22,9 @@ export class Sound {
   private voices = 0;
   private loops: Record<string, { src: AudioScheduledSourceNode; gain: GainNode; filter?: BiquadFilterNode; osc?: OscillatorNode }> = {};
   volume = 0.7;
+  private rotorBuf: AudioBuffer | null = null;
+  private rotorState: 'none' | 'loading' | 'ready' | 'failed' = 'none';
+  private rotorVoice: { src: AudioBufferSourceNode; gain: GainNode; pan: StereoPannerNode | null } | null = null;
 
   unlock() {
     if (!this.ctx) {
@@ -206,6 +214,90 @@ export class Sound {
         [392, 330, 262].forEach((f, i) => this.tone(dest, t + i * 0.18, 0.35, f, f * 0.98, 0.35, 'triangle'));
         break;
     }
+  }
+
+  /** A missile leaving its tube: a sharp crack, then the motor tearing away. */
+  missile(dist: number, pan: number) {
+    if (!this.ready() || dist > 400) return;
+    const t = this.ctx!.currentTime;
+    const dest = this.out(pan, 1.1 / (1 + dist / 25));
+    this.burst(dest, t, 0.09, 'highpass', 1800, 0.7, 0.9);
+    this.burst(dest, t + 0.02, 0.9, 'bandpass', 900, 0.6, 0.8, 0.04);
+    this.tone(dest, t, 0.7, 240, 70, 0.35, 'sawtooth');
+  }
+
+  /** Fetch and decode the rotor recording once, when a helicopter first needs it. */
+  private loadRotor() {
+    const c = this.ctx;
+    if (!c || this.rotorState !== 'none') return;
+    this.rotorState = 'loading';
+    fetch(new URL(rotorUrl, document.baseURI).href)
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`rotor sound: ${r.status}`))))
+      .then((b) => c.decodeAudioData(b))
+      .then((buf) => {
+        this.rotorBuf = buf;
+        this.rotorState = 'ready';
+      })
+      .catch((e) => {
+        // no rotor sound then; everything else carries on
+        this.rotorState = 'failed';
+        console.warn('rotor sound:', e);
+      });
+  }
+
+  /**
+   * The helicopter's rotors, a looped recording. `level` 0 stops it (also
+   * while the context is suspended); `speed` is the rotor speed 0..1, which
+   * lowers the pitch while they run up and down.
+   */
+  rotor(level: number, speed = 1, pan = 0) {
+    const c = this.ctx;
+    if (!c) return;
+    const v = this.rotorVoice;
+    if (level <= 0.001) {
+      if (v) {
+        v.gain.gain.setTargetAtTime(0, c.currentTime, 0.15);
+        setTimeout(() => {
+          try {
+            v.src.stop();
+            v.gain.disconnect();
+          } catch {
+            /* ignore */
+          }
+        }, 700);
+        this.rotorVoice = null;
+      }
+      return;
+    }
+    if (c.state !== 'running') return;
+    if (!this.rotorBuf) {
+      this.loadRotor();
+      return;
+    }
+    let l = v;
+    if (!l) {
+      try {
+        const src = c.createBufferSource();
+        src.buffer = this.rotorBuf;
+        src.loop = true;
+        src.loopStart = ROTOR_LOOP[0];
+        src.loopEnd = Math.min(ROTOR_LOOP[1], this.rotorBuf.duration);
+        const gain = c.createGain();
+        gain.gain.value = 0;
+        const p = c.createStereoPanner ? c.createStereoPanner() : null;
+        if (p) src.connect(p).connect(gain).connect(this.master);
+        else src.connect(gain).connect(this.master);
+        src.start(0, ROTOR_LOOP[0]);
+        l = this.rotorVoice = { src, gain, pan: p };
+      } catch {
+        this.rotorState = 'failed';
+        this.rotorBuf = null;
+        return;
+      }
+    }
+    l.gain.gain.setTargetAtTime(Math.min(1, level) * 0.9, c.currentTime, 0.12);
+    l.src.playbackRate.setTargetAtTime(0.45 + 0.55 * Math.min(1, Math.max(0, speed)), c.currentTime, 0.2);
+    l.pan?.pan.setTargetAtTime(Math.min(1, Math.max(-1, pan)), c.currentTime, 0.1);
   }
 
   /** Continuous loops: plane engine / freefall wind. level 0 stops. */

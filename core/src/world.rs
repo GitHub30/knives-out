@@ -31,6 +31,8 @@ pub const BK_HIDDEN: u8 = 9;
 /// Wall finishes besides lap siding (`BK_WALL`).
 pub const BK_BRICK: u8 = 11;
 pub const BK_STUCCO: u8 = 12;
+/// The hull of a helicopter (ray hits only: it is not a box of the world).
+pub const BK_HELI: u8 = 13;
 
 /// A pitched roof as it is drawn (it is solid as a stack of `BK_HIDDEN` steps).
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +60,20 @@ pub const VK_CAR: u8 = 0;
 pub const VK_TRUCK: u8 = 1;
 /// Half width, half length and height per vehicle kind.
 pub const CAR_DIMS: [(f32, f32, f32); 2] = [(CAR_HW, CAR_HL, CAR_H), (1.25, 3.05, 3.0)];
+
+/// Helicopter hull: half width over the side pods, half length, and the top
+/// of the cabin / of the rear pylon above the model origin (on the ground).
+pub const HELI_HW: f32 = 1.9;
+pub const HELI_HL: f32 = 7.75;
+pub const HELI_H: f32 = 3.5;
+pub const HELI_TOP: f32 = 5.5;
+/// The hull as boxes in its own frame (x = right, y up, z = nose): the
+/// cabin with its pods, the rear pylon and the forward pylon.
+pub const HELI_BOXES: [(V3, V3); 3] = [
+    (V3::new(-HELI_HW, 0.3, -HELI_HL), V3::new(HELI_HW, HELI_H, HELI_HL)),
+    (V3::new(-0.7, HELI_H, -7.6), V3::new(0.7, HELI_TOP, -3.6)),
+    (V3::new(-0.7, HELI_H, 3.2), V3::new(0.7, 4.7, 6.2)),
+];
 
 pub const CK_TREE: u8 = 0;
 pub const CK_ROCK: u8 = 1;
@@ -164,6 +180,9 @@ pub struct World {
     pub cars: Vec<[f32; 4]>,
     /// Vehicle kind of each car (never changes during a match).
     pub car_kind: Vec<u8>,
+    /// Helicopters: x, y (the model origin: on the ground when parked), z,
+    /// heading. Where they are now (they fly); generated parked.
+    pub helis: Vec<[f32; 4]>,
     gbox: Vec<Vec<u16>>,
     gcyl: Vec<Vec<u16>>,
     pub checksum: u32,
@@ -231,6 +250,7 @@ impl World {
             roofs: Vec::new(),
             cars: Vec::new(),
             car_kind: Vec::new(),
+            helis: Vec::new(),
             checksum: 0,
         };
 
@@ -531,6 +551,49 @@ impl World {
             let hh = r * rng.range(0.7, 1.3);
             w.rocks.push(Rock { x, z, y, r, h: hh, seed: rng.u32() });
             w.cyls.push(Cyl { x, z, r: r * 0.85, y0: y - 1.0, y1: y + hh * 0.85, kind: CK_ROCK });
+        }
+
+        // ---- helicopters: two, parked on open ground out of town. Placed
+        // last and from their own random stream, so nothing else moved.
+        let mut hrng = Rng::new((seed as u64) << 8 ^ 0x4E11_C0);
+        for n in 0..6000 {
+            if w.helis.len() >= 2 {
+                break;
+            }
+            // the demands relax as the tries run out: two are always placed
+            let relax = (n / 1500) as f32;
+            let clear = 25.0 - relax * 5.0;
+            let x = hrng.range(110.0, MAP - 110.0);
+            let z = hrng.range(110.0, MAP - 110.0);
+            let yaw = hrng.range(0.0, TAU);
+            let y = w.height(x, z);
+            if !(3.0..=45.0).contains(&y) {
+                continue;
+            }
+            let (lo, hi) = (w.min_height_rect(x - 12.0, z - 12.0, x + 12.0, z + 12.0), w.max_height_rect(x - 12.0, z - 12.0, x + 12.0, z + 12.0));
+            if hi - lo > 2.2 + relax * 1.5 || lo < 2.0 {
+                continue;
+            }
+            if w.towns.iter().any(|t| dist_xz(t.x, t.z, x, z) < t.r + 45.0 - relax * 10.0) || w.road_dist(x, z) < 14.0 - relax * 3.0 {
+                continue;
+            }
+            if w.helis.iter().any(|h| dist_xz(h[0], h[2], x, z) < 260.0 - relax * 60.0) {
+                continue;
+            }
+            if w.buildings.iter().any(|b| x > b.x0 - clear && x < b.x1 + clear && z > b.z0 - clear && z < b.z1 + clear) {
+                continue;
+            }
+            if w.boxes.iter().any(|b| x > b.min.x - clear && x < b.max.x + clear && z > b.min.z - clear && z < b.max.z + clear) {
+                continue;
+            }
+            if w.cyls.iter().any(|c| dist_xz(c.x, c.z, x, z) < clear + c.r) || w.cars.iter().any(|c| dist_xz(c[0], c[2], x, z) < clear) {
+                continue;
+            }
+            // a level pad (nothing stands within its rim, so only bare
+            // terrain changes)
+            let y = (lo + hi) * 0.5;
+            w.flatten(x, z, 10.0, (clear - 3.0).min(20.0), y);
+            w.helis.push([x, w.height(x, z), z, yaw]);
         }
 
         // ---- finalize
@@ -1205,6 +1268,11 @@ impl World {
             feed(s.pos.x.to_bits());
             feed(s.pos.z.to_bits());
         }
+        for h in &self.helis {
+            for v in h {
+                feed(v.to_bits());
+            }
+        }
         hsh
     }
 
@@ -1551,7 +1619,13 @@ impl World {
         self.raycast_opt(o, d, maxt, true)
     }
 
-    /// True if something other than a car obstructs the segment a->b.
+    /// First hit on the world itself (terrain, buildings, trees, props):
+    /// neither cars nor helicopters.
+    pub fn raycast_static(&self, o: V3, d: V3, maxt: f32) -> Option<(f32, V3, u8)> {
+        self.raycast_opt(o, d, maxt, false)
+    }
+
+    /// True if something other than a vehicle obstructs the segment a->b.
     pub fn blocked_static(&self, a: V3, b: V3) -> bool {
         let dv = b - a;
         let l = dv.len();
@@ -1563,6 +1637,9 @@ impl World {
         if cars {
             if let Some((t, n, _)) = self.ray_cars(o, d, obj.map_or(maxt, |h| h.0)) {
                 obj = Some((t, n, BK_CAR));
+            }
+            if let Some((t, n, _)) = self.ray_helis(o, d, obj.map_or(maxt, |h| h.0), usize::MAX) {
+                obj = Some((t, n, BK_HELI));
             }
         }
         let lim = obj.map_or(maxt, |h| h.0);
@@ -1618,7 +1695,111 @@ impl World {
             let (i, j) = ((c.x as usize).min(n - 1), (c.z as usize).min(n - 1));
             m[j * n + i] = m[j * n + i].min(90);
         }
+        // helicopter pads: bare ground, the grass coming back towards the rim
+        for h in &self.helis {
+            let r = 12.0f32;
+            let (i0, i1) = ((h[0] - r).max(0.0) as usize, ((h[0] + r) as usize).min(n - 1));
+            let (j0, j1) = ((h[2] - r).max(0.0) as usize, ((h[2] + r) as usize).min(n - 1));
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let k = smoothstep(8.5, r, dist_xz(i as f32 + 0.5, j as f32 + 0.5, h[0], h[2]));
+                    m[j * n + i] = (m[j * n + i] as f32 * k) as u8;
+                }
+            }
+        }
         m
+    }
+
+    /// First helicopter hull hit along a normalized ray: (distance, normal,
+    /// index). `skip` is one to ignore (usize::MAX for none). The hull is
+    /// taken level: the few degrees it tilts in flight are not modelled.
+    pub fn ray_helis(&self, o: V3, d: V3, maxt: f32, skip: usize) -> Option<(f32, V3, usize)> {
+        let mut best: Option<(f32, V3, usize)> = None;
+        let mut lim = maxt;
+        for (k, h) in self.helis.iter().enumerate() {
+            if k == skip {
+                continue;
+            }
+            // quick reject: closest approach of the ray to the hull's middle
+            let rel = V3::new(h[0] - o.x, h[1] + 2.6 - o.y, h[2] - o.z);
+            let along = rel.dot(d);
+            if along < -9.0 || along > lim + 9.0 {
+                continue;
+            }
+            if (rel - d * along).len2() > 81.0 {
+                continue;
+            }
+            // into the hull's frame: x = right, z = forward
+            let (f, r) = (fwd(h[3]), right(h[3]));
+            let lo = V3::new(-(rel.x * r.x + rel.z * r.z), -rel.y + 2.6, -(rel.x * f.x + rel.z * f.z));
+            let ld = V3::new(d.x * r.x + d.z * r.z, d.y, d.x * f.x + d.z * f.z);
+            for (mn, mx) in HELI_BOXES {
+                if let Some((t, ax)) = ray_aabb(lo, ld, mn, mx, lim) {
+                    if t < lim {
+                        lim = t;
+                        let n = match ax {
+                            0 => r * -ld.x.signum(),
+                            1 => V3::new(0.0, -ld.y.signum(), 0.0),
+                            _ => f * -ld.z.signum(),
+                        };
+                        best = Some((t, n, k));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Push a body (circle of radius `r` at `p`, `hgt` tall) out of the
+    /// cabin of helicopter `k`. True if it was touching.
+    pub fn push_heli(&self, k: usize, p: &mut V3, r: f32, hgt: f32) -> bool {
+        let Some(h) = self.helis.get(k) else { return false };
+        let (dx, dz) = (p.x - h[0], p.z - h[2]);
+        // (not under one that hovers, nor on top of it)
+        if dx * dx + dz * dz > 144.0 || p.y > h[1] + HELI_H - 0.3 || p.y + hgt < h[1] + 0.3 {
+            return false;
+        }
+        let (f, rt) = (fwd(h[3]), right(h[3]));
+        let (lx, lz) = (dx * rt.x + dz * rt.z, dx * f.x + dz * f.z);
+        let (qx, qz) = (clampf(lx, -HELI_HW, HELI_HW), clampf(lz, -HELI_HL, HELI_HL));
+        let (ex, ez) = (lx - qx, lz - qz);
+        let d2 = ex * ex + ez * ez;
+        if d2 >= r * r {
+            return false;
+        }
+        let (nx, nz, push);
+        if d2 > 1e-8 {
+            let dl = d2.sqrt();
+            nx = ex / dl;
+            nz = ez / dl;
+            push = r - dl;
+        } else {
+            // centre inside the hull: leave through the nearest side
+            let (px, pz) = (HELI_HW - lx.abs(), HELI_HL - lz.abs());
+            if px < pz {
+                nx = if lx >= 0.0 { 1.0 } else { -1.0 };
+                nz = 0.0;
+                push = px + r;
+            } else {
+                nx = 0.0;
+                nz = if lz >= 0.0 { 1.0 } else { -1.0 };
+                push = pz + r;
+            }
+        }
+        p.x += (rt.x * nx + f.x * nz) * push;
+        p.z += (rt.z * nx + f.z * nz) * push;
+        true
+    }
+
+    /// Push a standing body out of every helicopter (`skip`: one to ignore).
+    pub fn push_helis(&self, p: &mut V3, r: f32, hgt: f32, skip: usize) -> bool {
+        let mut hit = false;
+        for k in 0..self.helis.len() {
+            if k != skip {
+                hit |= self.push_heli(k, p, r, hgt);
+            }
+        }
+        hit
     }
 
     /// First car hit along a normalized ray: (distance, normal, car index).

@@ -388,7 +388,7 @@ export class Hud {
     }
   }
 
-  drawMinimap(px: number, pz: number, yaw: number, zone: ZoneState | null, plane: PlaneState | null, markers: MapMarker[], now: number, mapSize: number) {
+  drawMinimap(px: number, pz: number, yaw: number, zone: ZoneState | null, plane: PlaneState | null, markers: MapMarker[], now: number, mapSize: number, helis: { x: number; z: number }[] = []) {
     const ctx = this.miniCtx;
     const W = this.mini.width;
     const R = 170; // meters shown from center to edge
@@ -409,6 +409,7 @@ export class Hud {
     const tz = (z: number) => W / 2 + (z - pz) * s;
     this.drawZone(ctx, zone, tx, tz, s, 2);
     if (plane && plane.active) this.drawPlane(ctx, plane, tx, tz, mapSize);
+    for (const h of helis) this.heliMark(ctx, tx(h.x), tz(h.z), 7);
     for (const m of markers) {
       const age = now - m.t;
       if (age > 2.5) continue;
@@ -458,6 +459,25 @@ export class Hud {
     this.arrow(ctx, tx(x), tz(z), Math.atan2(p.dx, p.dz), 8, '#fff');
   }
 
+  /** A helicopter that can be flown: a landing-pad H. */
+  private heliMark(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
+    ctx.fillStyle = 'rgba(20,30,24,0.85)';
+    ctx.strokeStyle = '#9fe870';
+    ctx.lineWidth = Math.max(1.5, r * 0.22);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    for (const sx of [-0.38, 0.38]) {
+      ctx.moveTo(x + sx * r, y - r * 0.5);
+      ctx.lineTo(x + sx * r, y + r * 0.5);
+    }
+    ctx.moveTo(x - 0.38 * r, y);
+    ctx.lineTo(x + 0.38 * r, y);
+    ctx.stroke();
+  }
+
   private arrow(ctx: CanvasRenderingContext2D, x: number, y: number, yaw: number, r: number, col: string) {
     // map: +x right, +z down. forward (sin yaw, cos yaw)
     const fx = Math.sin(yaw), fz = Math.cos(yaw);
@@ -479,7 +499,7 @@ export class Hud {
     this.fullmap.style.display = open ? 'flex' : 'none';
   }
 
-  drawFullMap(px: number | null, pz: number, yaw: number, zone: ZoneState | null, plane: PlaneState | null, towns: { x: number; z: number; name: number }[], mapSize: number) {
+  drawFullMap(px: number | null, pz: number, yaw: number, zone: ZoneState | null, plane: PlaneState | null, towns: { x: number; z: number; name: number }[], mapSize: number, helis: { x: number; z: number }[] = []) {
     if (!this.mapOpen) return;
     const c = this.fullCanvas;
     const size = Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.92 * Math.min(2, window.devicePixelRatio || 1));
@@ -516,6 +536,7 @@ export class Hud {
       ctx.fillStyle = '#fff';
       ctx.fillText(name, tx(t.x), tx(t.z));
     }
+    for (const h of helis) this.heliMark(ctx, tx(h.x), tx(h.z), Math.max(8, size / 70));
     if (px !== null) this.arrow(ctx, tx(px), tx(pz), yaw, Math.max(9, size / 60), '#ffd54a');
   }
 }

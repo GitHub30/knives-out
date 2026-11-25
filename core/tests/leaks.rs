@@ -100,6 +100,12 @@ fn parse(buf: &[u8]) -> Snap {
     // loose props: id, position, moving
     let np = r.u8() as usize;
     r.skip(np * 15);
+    // helicopters: id, pose, attitude, rotor, pilot, hull, missiles left, flags
+    let nh = r.u8() as usize;
+    r.skip(nh * 22);
+    // missiles: id, position, direction
+    let nm = r.u8() as usize;
+    r.skip(nm * 18);
     let ne = r.u16() as usize;
     let mut events = vec![];
     for _ in 0..ne {

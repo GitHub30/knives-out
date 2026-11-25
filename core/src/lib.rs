@@ -220,6 +220,7 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
 ///       10 window panes(f32 x6: min xyz, max xyz) 11 grass mask(u8, 1024 x 1024, one per m2)
 ///       13 loose props(f32 x8: min xyz, max xyz, crate?, colour)
 ///       12 trees(f32 x8: x y z height radius kind(0 conifer) seed -)
+///       14 helicopters(f32 x4: x y z yaw)
 #[no_mangle]
 pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
     let Some(c) = client() else { return std::ptr::null() };
@@ -238,6 +239,7 @@ pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
         11 => c.grass.as_ptr(),
         12 => c.trees.as_ptr() as *const u8,
         13 => c.props.as_ptr() as *const u8,
+        14 => c.world.helis.as_ptr() as *const u8,
         _ => std::ptr::null(),
     }
 }
@@ -261,6 +263,7 @@ pub extern "C" fn cli_mesh_len(kind: u32) -> u32 {
         11 => c.grass.len(),
         12 => c.trees.len() * 4,
         13 => c.props.len() * 4,
+        14 => c.world.helis.len() * 16,
         _ => 0,
     }) as u32
 }
@@ -324,6 +327,17 @@ pub extern "C" fn cli_set_car(k: u32, x: f32, y: f32, z: f32, yaw: f32) {
     }
 }
 
+/// Where helicopter `k` is now (they fly: the server sends their poses).
+#[no_mangle]
+pub extern "C" fn cli_set_heli(k: u32, x: f32, y: f32, z: f32, yaw: f32) {
+    let Some(c) = client() else { return };
+    if let Some(h) = c.world.helis.get_mut(k as usize) {
+        if x.is_finite() && y.is_finite() && z.is_finite() && yaw.is_finite() {
+            *h = [x, y, z, yaw];
+        }
+    }
+}
+
 /// Where loose prop `k` is now (the middle of its underside).
 #[no_mangle]
 pub extern "C" fn cli_set_prop(k: u32, x: f32, y: f32, z: f32) {
@@ -343,7 +357,8 @@ pub extern "C" fn cli_pred_ptr() -> *mut f32 {
 /// Prediction IO layout (f32):
 ///  0-2 pos, 3-5 vel, 6 mode, 7 on_ground, 8 crouch, 9 in_water, 10 airtime, 11 speed_mult,
 ///  12 mx_q, 13 mz_q, 14 yaw_q, 15 pitch_q, 16 buttons, 17 out events, 18 car index
-/// While driving (mode 5) pos/vel are the car's and airtime is its heading.
+/// While driving (mode 5) pos/vel are the car's and airtime is its heading;
+/// while flying (mode 6) they are the helicopter's, and 18 is its index.
 #[no_mangle]
 pub extern "C" fn cli_pred_step() {
     let Some(c) = client() else { return };

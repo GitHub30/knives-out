@@ -27,6 +27,9 @@ export class Input {
   lookDY = 0;
   mouseFire = false;
   touchFire = false;
+  /** Touch buttons held while flying a helicopter: climb, descend. */
+  touchUp = false;
+  touchDown = false;
   mouseAds = false;
   adsToggled = false;
   crouch = false;
@@ -227,6 +230,7 @@ export class Input {
     this.moveX = this.moveZ = 0;
     this.lookDX = this.lookDY = 0;
     this.mouseFire = this.touchFire = this.mouseAds = this.adsToggled = false;
+    this.touchUp = this.touchDown = false;
     this.crouch = false;
     this.touchSprint = false;
     this.edges = emptyEdges();

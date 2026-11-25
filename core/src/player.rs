@@ -35,7 +35,8 @@ pub struct MoveState {
     pub crouch: bool,
     pub in_water: bool,
     pub airtime: f32,
-    /// Index of the car being driven (MODE_DRIVE only).
+    /// Index of the car being driven (MODE_DRIVE) or of the helicopter
+    /// being flown (MODE_FLY).
     pub car: u8,
 }
 
@@ -193,7 +194,7 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
                 }
             }
             w.collide_body(&mut np, P_RADIUS, hgt);
-            if w.push_cars(&mut np, P_RADIUS, usize::MAX) {
+            if w.push_cars(&mut np, P_RADIUS, usize::MAX) | w.push_helis(&mut np, P_RADIUS, hgt, usize::MAX) {
                 // squeezed between a car and a wall: the wall wins
                 w.collide_body(&mut np, P_RADIUS, hgt);
             }
@@ -249,6 +250,7 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             s.pos = np;
         }
         MODE_DRIVE => step_drive(w, s, c, dt),
+        MODE_FLY => step_fly(w, s, c, dt),
         _ => {}
     }
     s.pos.x = clampf(s.pos.x, 2.0, MAP - 2.0);
@@ -353,6 +355,7 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
                     }
                 }
             }
+            w.push_helis(&mut q, cr, 1.0, usize::MAX);
             let (dx, dz) = (q.x - base.x, q.z - base.z);
             np.x += dx;
             np.z += dz;
@@ -370,6 +373,137 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     s.vel = V3::new(f.x * v, 0.0, f.z * v);
     s.airtime = yaw;
     s.on_ground = true;
+    s.crouch = false;
+    s.in_water = false;
+}
+
+pub const HELI_VMAX: f32 = 45.0;
+/// Top speed backwards and sideways.
+pub const HELI_VSIDE: f32 = 14.0;
+pub const HELI_CLIMB: f32 = 9.0;
+/// Highest the model origin goes.
+pub const HELI_CEIL: f32 = 260.0;
+/// How fast the heading follows the view (rad/s).
+pub const HELI_TURN: f32 = 1.3;
+/// Offsets along the hull of the three circles it collides with, their
+/// radius, and the height of the hull they stand for.
+pub const HELI_CIRCLES: [f32; 3] = [-5.4, 0.0, 5.4];
+pub const HELI_CR: f32 = 2.3;
+pub const HELI_BODY_H: f32 = 3.4;
+/// How deep the hull sits in water it has landed on.
+pub const HELI_DRAUGHT: f32 = 0.7;
+
+/// What a helicopter at `pos` heading `yaw` would stand on: the highest
+/// ground or roof under its hull that is not above `feet` (or the water).
+pub fn heli_floor(w: &World, pos: V3, yaw: f32, feet: f32) -> f32 {
+    let f = fwd(yaw);
+    let mut g = WATER - HELI_DRAUGHT;
+    for off in [-5.6f32, 0.0, 5.6] {
+        g = g.max(w.ground_below(pos.x + f.x * off, pos.z + f.z * off, feet, 1.6));
+    }
+    g
+}
+
+/// Push the hull of helicopter `k` (at `np`, heading `yaw`) out of walls,
+/// trees, cars and the other helicopters. Returns the push applied.
+pub fn heli_collide(w: &World, k: usize, np: &mut V3, yaw: f32) -> V3 {
+    let f = fwd(yaw);
+    let start = *np;
+    for _ in 0..2 {
+        for off in HELI_CIRCLES {
+            let base = V3::new(np.x + f.x * off, np.y + 0.2, np.z + f.z * off);
+            let mut q = base;
+            w.collide_body(&mut q, HELI_CR, HELI_BODY_H);
+            for c in 0..w.cars.len() {
+                w.push_car(c, &mut q, HELI_CR);
+            }
+            for (j, o) in w.helis.iter().enumerate() {
+                if j == k || (o[1] - np.y).abs() > HELI_TOP || (o[0] - q.x).abs() > 22.0 || (o[2] - q.z).abs() > 22.0 {
+                    continue;
+                }
+                let of = fwd(o[3]);
+                for ooff in HELI_CIRCLES {
+                    let (dx, dz) = (q.x - (o[0] + of.x * ooff), q.z - (o[2] + of.z * ooff));
+                    let d2 = dx * dx + dz * dz;
+                    let rr = HELI_CR * 2.0;
+                    if d2 < rr * rr && d2 > 1e-6 {
+                        let dl = d2.sqrt();
+                        q.x += dx / dl * (rr - dl);
+                        q.z += dz / dl * (rr - dl);
+                    }
+                }
+            }
+            np.x += q.x - base.x;
+            np.z += q.z - base.z;
+        }
+    }
+    *np - start
+}
+
+/// One step of a flown helicopter: the stick moves it in the frame of its
+/// heading, the heading follows the view, jump climbs and crouch descends.
+/// On the ground without the climb held it stands still.
+pub fn step_fly(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
+    let mut yaw = if s.airtime.is_finite() { s.airtime } else { 0.0 };
+    let up = c.has(B_JUMP);
+    let down = c.has(B_CROUCH) && !up;
+    let alt = s.pos.y - heli_floor(w, s.pos, yaw, s.pos.y);
+    let mut tv = V3::ZERO;
+    let mut acc = 14.0;
+    if !(s.on_ground && !up) {
+        let dy = wrap_angle(c.yaw - yaw);
+        yaw = wrap_angle(yaw + clampf(dy, -HELI_TURN * dt, HELI_TURN * dt));
+        let (mz, mx) = (clampf(c.mz, -1.0, 1.0), clampf(c.mx, -1.0, 1.0));
+        tv = fwd(yaw) * (mz * if mz >= 0.0 { HELI_VMAX } else { HELI_VSIDE }) + right(yaw) * (mx * HELI_VSIDE);
+        acc = 10.0;
+    }
+    let (dvx, dvz) = (tv.x - s.vel.x, tv.z - s.vel.z);
+    let dl = (dvx * dvx + dvz * dvz).sqrt();
+    let k = if dl > acc * dt { acc * dt / dl } else { 1.0 };
+    s.vel.x += dvx * k;
+    s.vel.z += dvz * k;
+    // the descent flares out near the ground: it cannot be flown into it
+    let mut tvy = if up {
+        HELI_CLIMB
+    } else if down {
+        -HELI_CLIMB.min(1.2 + alt.max(0.0) * 0.7)
+    } else {
+        0.0
+    };
+    if s.pos.y >= HELI_CEIL {
+        tvy = tvy.min(0.0);
+    }
+    s.vel.y = approach(s.vel.y, tvy, 8.0 * dt);
+    let mut np = s.pos + s.vel * dt;
+    np.x = clampf(np.x, 10.0, MAP - 10.0);
+    np.z = clampf(np.z, 10.0, MAP - 10.0);
+    np.y = np.y.min(HELI_CEIL);
+    let push = heli_collide(w, s.car as usize, &mut np, yaw);
+    let pl = push.len();
+    if pl > 1e-4 {
+        // what it flew into takes the speed towards it
+        let n = push * (1.0 / pl);
+        let vn = s.vel.dot(n);
+        if vn < 0.0 {
+            s.vel -= n * vn;
+        }
+    }
+    let g = heli_floor(w, np, yaw, s.pos.y.max(np.y));
+    if np.y <= g {
+        np.y = g;
+        if s.vel.y < 0.0 {
+            s.vel.y = 0.0;
+        }
+        // skidding along the ground
+        let fr = (1.0 - 3.0 * dt).max(0.0);
+        s.vel.x *= fr;
+        s.vel.z *= fr;
+        s.on_ground = true;
+    } else {
+        s.on_ground = false;
+    }
+    s.pos = np;
+    s.airtime = yaw;
     s.crouch = false;
     s.in_water = false;
 }

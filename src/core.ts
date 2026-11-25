@@ -38,6 +38,7 @@ interface CoreExports {
   cli_ray_kind(): number;
   cli_building_at(x: number, z: number): number;
   cli_set_car(k: number, x: number, y: number, z: number, yaw: number): void;
+  cli_set_heli(k: number, x: number, y: number, z: number, yaw: number): void;
   cli_set_prop(k: number, x: number, y: number, z: number): void;
   cli_pred_ptr(): number;
   cli_pred_step(): void;
@@ -139,6 +140,16 @@ export class Core {
   /** Where car `k` is now, for collisions and rays. */
   setCar(k: number, x: number, y: number, z: number, yaw: number) {
     this.ex.cli_set_car(k, x, y, z, yaw);
+  }
+
+  /** Where helicopter `k` is now (its model origin and heading), for collisions, rays and flight prediction. */
+  setHeli(k: number, x: number, y: number, z: number, yaw: number) {
+    this.ex.cli_set_heli(k, x, y, z, yaw);
+  }
+
+  /** Parked helicopters as generated (x, ground y, z, yaw each). */
+  helis(): Float32Array {
+    return this.f32(14);
   }
 
   /** Where loose prop `k` is now (the middle of its underside). */

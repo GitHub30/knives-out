@@ -2,6 +2,8 @@
 // ambient, two shadow cascades, height fog) into a float target; a post pass
 // adds bloom, tonemaps (ACES), anti-aliases (FXAA) and grades.
 
+import { HELI_BLADE_ROOT, HELI_ROTOR_RADIUS } from './heli';
+
 export const FRAME = /* wgsl */ `
 struct Frame {
   viewProj: mat4x4f,
@@ -529,6 +531,24 @@ struct MIn {
   /** 1 = as painted, towards 0 = burnt out. */
   @location(6) itint: f32,
 };
+// A rotor: the same, plus where the blade tips stand against the hub (m) and
+// how far the blades have blurred away (0 = solid .. 1 = gone, the disc shows instead).
+struct RIn {
+  @location(0) pos: vec3f,
+  @location(1) nrm: vec3f,
+  @location(2) tan: vec4f,
+  @location(3) uv: vec2f,
+  @location(4) ipos: vec3f,
+  @location(5) iquat: vec4f,
+  @location(6) itint: f32,
+  @location(7) irot: vec2f,
+};
+// Blades are modelled straight: they hang in a parabola from the flap hinge
+// when stopped and cone upwards at speed.
+fn rotorBend(p: vec3f, tip: f32) -> vec3f {
+  let t = clamp((length(p.xz) - ${HELI_BLADE_ROOT}) / ${HELI_ROTOR_RADIUS - HELI_BLADE_ROOT}, 0.0, 1.1);
+  return vec3f(p.x, p.y + tip * t * t, p.z);
+}
 `;
 
 export const MODEL_WGSL = /* wgsl */ `
@@ -552,9 +572,25 @@ struct VOut {
   @location(2) t: vec4f,
   @location(3) uv: vec2f,
   @location(4) tint: f32,
+  @location(5) fade: f32,
 };
+@vertex fn vs_rotor(v: RIn) -> VOut {
+  var o: VOut;
+  o.tint = v.itint;
+  // the hub stays solid, the blades thin out as they speed up
+  o.fade = v.irot.y * step(1.1, length(v.pos.xz));
+  let wp = v.ipos + qrot(v.iquat, rotorBend(v.pos, v.irot.x));
+  o.wp = wp;
+  o.clip = F.viewProj * vec4f(wp, 1.0);
+  if (o.fade > 0.995) { o.clip = vec4f(0.0, 0.0, 2.0, 1.0); }
+  o.n = qrot(v.iquat, v.nrm);
+  o.t = vec4f(qrot(v.iquat, v.tan.xyz), v.tan.w);
+  o.uv = v.uv;
+  return o;
+}
 @vertex fn vs(v: MIn) -> VOut {
   var o: VOut;
+  o.fade = 0.0;
   o.tint = v.itint;
   let wp = v.ipos + qrot(v.iquat, v.pos);
   o.wp = wp;
@@ -599,6 +635,15 @@ fn surface(i: VOut, front: bool) -> Surface {
   c = applyFog(c, i.wp);
   return vec4f(c, 1.0);
 }
+// Rotor parts: blades dissolve (screen-door) as the fade rises.
+@fragment fn fs_rotor(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  let s = surface(i, front);
+  let dither = fract(52.9829189 * fract(dot(floor(i.clip.xy), vec2f(0.06711056, 0.00583715))));
+  if (i.fade > 0.0 && i.fade >= dither) { discard; }
+  var c = shade(s, i.wp);
+  c = applyFog(c, i.wp);
+  return vec4f(c, 1.0);
+}
 @fragment fn fs_blend(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   let s = surface(i, front);
   var c = shade(s, i.wp);
@@ -609,6 +654,20 @@ fn surface(i: VOut, front: bool) -> Surface {
   let a = mix(0.96, clamp(M.base.a + fres * 0.6, 0.0, 1.0), step(0.5, i.tint));
   c = applyFog(c, i.wp);
   return vec4f(c, a);
+}
+// The blur of a turning rotor: uv = (angle / turn, radius / blade length),
+// the instance tint carries how much of it shows (0 = blades at rest).
+@fragment fn fs_disc(i: VOut) -> @location(0) vec4f {
+  let r = i.uv.y;
+  // three smeared blades turning with the rotor, denser towards the hub where
+  // they overlap more; the rim fades out over the last few percent
+  let lobe = pow(0.5 + 0.5 * cos(i.uv.x * 18.849556), 2.0);
+  // seen edge-on the eye looks through more of the blur (the blades have depth)
+  let nv = abs(dot(normalize(i.n), normalize(F.camPos.xyz - i.wp)));
+  let a = min(0.34, 0.6 * M.base.a * i.tint * (0.55 + 0.45 * lobe) * (1.15 - 0.45 * r) / max(nv, 0.45)) * smoothstep(1.0, 0.94, r) * smoothstep(0.12, 0.24, r);
+  let sun = max(F.sunDir.y, 0.0);
+  let c = applyFog(M.base.rgb * (0.6 + 0.8 * sun), i.wp);
+  return vec4f(c, clamp(a, 0.0, 1.0));
 }
 `;
 
@@ -622,6 +681,11 @@ fn qrot(q: vec4f, v: vec3f) -> vec3f {
 }
 @vertex fn vs(v: MIn) -> @builtin(position) vec4f {
   return F.lightVP0 * vec4f(v.ipos + qrot(v.iquat, v.pos), 1.0);
+}
+// blurred blades throw no shadow: only the hub does at speed
+@vertex fn vs_rotor(v: RIn) -> @builtin(position) vec4f {
+  if (v.irot.y > 0.5 && length(v.pos.xz) > 1.1) { return vec4f(0.0, 0.0, 2.0, 1.0); }
+  return F.lightVP0 * vec4f(v.ipos + qrot(v.iquat, rotorBend(v.pos, v.irot.x)), 1.0);
 }
 `;
 

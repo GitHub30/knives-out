@@ -6,6 +6,7 @@ import type { Core } from './core';
 import { CAR_STRIDE, PUFF_FIREBALL, PUFF_FLAME, PUFF_SMOKE, Puffs, type Renderer } from './render/renderer';
 import { Instances, rgba, surf } from './render/instances';
 import { drawPlane, emitCharacter, emitItem, line } from './render/models';
+import { HELI_HULL_HALF, HELI_ROTOR_SPEED, HELI_STRIDE } from './render/heli';
 import {
   add, clamp, dirFrom, invert, lerp, lerpAngle, lookAt, mul, norm, perspectiveRZ, qAxis, qIdent, qMul, qRot, qY, rightOf, scale, sub, transformPoint, wrapAngle, type M4, type Q, type V3,
 } from './render/math';
@@ -76,9 +77,9 @@ interface Pred {
   onGround: boolean;
   crouch: boolean;
   inWater: boolean;
-  /** While driving: the car's heading. */
+  /** While driving or flying: the vehicle's heading. */
   airtime: number;
-  /** Index of the car being driven (255 = none). */
+  /** Index of the car being driven or the helicopter being flown (255 = none). */
   car: number;
 }
 
@@ -102,6 +103,34 @@ interface CarC {
   /** Distance since the last tyre mark, the rear wheel spots it ended at, time to the next smoke puff. */
   trackAcc: number;
   trackAt: (V3 | null)[];
+  smokeT: number;
+}
+
+interface HeliPose {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  t: number;
+}
+
+/** A helicopter as the client draws it: two timed samples to interpolate between. */
+interface HeliC {
+  a: HeliPose;
+  b: HeliPose;
+  /** From the server: rotor speed 0..1, pilot id (255 nobody, 254 unseen), hull in 255ths, missiles left. */
+  rotor: number;
+  pilot: number;
+  hp: number;
+  ammo: number;
+  airborne: boolean;
+  deadAt: number;
+  /** Drawn state: rotor speed and angle, landing gear (0 on its wheels, 1 struts extended, 2 stowed). */
+  spin: number;
+  angle: number;
+  gear: number;
   smokeT: number;
 }
 
@@ -136,6 +165,8 @@ const CAR_KINDS = [
 ];
 
 const DT = 1 / 30;
+/** As in core/src/sim.rs (m/s). */
+const MISSILE_SPEED = 95;
 /** A unit cube with sharp edges (pos + normal, 36 vertices), for crates and containers. */
 function unitCube(): Float32Array {
   const out: number[] = [];
@@ -206,6 +237,14 @@ export class Game {
   /** Free car within reach (-1 = none) and whether an item is, too. */
   private nearCar = -1;
   private nearItem = false;
+  private helis: HeliC[] = [];
+  private myHeli = -1;
+  /** Free helicopter within reach (-1 = none). */
+  private nearHeli = -1;
+  private heliPoses = new Float32Array(0);
+  /** Missiles already heard leaving (by id), and when a smoke puff was last left behind them. */
+  private missilesSeen = new Set<number>();
+  private missileSmokeT = 0;
   private predPrevYaw = 0;
   private smoothYaw = 0;
   private lastLookAt = 0;
@@ -308,6 +347,7 @@ export class Game {
     this.d.sound.loop('plane', 0);
     this.d.sound.loop('wind', 0);
     this.d.sound.loop('engine', 0);
+    this.d.sound.rotor(0);
     this.d.input.enabled = false;
     this.d.input.unlock();
     this.d.touch.releaseAll();
@@ -411,6 +451,14 @@ export class Game {
       });
     }
     this.myCar = -1;
+    const h0 = core.helis();
+    this.helis = [];
+    for (let i = 0; i + 4 <= h0.length; i += 4) {
+      const at: HeliPose = { x: h0[i], y: h0[i + 1], z: h0[i + 2], yaw: h0[i + 3], pitch: 0, roll: 0, t: 0 };
+      this.helis.push({ a: at, b: { ...at }, rotor: 0, pilot: 255, hp: 255, ammo: 0, airborne: false, deadAt: -1, spin: 0, angle: i, gear: 0, smokeT: 0 });
+    }
+    this.myHeli = -1;
+    this.missilesSeen.clear();
     this.tracks = [];
     core.freeMeshes();
     for (const p of w.players) this.players.set(p.id, p);
@@ -447,6 +495,7 @@ export class Game {
     for (const e of s.events) this.onEvent(e);
     this.onPhase(s);
     this.onCars(s);
+    this.onHelis(s);
     this.onProps(s);
     this.reconcile(s);
     if (this.slotReq < 0 || performance.now() - this.slotReqAt > 1200 || s.self.cur === this.slotReq) {
@@ -559,7 +608,7 @@ export class Game {
       case 'kill': {
         const killer = this.nameOf(e.killer);
         const victim = this.nameOf(e.victim);
-        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : e.weapon === P.WK_TRUCK ? '消防車' : e.weapon === P.WK_BOOM ? '車両爆発' : WEAPON_SHORT[e.weapon] ?? '?';
+        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : e.weapon === P.WK_TRUCK ? '消防車' : e.weapon === P.WK_BOOM ? '車両爆発' : e.weapon === P.WK_MISSILE ? 'ミサイル' : e.weapon === P.WK_HELI ? 'CH-47J' : WEAPON_SHORT[e.weapon] ?? '?';
         const mine = e.killer === this.myId ? 'me' : e.victim === this.myId ? 'victim' : '';
         hud.killfeed(killer, victim, (e.head ? '◎ ' : '') + weapon, mine);
         if (e.killer === this.myId && e.victim !== this.myId) hud.showBanner(`キル！ ${victim}${e.head ? '（ヘッドショット）' : ''}`, 2, 'kill');
@@ -724,6 +773,90 @@ export class Game {
     if (this.myCar >= 0) core.setCar(this.myCar, 0, -1000, 0, 0);
   }
 
+  /** Helicopter poses from the server: for drawing, and solid in the core where they are now. */
+  private onHelis(s: P.Snapshot) {
+    const core = this.d.core;
+    const step = this.welcome?.snapEvery ?? 2;
+    let mine = -1;
+    for (const h of s.helis) {
+      const k = this.helis[h.id];
+      if (!k) continue;
+      k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - step } : k.b;
+      k.b = { x: h.x, y: h.y, z: h.z, yaw: h.yaw, pitch: h.pitch, roll: h.roll, t: s.tick };
+      if (h.hp === 0 && k.hp > 0) {
+        // it just blew up (unless this is old news from far away); the blast itself comes as an event
+        k.deadAt = Math.hypot(h.x - this.camEye[0], h.z - this.camEye[2]) < 320 ? this.time : this.time - 1000;
+      } else if (h.hp > 0 && k.hp === 0) k.deadAt = -1;
+      k.rotor = h.rotor;
+      k.pilot = h.pilot;
+      k.hp = h.hp;
+      k.ammo = h.ammo;
+      k.airborne = h.airborne;
+      if (h.pilot === this.myId) mine = h.id;
+      core.setHeli(h.id, h.x, h.y, h.z, h.yaw);
+    }
+    const flying = s.self.alive && s.self.mode === P.MODE_FLY;
+    this.myHeli = flying ? (mine >= 0 ? mine : this.myHeli) : -1;
+    // the one I fly follows my prediction: keep the server's copy of it out
+    // of the way of the camera and of the aiming ray
+    if (this.myHeli >= 0) core.setHeli(this.myHeli, 0, -1000, 0, 0);
+    // a missile seen for the first time has just left its tube
+    const live = new Set<number>();
+    for (const m of s.missiles) {
+      live.add(m.id);
+      if (this.missilesSeen.has(m.id)) continue;
+      const d = dirFrom(m.yaw, m.pitch);
+      // back to the pod it came from (it is a tick or two old by now)
+      const at: V3 = [m.x - d[0] * 4, m.y - d[1] * 4, m.z - d[2] * 4];
+      this.spawnFlash(at);
+      for (let i = 0; i < 5; i++) {
+        this.fx.push({ k: 'smoke', t: 0, life: 0.7 + Math.random() * 0.5, p: [...at], v: [-d[0] * (4 + i * 3) + (Math.random() - 0.5) * 2, -d[1] * (4 + i * 3) + 0.6, -d[2] * (4 + i * 3) + (Math.random() - 0.5) * 2], d: [0, 0, 0], len: 0, col: 0xcfcbc4, size: 0.5 + Math.random() * 0.3 });
+      }
+      this.d.sound.missile(Math.hypot(at[0] - this.camEye[0], at[1] - this.camEye[1], at[2] - this.camEye[2]), this.panOf(at));
+    }
+    this.missilesSeen = live;
+  }
+
+  private heliPose(k: number): HeliPose {
+    const h = this.helis[k];
+    const span = h.b.t - h.a.t;
+    const f = span > 0 ? clamp((this.renderTick - h.a.t) / span, 0, 1) : 1;
+    const pitch = lerp(h.a.pitch, h.b.pitch, f), roll = lerp(h.a.roll, h.b.roll, f);
+    if (k === this.myHeli && this.pred && this.pred.mode === P.MODE_FLY) {
+      const p = this.renderPos();
+      const a = clamp(this.cmdAcc / DT, 0, 1);
+      return { x: p[0], y: p[1], z: p[2], yaw: lerpAngle(this.predPrevYaw, this.pred.airtime, a) + this.smoothYaw, pitch, roll, t: 0 };
+    }
+    return { x: lerp(h.a.x, h.b.x, f), y: lerp(h.a.y, h.b.y, f), z: lerp(h.a.z, h.b.z, f), yaw: lerpAngle(h.a.yaw, h.b.yaw, f), pitch, roll, t: 0 };
+  }
+
+  /** The free, landed helicopter a player at `me` could board, or -1 (the server allows 1.8 m from the hull). */
+  private heliInReach(me: V3): number {
+    for (let k = 0; k < this.helis.length; k++) {
+      const h = this.helis[k];
+      if (h.pilot !== 255 || h.hp === 0 || h.airborne || Math.abs(me[1] - h.b.y) > 1.6) continue;
+      const dx = me[0] - h.b.x, dz = me[2] - h.b.z;
+      if (dx * dx + dz * dz > 144) continue;
+      const sn = Math.sin(h.b.yaw), cs = Math.cos(h.b.yaw);
+      const lx = -dx * cs + dz * sn, lz = dx * sn + dz * cs;
+      if (Math.hypot(Math.max(0, Math.abs(lx) - HELI_HULL_HALF[0]), Math.max(0, Math.abs(lz) - HELI_HULL_HALF[2])) < 1.6) return k;
+    }
+    return -1;
+  }
+
+  /** Where the missiles of the helicopter I fly would go: the server aims both pods at this point. */
+  private missileAim(): V3 | null {
+    const p = this.pred;
+    if (!p || p.mode !== P.MODE_FLY) return null;
+    const pos = this.renderPos();
+    const off = clamp(wrapAngle(this.yaw - p.airtime), -1.05, 1.05);
+    const d = dirFrom(p.airtime + off, clamp(this.pitch, -1.3, 0.6));
+    const mid: V3 = [pos[0], pos[1] + 2, pos[2]];
+    const reach = 380;
+    const t = this.d.core.ray(mid, d, reach);
+    return add(mid, scale(d, Math.max(30, t >= 0 ? t : reach)));
+  }
+
   /** Crates and containers that were knocked about: for drawing, and solid in the core where they are now. */
   private onProps(s: P.Snapshot) {
     const step = this.welcome?.snapEvery ?? 2;
@@ -830,14 +963,14 @@ export class Game {
     // (its debt then says nothing about the network)
     if (me.debt >= 4 && !document.hidden && tnow - this.lastFrame < 150 && tnow - this.lastGapEnd > pathRtt + 600) this.stallSeenAt = tnow;
     this.pending = this.pending.filter((p) => p.cmd.seq > s.ack);
-    const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND || (me.mode === P.MODE_DRIVE && this.myCar >= 0));
+    const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND || (me.mode === P.MODE_DRIVE && this.myCar >= 0) || (me.mode === P.MODE_FLY && this.myHeli >= 0));
     if (!predictable) {
       this.pred = null;
       return;
     }
     const old = this.pred ? ([...this.pred.pos] as V3) : null;
-    const oldYaw = this.pred && this.pred.mode === P.MODE_DRIVE && me.mode === P.MODE_DRIVE ? this.pred.airtime : null;
-    this.pred = { pos: [...me.pos], vel: [...me.vel], mode: me.mode, onGround: me.onGround, crouch: me.crouch, inWater: me.inWater, airtime: me.airtime, car: me.mode === P.MODE_DRIVE ? this.myCar : 255 };
+    const oldYaw = this.pred && this.pred.mode === me.mode && (me.mode === P.MODE_DRIVE || me.mode === P.MODE_FLY) ? this.pred.airtime : null;
+    this.pred = { pos: [...me.pos], vel: [...me.vel], mode: me.mode, onGround: me.onGround, crouch: me.crouch, inWater: me.inWater, airtime: me.airtime, car: me.mode === P.MODE_DRIVE ? this.myCar : me.mode === P.MODE_FLY ? this.myHeli : 255 };
     const mult = this.speedMult(me);
     // The server stood in for late commands with idle steps and drops that many of
     // the oldest when they arrive, so they must not be replayed. Only commands old
@@ -933,6 +1066,19 @@ export class Game {
         e.slot = -1;
       }
     }
+    const flying = this.pred?.mode === P.MODE_FLY;
+    if (flying) {
+      // at the controls: Space climbs and C / Ctrl descends while held, the trigger launches missiles
+      b = firing ? P.B_FIRE : 0;
+      if (inp.keys.has('Space') || inp.touchUp) b |= P.B_JUMP;
+      if (inp.keys.has('KeyC') || inp.keys.has('ControlLeft') || inp.touchDown) b |= P.B_CROUCH;
+      inp.crouch = false;
+      if (e) {
+        e.jump = e.reload = e.nade = false;
+        e.heal = 0;
+        e.slot = -1;
+      }
+    }
     if (e) {
       if (e.jump) {
         b |= P.B_JUMP;
@@ -940,7 +1086,7 @@ export class Game {
       }
       if (e.reload) b |= P.B_RELOAD;
       // one key: leave the car, get into one, or pick up what lies here
-      if (e.pickup) b |= driving || (this.nearCar >= 0 && !this.nearItem) ? P.B_USE : P.B_PICKUP;
+      if (e.pickup) b |= driving || flying || ((this.nearCar >= 0 || this.nearHeli >= 0) && !this.nearItem) ? P.B_USE : P.B_PICKUP;
       if (e.spect) b |= P.B_SPECT;
       if (e.nade) b |= P.B_NADE;
       let heal = e.heal;
@@ -986,7 +1132,7 @@ export class Game {
     const wall = this.d.core.ray(o, d, def.range);
     const lim = wall >= 0 ? wall : def.range;
     for (const p of this.interpAll()) {
-      if (!p.alive || p.id === this.myId || p.mode === P.MODE_PLANE) continue;
+      if (!p.alive || p.id === this.myId || p.mode === P.MODE_PLANE || p.mode === P.MODE_FLY) continue;
       const c: V3 = [p.x, p.y + (p.crouch ? 0.8 : 1.15), p.z];
       const to = sub(c, o);
       const along = to[0] * d[0] + to[1] * d[1] + to[2] * d[2];
@@ -1054,7 +1200,7 @@ export class Game {
       const tw = this.d.core.ray(o, d, def.range);
       let end = tw >= 0 ? tw : def.range;
       for (const q of this.interpAll()) {
-        if (q.id === this.myId || !q.alive || q.mode === P.MODE_PLANE) continue;
+        if (q.id === this.myId || !q.alive || q.mode === P.MODE_PLANE || q.mode === P.MODE_FLY) continue;
         const c: V3 = [q.x, q.y + (q.crouch ? 0.8 : 1.1), q.z];
         const to = sub(c, o);
         const along = to[0] * d[0] + to[1] * d[1] + to[2] * d[2];
@@ -1424,6 +1570,12 @@ export class Game {
         const pivot: V3 = [pos[0], pos[1] + (kind ? 3.7 : 2.0), pos[2]];
         return { eye: back(pivot, (kind ? 10.5 : 7.2) + 1.2 * k), dir: d, vfov: base * (1 + 0.1 * k), scoped: false, pivot };
       }
+      if (this.pred.mode === P.MODE_FLY) {
+        // chase camera looking over the rotors, further back with speed
+        const k = Math.min(1, Math.hypot(this.pred.vel[0], this.pred.vel[2]) / 45);
+        const pivot: V3 = [pos[0], pos[1] + 7, pos[2]];
+        return { eye: back(pivot, 21 + 4 * k), dir: d, vfov: base * (1 + 0.08 * k), scoped: false, pivot };
+      }
       const pivot: V3 = [pos[0], pos[1] + 1.2, pos[2]];
       return { eye: back(pivot, this.pred.mode === P.MODE_PARA ? 8 : 6.5), dir: d, vfov: base, scoped: false, pivot };
     }
@@ -1435,8 +1587,10 @@ export class Game {
     }
     // spectating / dead
     const target = s.self.spect !== 255 ? this.interpPlayer(s.self.spect) : null;
-    const tp: V3 = target ? [target.x, target.y + 1.6, target.z] : [s.self.pos[0], s.self.pos[1] + 1.6, s.self.pos[2]];
-    return { eye: back(tp, 4.5), dir: d, vfov: base, scoped: false, pivot: tp };
+    // (a pilot is watched from behind the helicopter, not from inside it)
+    const fly = !!target && target.alive && target.mode === P.MODE_FLY;
+    const tp: V3 = target ? [target.x, target.y + (fly ? 7 : 1.6), target.z] : [s.self.pos[0], s.self.pos[1] + 1.6, s.self.pos[2]];
+    return { eye: back(tp, fly ? 22 : 4.5), dir: d, vfov: base, scoped: false, pivot: tp };
   }
 
   private draw(dt: number) {
@@ -1461,8 +1615,8 @@ export class Game {
     const tsec = this.time;
     const seen = new Set<number>();
     for (const p of this.interpAll()) {
-      // a driver sits inside the car
-      if (p.id === this.myId || p.mode === P.MODE_PLANE || (p.mode === P.MODE_DRIVE && p.alive)) continue;
+      // a driver sits inside the car, a pilot in the helicopter
+      if (p.id === this.myId || p.mode === P.MODE_PLANE || ((p.mode === P.MODE_DRIVE || p.mode === P.MODE_FLY) && p.alive)) continue;
       const dx = p.x - eye[0], dz = p.z - eye[2];
       if (dx * dx + dz * dz > 420 * 420) continue;
       seen.add(p.id);
@@ -1476,7 +1630,7 @@ export class Game {
     for (const id of this.anims.keys()) if (!seen.has(id) && id !== this.myId) this.anims.get(id)!.seen += dt;
 
     // ---- me
-    if (this.pred && s.self.alive && !cam.scoped && this.pred.mode !== P.MODE_DRIVE) {
+    if (this.pred && s.self.alive && !cam.scoped && this.pred.mode !== P.MODE_DRIVE && this.pred.mode !== P.MODE_FLY) {
       const pos = this.renderPos();
       const a = this.anim(this.myId, pos[0], pos[2], true, dt, this.pred.onGround && !this.pred.inWater && !this.pred.crouch, 0);
       const weapon = this.displayCur < 2 ? s.self.slots[this.displayCur].kind : 0;
@@ -1510,6 +1664,8 @@ export class Game {
     }
     this.updateFx(dt);
     this.drawCars(eye, dt);
+    this.drawHelis(eye, dt);
+    this.drawMissiles(br, dt);
     this.drawProps(eye, dt);
     // window glass near the camera
     this.glass.reset();
@@ -1535,7 +1691,8 @@ export class Game {
     }
 
     const me = this.myPos();
-    const shadowCenter: V3 = this.pred ? this.renderPos() : cam.pivot;
+    // (a debug camera takes the shadows with it)
+    const shadowCenter: V3 = this.pred && !(DEBUG && (window as unknown as { __zfCam?: number[] }).__zfCam) ? this.renderPos() : cam.pivot;
     this.d.renderer.render({
       viewProj: this.viewProj,
       invViewProj: invert(this.viewProj),
@@ -1592,26 +1749,51 @@ export class Game {
     else hud.setProgress(null, 0);
     const item = ground && me ? this.nearestPickup(me) : null;
     const driving = alive && this.pred?.mode === P.MODE_DRIVE;
+    const flying = alive && this.pred?.mode === P.MODE_FLY;
+    const heli = flying ? this.helis[this.myHeli] : undefined;
     this.nearItem = !!item;
     this.nearCar = ground && me ? this.carInReach(me) : -1;
+    this.nearHeli = ground && me && this.nearCar < 0 ? this.heliInReach(me) : -1;
+    const landed = flying && !!this.pred?.onGround && Math.hypot(...this.pred.vel) < 1.5;
+    let flyText = '';
+    if (flying && this.pred && heli) {
+      const pp = this.pred.pos;
+      const alt = Math.max(0, Math.round(pp[1] - Math.max(0, core.height(pp[0], pp[2]))));
+      flyText = `${Math.round(Math.hypot(this.pred.vel[0], this.pred.vel[2]) * 3.6)} km/h　高度 ${alt} m　機体 ${Math.ceil((heli.hp / 255) * 100)}%　ミサイル ${heli.ammo}`;
+    }
+    // where the missiles would go
+    const aim = flying ? this.missileAim() : null;
+    if (aim && heli) {
+      const sz = Math.max(0.12, Math.hypot(aim[0] - eye[0], aim[1] - eye[1], aim[2] - eye[2]) * 0.004);
+      const col = rgba(heli.ammo > 0 ? 0xff5a28 : 0x9a9a9a, 230);
+      const q = qY(this.yaw);
+      for (const sgn of [-1, 1]) {
+        this.glow.push(add(aim, qRot(q, [sgn * sz * 3.2, 0, 0])), q, [sz * 3, sz * 0.6, sz * 0.6], col);
+        this.glow.push(add(aim, [0, sgn * sz * 3.2, 0]), q, [sz * 0.6, sz * 3, sz * 0.6], col);
+      }
+    }
     const kmh = driving && this.pred ? Math.round(Math.hypot(this.pred.vel[0], this.pred.vel[2]) * 3.6) : 0;
     const carName = CAR_KINDS[this.cars[driving ? this.myCar : this.nearCar]?.kind ?? 0].name;
-    const pickup = driving ? '降りる' : item ?? (this.nearCar >= 0 ? `${carName}に乗る` : null);
+    const pickup = driving ? '降りる' : flying ? (landed ? '降りる' : null) : item ?? (this.nearCar >= 0 ? `${carName}に乗る` : this.nearHeli >= 0 ? 'CH-47Jに乗る' : null);
     const touch = matchMedia('(pointer: coarse)').matches;
     const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
     hud.setPrompt(
       needLock ? 'クリックしてマウス操作を開始'
         : driving && (this.cars[this.myCar]?.hp ?? 255) < 50 ? '🔥 炎上中 — まもなく爆発！' + (touch ? ' 降りて離れろ' : ' [F] で降りて離れろ')
         : driving ? `${kmh} km/h　車体 ${Math.ceil(((this.cars[this.myCar]?.hp ?? 255) / 255) * 100)}%` + (touch ? '' : '　[F] 降りる　[Space] ブレーキ')
+        : flying ? flyText + (touch ? '' : landed ? '　[Space] 上昇　[F] 降りる' : '　[Space] 上昇　[C] 下降　[クリック] ミサイル')
         : touch ? null
         : item ? `[F] 拾う: ${item}`
-        : this.nearCar >= 0 ? `[F] ${carName}に乗る` : null,
+        : this.nearCar >= 0 ? `[F] ${carName}に乗る`
+        : this.nearHeli >= 0 ? '[F] CH-47Jに乗る' : null,
     );
     this.d.sound.loop('engine', driving ? 1 : 0, kmh / (CAR_KINDS[this.cars[this.myCar]?.kind ?? 0].vmax * 3.6));
     const spectating = !alive && s.phase === P.PH_PLAY;
     hud.setSpectate(spectating ? (s.self.spect !== 255 ? this.nameOf(s.self.spect) : '—') : null);
-    if (me) hud.drawMinimap(me[0], me[2], this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, this.markers, this.time, 1024);
-    if (hud.mapOpen) hud.drawFullMap(me ? me[0] : null, me ? me[2] : 0, this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, core.towns, 1024);
+    // helicopters that still fly, where they were last seen
+    const heliMarks = this.helis.filter((h) => h.hp > 0).map((h) => ({ x: h.b.x, z: h.b.z }));
+    if (me) hud.drawMinimap(me[0], me[2], this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, this.markers, this.time, 1024, heliMarks);
+    if (hud.mapOpen) hud.drawFullMap(me ? me[0] : null, me ? me[2] : 0, this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, core.towns, 1024, heliMarks);
     if (this.d.settings.showFps) hud.setNet(`${Math.round(this.fps)} fps${this.d.transport.kind === 'online' ? ` · ${Math.round(this.rtt)} ms` : ''}`);
     else hud.setNet(this.d.transport.kind === 'online' && this.rtt > 180 ? `⚠ ${Math.round(this.rtt)} ms` : '');
     this.d.touch.setState({
@@ -1625,7 +1807,107 @@ export class Game {
       heals: s.self.heals[0] + s.self.heals[1] + s.self.heals[2],
       dead: !alive,
       driving,
+      flying,
     });
+  }
+
+  /**
+   * Hand the renderer every helicopter: rotors turning as fast as the server
+   * says, struts extending as the weight comes off and the gear stowed once
+   * well clear of the ground, wrecks charred. Also the rotor sound of the
+   * loudest one, and smoke from damaged or burning ones.
+   */
+  private drawHelis(eye: V3, dt: number) {
+    const core = this.d.core;
+    const n = this.helis.length;
+    if (this.heliPoses.length !== n * HELI_STRIDE) this.heliPoses = new Float32Array(n * HELI_STRIDE);
+    const out = this.heliPoses;
+    let loud = 0, loudSpin = 0, loudPan = 0;
+    for (let k = 0; k < n; k++) {
+      const h = this.helis[k];
+      const c = this.heliPose(k);
+      h.spin += ((h.hp > 0 ? h.rotor : Math.min(h.rotor, h.spin)) - h.spin) * Math.min(1, dt * 5);
+      if (h.spin < 0.003) h.spin = 0;
+      h.angle = (h.angle + h.spin * HELI_ROTOR_SPEED * dt) % (Math.PI * 2);
+      if (h.hp > 0) {
+        const alt = c.y - Math.max(0, core.height(c.x, c.z));
+        // up at 9 m, down again below 6 m (the wheels are out well before touching down)
+        const want = !h.airborne ? 0 : alt > 9 || (h.gear > 1.02 && alt > 6) ? 2 : 1;
+        const rate = (h.gear > 1 || want > 1 ? 0.45 : 2.5) * dt;
+        h.gear += clamp(want - h.gear, -rate, rate);
+      }
+      const q = qMul(qAxis(0, 1, 0, c.yaw), qMul(qAxis(1, 0, 0, c.pitch), qAxis(0, 0, 1, c.roll)));
+      const tint = h.hp === 0 ? 0.25 : 0.72 + 0.28 * Math.min(1, h.hp / 128);
+      out.set([c.x, c.y, c.z, q[0], q[1], q[2], q[3], tint, h.angle, h.gear, h.spin], k * HELI_STRIDE);
+      const mine = k === this.myHeli;
+      const dist = Math.hypot(c.x - eye[0], c.y + 3 - eye[1], c.z - eye[2]);
+      const level = h.hp > 0 ? Math.min(1, h.spin * 1.3) * (mine ? 0.8 : 1 / (1 + (dist / 45) ** 2)) : 0;
+      if (level > loud) {
+        loud = level;
+        loudSpin = h.spin;
+        loudPan = mine ? 0 : this.panOf([c.x, c.y + 3, c.z]) * 0.7;
+      }
+      if (dist < 320) this.heliSmoke(h, c, q, dt);
+    }
+    this.d.renderer.setHelis(out);
+    this.d.sound.rotor(this.paused || this.ended ? 0 : loud, loudSpin, loudPan);
+  }
+
+  /** Smoke from the engines of a badly hit helicopter, fire and black smoke from a wreck. */
+  private heliSmoke(h: HeliC, c: HeliPose, q: Q, dt: number) {
+    const hurt = h.hp > 0 && h.hp < 100;
+    const burning = h.hp === 0 && this.time - h.deadAt < 90;
+    if (!hurt && !burning) return;
+    h.smokeT -= dt;
+    const base: V3 = [c.x, c.y, c.z];
+    if (h.smokeT <= 0) {
+      h.smokeT = burning ? 0.09 : h.hp < 45 ? 0.1 : 0.2;
+      // the engines beside the aft pylon; all along a wreck
+      const at = add(base, qRot(q, burning ? [(Math.random() - 0.5) * 2.4, 2.4, (Math.random() - 0.5) * 12] : [Math.random() < 0.5 ? 1.4 : -1.4, 3.5, -5.2]));
+      this.fx.push({
+        k: 'smoke', t: 0, life: burning ? 3 + Math.random() * 2 : 1.5 + Math.random() * 0.8, p: at,
+        v: [(Math.random() - 0.5) * 1.2, 1.8 + Math.random() * 1.8, (Math.random() - 0.5) * 1.2],
+        d: [0, 0, 0], len: 0, col: burning ? 0x121110 : h.hp < 45 ? 0x2a2826 : 0x8d8a86, size: burning ? 1.3 + Math.random() : 0.5 + Math.random() * 0.3,
+      });
+    }
+    if (burning && this.time - h.deadAt < 50) {
+      const fade = Math.min(1, (50 - (this.time - h.deadAt)) / 8);
+      const id = h.b.x * 0.37 + h.b.z * 0.11;
+      for (let i = 0; i < 9; i++) {
+        const h1 = Math.abs(Math.sin(id + i * 12.9898) * 43758.5453) % 1, h2 = Math.abs(Math.sin(id + i * 78.233) * 12543.123) % 1;
+        const sz = (1.0 + 0.8 * h1) * (0.6 + 0.4 * fade);
+        const at = add(base, qRot(q, [(h2 - 0.5) * 3, 1.2 + 2 * h2 + sz, (h1 - 0.5) * 13]));
+        this.puffs.push(at, sz, rgba(0xffffff, Math.round(255 * fade)), 0, (id + i * 3.1) % 10, PUFF_FLAME);
+      }
+      this.glow.push([c.x, c.y + 0.4, c.z], qIdent(), [0.05, 0.05, 0.05], rgba(0xff8030, 60));
+    }
+  }
+
+  /** Missiles in flight: the round, its motor flame and the smoke it leaves behind. */
+  private drawMissiles(br: { a: Snap; b: Snap; f: number } | null, dt: number) {
+    if (!br || !br.b.missiles.length) return;
+    this.missileSmokeT -= dt;
+    const puff = this.missileSmokeT <= 0;
+    if (puff) this.missileSmokeT = 0.022;
+    const span = Math.max(1, br.b.tick - br.a.tick) / 30;
+    for (const m of br.b.missiles) {
+      const d = dirFrom(m.yaw, m.pitch);
+      const was = br.a.missiles.find((x) => x.id === m.id);
+      // not in the older snapshot yet: it flew straight to where it is
+      const from: V3 = was && br.a !== br.b ? [was.x, was.y, was.z] : [m.x - d[0] * MISSILE_SPEED * span, m.y - d[1] * MISSILE_SPEED * span, m.z - d[2] * MISSILE_SPEED * span];
+      const p: V3 = [lerp(from[0], m.x, br.f), lerp(from[1], m.y, br.f), lerp(from[2], m.z, br.f)];
+      const q = qMul(qAxis(0, 1, 0, m.yaw), qAxis(1, 0, 0, -m.pitch));
+      this.boxes.push(p, q, [0.14, 0.14, 1.5], rgba(0x4a5136), undefined, surf(0.5, 0.3));
+      this.boxes.push(add(p, scale(d, 0.85)), q, [0.1, 0.1, 0.25], rgba(0x1c1c1c));
+      for (const [fx, fy] of [[0.16, 0], [-0.16, 0], [0, 0.16], [0, -0.16]]) this.boxes.push(add(p, qRot(q, [fx, fy, -0.62])), q, [fx ? 0.18 : 0.02, fy ? 0.18 : 0.02, 0.26], rgba(0x3a4030));
+      // motor flame
+      this.glow.push(add(p, scale(d, -1.1)), q, [0.2, 0.2, 0.9], rgba(0xffc070, 255));
+      this.glow.push(add(p, scale(d, -1.9)), q, [0.12, 0.12, 1.2], rgba(0xff7a30, 200));
+      if (puff) {
+        const at = add(p, scale(d, -1.6 - Math.random() * 1.5));
+        this.fx.push({ k: 'smoke', t: 0, life: 1.1 + Math.random() * 0.7, p: at, v: [(Math.random() - 0.5) * 0.9 - d[0] * 3, (Math.random() - 0.5) * 0.9 + 0.3, (Math.random() - 0.5) * 0.9 - d[2] * 3], d: [0, 0, 0], len: 0, col: 0xd8d5cf, size: 0.38 + Math.random() * 0.22 });
+      }
+    }
   }
 
   /**

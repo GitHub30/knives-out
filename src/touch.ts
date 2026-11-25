@@ -30,6 +30,7 @@ export class TouchControls {
   private sprintLocked = false;
   private looks = new Map<number, [number, number]>();
   private held = new Map<number, TouchButton>();
+  private flying = false;
   lookScale = 1.6;
   onButton: (b: TouchButton) => void = () => {};
 
@@ -98,6 +99,7 @@ export class TouchControls {
     this.looks.clear();
     this.held.clear();
     this.input.touchFire = false;
+    this.input.touchUp = this.input.touchDown = false;
     this.input.moveX = 0;
     this.input.moveZ = 0;
     this.input.touchSprint = this.sprintLocked = false;
@@ -106,22 +108,29 @@ export class TouchControls {
   }
 
   /** Context-dependent appearance. */
-  setState(s: { plane: boolean; air: boolean; canJumpPlane: boolean; pickup: string | null; ads: boolean; crouch: boolean; nades: number; heals: number; dead: boolean; driving?: boolean }) {
+  setState(s: { plane: boolean; air: boolean; canJumpPlane: boolean; pickup: string | null; ads: boolean; crouch: boolean; nades: number; heals: number; dead: boolean; driving?: boolean; flying?: boolean }) {
+    this.flying = !!s.flying;
     const jump = this.btns.get('jump')!;
     jump.classList.toggle('big', s.plane || s.air);
-    jump.dataset.label = s.plane ? (s.canJumpPlane ? '降下' : '待機') : s.air ? '開傘' : '';
+    jump.dataset.label = s.plane ? (s.canJumpPlane ? '降下' : '待機') : s.air ? '開傘' : s.flying ? '上昇' : '';
+    // at the controls of a helicopter: hold to climb, hold to descend, fire launches missiles
+    jump.classList.toggle('fly', this.flying);
+    const crouch = this.btns.get('crouch')!;
+    crouch.classList.toggle('fly', this.flying);
+    crouch.dataset.label = this.flying ? '下降' : '';
     jump.classList.toggle('disabled', s.plane && !s.canJumpPlane);
-    const combat = !s.plane && !s.air && !s.dead && !s.driving;
-    for (const id of ['fire', 'fireL', 'ads', 'crouch', 'reload'] as TouchButton[]) this.btns.get(id)!.style.display = combat ? '' : 'none';
+    const combat = !s.plane && !s.air && !s.dead && !s.driving && !s.flying;
+    for (const id of ['ads', 'reload'] as TouchButton[]) this.btns.get(id)!.style.display = combat ? '' : 'none';
+    for (const id of ['fire', 'fireL', 'crouch'] as TouchButton[]) this.btns.get(id)!.style.display = combat || s.flying ? '' : 'none';
     this.btns.get('nade')!.style.display = combat && s.nades > 0 ? '' : 'none';
     this.btns.get('heal')!.style.display = combat && s.heals > 0 ? '' : 'none';
     this.btns.get('jump')!.style.display = s.dead || s.driving ? 'none' : '';
     const pick = this.btns.get('pickup')!;
-    pick.style.display = s.pickup && (combat || s.driving) ? '' : 'none';
+    pick.style.display = s.pickup && (combat || s.driving || s.flying) ? '' : 'none';
     const label = pick.querySelector('.tb-label');
     if (label && label.textContent !== (s.pickup ?? '')) label.textContent = s.pickup ?? '';
     this.btns.get('ads')!.classList.toggle('on', s.ads);
-    this.btns.get('crouch')!.classList.toggle('on', s.crouch);
+    this.btns.get('crouch')!.classList.toggle('on', s.crouch && !this.flying);
   }
 
   private press(b: TouchButton) {
@@ -136,9 +145,11 @@ export class TouchControls {
         break;
       case 'jump':
         i.edges.jump = true;
+        i.touchUp = true;
         break;
       case 'crouch':
-        i.crouch = !i.crouch;
+        if (this.flying) i.touchDown = true;
+        else i.crouch = !i.crouch;
         break;
       case 'reload':
         i.edges.reload = true;
@@ -264,6 +275,8 @@ export class TouchControls {
     if (b) {
       this.held.delete(e.pointerId);
       this.btns.get(b)?.classList.remove('down');
+      if (b === 'jump') this.input.touchUp = false;
+      if (b === 'crouch') this.input.touchDown = false;
       if ((b === 'fire' || b === 'fireL') && ![...this.held.values()].some((v) => v === 'fire' || v === 'fireL')) this.input.touchFire = false;
     }
   }
