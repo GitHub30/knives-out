@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 10;
+pub const PROTO: u16 = 11;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -70,7 +70,7 @@ pub const ITEM_SYNC_R: f32 = 190.0;
 const ALWAYS_SEND_R: f32 = 40.0;
 /// Item changes are logged; each viewer gets a change once it is near it or
 /// can see the player who made it.
-const ILOG: usize = 1024;
+const ILOG: usize = 2048;
 /// A chunk is only resynced to a viewer when it holds no change younger than
 /// this that the viewer was not allowed to see.
 const ITEM_QUIET: u32 = 300;

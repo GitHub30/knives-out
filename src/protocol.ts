@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 10;
+export const PROTO = 11;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;

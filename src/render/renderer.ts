@@ -2,7 +2,7 @@
 // models, sky, water, zone wall) lit by a sun with two shadow cascades, then
 // bloom + tonemap + FXAA into the swap chain.
 
-import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
@@ -53,6 +53,59 @@ export interface FrameView {
   boxes: Instances;
   glow: Instances;
   smoke: Instances;
+  /** Soft smoke and fire particles (optional). */
+  puffs?: Puffs;
+}
+
+/** Billboard particle kinds. */
+export const PUFF_SMOKE = 0;
+export const PUFF_FLAME = 1;
+export const PUFF_FIREBALL = 2;
+
+/** Soft particles of a frame: 32 bytes each (pos, size, rgba8, rotation, seed, kind). */
+export class Puffs {
+  private buf = new ArrayBuffer(256 * 32);
+  private f = new Float32Array(this.buf);
+  private u = new Uint32Array(this.buf);
+  count = 0;
+  reset() {
+    this.count = 0;
+  }
+  /** `color`: packed like the box instances (see `rgba`), alpha = opacity / heat. */
+  push(p: ArrayLike<number>, size: number, color: number, rot: number, seed: number, kind: number) {
+    if (this.count * 32 >= this.buf.byteLength) {
+      const nb = new ArrayBuffer(this.buf.byteLength * 2);
+      new Uint8Array(nb).set(new Uint8Array(this.buf));
+      this.buf = nb;
+      this.f = new Float32Array(nb);
+      this.u = new Uint32Array(nb);
+    }
+    const o = this.count * 8;
+    this.f[o] = p[0];
+    this.f[o + 1] = p[1];
+    this.f[o + 2] = p[2];
+    this.f[o + 3] = size;
+    this.u[o + 4] = color;
+    this.f[o + 5] = rot;
+    this.f[o + 6] = seed;
+    this.f[o + 7] = kind;
+    this.count++;
+  }
+  /** Far to near, so the blending layers up correctly. */
+  sorted(cam: ArrayLike<number>): ArrayBuffer {
+    const n = this.count;
+    const order = new Uint32Array(n);
+    const dist = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      order[i] = i;
+      const o = i * 8;
+      dist[i] = (this.f[o] - cam[0]) ** 2 + (this.f[o + 1] - cam[1]) ** 2 + (this.f[o + 2] - cam[2]) ** 2;
+    }
+    order.sort((a, b) => dist[b] - dist[a]);
+    const out = new Uint32Array(n * 8);
+    for (let i = 0; i < n; i++) out.set(this.u.subarray(order[i] * 8, order[i] * 8 + 8), i * 8);
+    return out.buffer;
+  }
 }
 
 const SUN = norm([-0.42, 0.78, -0.46]);
@@ -331,6 +384,7 @@ export class Renderer {
     const lit = mod(LIT_WGSL), litSh = mod(LIT_SHADOW_WGSL), box = mod(BOX_WGSL), boxSh = mod(BOX_SHADOW_WGSL);
     const model = mod(MODEL_WGSL), modelSh = mod(MODEL_SHADOW_WGSL);
     const sky = mod(SKY_WGSL), water = mod(WATER_WGSL), zone = mod(ZONE_WGSL);
+    const puff = mod(PUFF_WGSL);
     const bloom = mod(BLOOM_WGSL), post = mod(POST_WGSL), mip = mod(MIP_WGSL), ao = mod(AO_WGSL);
     const layoutAo = d.createPipelineLayout({ bindGroupLayouts: [this.bglAo] });
     const layoutMain = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain] });
@@ -461,6 +515,31 @@ export class Renderer {
         vertex: { module: box, entryPoint: 'vs', buffers: boxVB },
         fragment: { module: box, entryPoint: 'fs_smoke', targets: target(alpha) },
         primitive: tri,
+        depthStencil: depthMain(false),
+      }),
+      puff: d.createRenderPipeline({
+        layout: layoutMain,
+        vertex: {
+          module: puff,
+          entryPoint: 'vs',
+          buffers: [{
+            arrayStride: 32,
+            stepMode: 'instance',
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: 'float32x3' },
+              { shaderLocation: 1, offset: 12, format: 'float32' },
+              { shaderLocation: 2, offset: 16, format: 'unorm8x4' },
+              { shaderLocation: 3, offset: 20, format: 'float32x3' },
+            ],
+          }],
+        },
+        // premultiplied: smoke covers what is behind it, fire adds light
+        fragment: {
+          module: puff,
+          entryPoint: 'fs',
+          targets: target({ color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } }),
+        },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depthMain(false),
       }),
       sky: d.createRenderPipeline({
@@ -980,6 +1059,15 @@ export class Renderer {
       }
     }
     drawShapes(this.pipes.smoke, smokeBufs, v.smoke, true);
+    if (v.puffs && v.puffs.count) {
+      const pb = this.instBuffer('puffs', v.puffs.sorted(v.camPos), v.puffs.count * 32);
+      if (pb) {
+        pass.setPipeline(this.pipes.puff);
+        pass.setVertexBuffer(0, pb);
+        pass.draw(6, v.puffs.count);
+        draws++;
+      }
+    }
     if (v.zone.visible) {
       pass.setPipeline(this.pipes.zone);
       pass.setVertexBuffer(0, this.zoneVB);

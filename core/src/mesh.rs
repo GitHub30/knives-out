@@ -385,6 +385,16 @@ pub fn build(w: &World) -> Meshes {
             _ => s.cuboid(b.min, b.max, col, false, None),
         }
     }
+    // trim: frames, sills, bands, pipes (drawn, not solid)
+    for b in &w.deco {
+        s.select((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5);
+        let mat = match b.kind {
+            BK_METAL => MAT_METAL,
+            BK_CONCRETE => MAT_CONCRETE,
+            _ => MAT_FLOOR,
+        };
+        s.cuboid(b.min, b.max, pack_c(rgb(b.col), mat), false, None);
+    }
     for t in &w.trees {
         s.select(t.x, t.z);
         let mut r = Rng::new(t.seed as u64);

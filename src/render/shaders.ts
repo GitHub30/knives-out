@@ -561,6 +561,109 @@ fn qrot(q: vec4f, v: vec3f) -> vec3f {
 }
 `;
 
+// ---------------------------------------------------------------- soft particles
+// Camera-facing puffs of smoke and fire. The shape comes from animated noise
+// (no flat faces, no hard edges); smoke is lit by the sun, fire is emissive.
+export const PUFF_WGSL = /* wgsl */ `
+${COMMON}
+struct PIn {
+  @builtin(vertex_index) vi: u32,
+  @location(0) ipos: vec3f,
+  @location(1) isize: f32,
+  @location(2) icol: vec4f,
+  @location(3) iparm: vec3f,   // rotation, seed, kind (0 smoke, 1 flame, 2 fireball)
+};
+struct VOut {
+  @builtin(position) clip: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) col: vec4f,
+  @location(2) parm: vec3f,
+  @location(3) wp: vec3f,
+};
+@vertex fn vs(v: PIn) -> VOut {
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+  let c = corners[v.vi];
+  let right = normalize(F.rayX.xyz);
+  let up = normalize(F.rayY.xyz);
+  // flames stand upright: they rise whatever the camera does
+  let upw = select(up, normalize(vec3f(0.0, 1.0, 0.0) + up * 0.25), v.iparm.z > 0.5 && v.iparm.z < 1.5);
+  let cr = cos(v.iparm.x);
+  let sr = sin(v.iparm.x);
+  let q = vec2f(c.x * cr - c.y * sr, c.x * sr + c.y * cr);
+  let stretch = select(1.0, 1.7, v.iparm.z > 0.5 && v.iparm.z < 1.5);
+  let wp = v.ipos + (right * q.x + upw * q.y * stretch) * v.isize;
+  var o: VOut;
+  o.clip = F.viewProj * vec4f(wp, 1.0);
+  o.uv = c;
+  o.col = v.icol;
+  o.parm = v.iparm;
+  o.wp = wp;
+  return o;
+}
+fn heatRamp(h: f32) -> vec3f {
+  // deep red -> orange -> yellow-white
+  let a = mix(vec3f(0.55, 0.04, 0.0), vec3f(1.0, 0.32, 0.03), smoothstep(0.0, 0.45, h));
+  return mix(a, vec3f(1.0, 0.86, 0.5), smoothstep(0.45, 1.0, h));
+}
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  let t = F.camPos.w;
+  let seed = i.parm.y;
+  let r = length(i.uv);
+  if (r > 1.0) { discard; }
+  let kind = i.parm.z;
+  if (kind < 0.5) {
+    // ---- smoke: billowing density with a ragged, wispy edge
+    let p = vec3f(i.uv * 1.25 + vec2f(seed * 17.3, seed * 7.1), t * 0.22 + seed * 5.0);
+    let warp = vec2f(fbm3(p * 1.1 + 3.7), fbm3(p * 1.1 - 9.2)) - 0.5;
+    let n = fbm3(vec3f(p.xy + warp * 0.9, p.z) * 1.6);
+    let fine = fbm3(p * 4.2 + 11.0);
+    var dens = smoothstep(1.0, 0.15, r + (n - 0.5) * 1.1);
+    dens *= 0.5 + 0.9 * n;
+    dens *= 0.8 + 0.4 * fine;
+    // rounded: lit like a lumpy ball, sunward side brighter
+    let z = sqrt(max(1.0 - r * r, 0.0));
+    let right = normalize(F.rayX.xyz);
+    let up = normalize(F.rayY.xyz);
+    let fw = normalize(F.camPos.xyz - i.wp);
+    let nrm = normalize(right * (i.uv.x + warp.x) + up * (i.uv.y + warp.y) + fw * (z + 0.25));
+    let ndl = dot(nrm, F.sunDir.xyz) * 0.5 + 0.5;
+    let sky = mix(F.skyHorizon.rgb, F.skyTop.rgb, 0.5) * F.sunColor.w;
+    var c = i.col.rgb * (sky * 0.9 + F.sunColor.rgb * (0.25 + 0.75 * ndl * ndl) * 0.55);
+    // thick cores swallow light
+    c *= 1.0 - 0.35 * dens;
+    let a = clamp(i.col.a * dens * 1.35, 0.0, 1.0);
+    c = applyFog(c, i.wp);
+    return vec4f(c * a, a);
+  }
+  if (kind < 1.5) {
+    // ---- flame: noise scrolling upward through a teardrop
+    let y = i.uv.y * 0.5 + 0.5;                       // 0 at the base, 1 at the tip
+    let sc = vec3f(i.uv.x * 1.9 + seed * 13.0, i.uv.y * 1.5 - t * 2.6 - seed * 9.0, t * 0.9 + seed * 3.0);
+    let n = fbm3(sc);
+    let lick = fbm3(sc * 2.3 + 5.0);
+    let width = mix(0.85, 0.12, pow(y, 1.3));
+    let d = abs(i.uv.x + (n - 0.5) * 0.7 * y) / width;
+    var heat = (1.0 - smoothstep(0.35, 1.0, d)) * (1.0 - smoothstep(0.55, 1.0, y + (lick - 0.5) * 0.8));
+    heat *= smoothstep(0.0, 0.12, y) * (0.55 + 0.9 * lick);
+    heat = clamp(heat * i.col.a * 1.5, 0.0, 1.0);
+    let c = heatRamp(heat) * i.col.rgb * heat * 9.0;
+    return vec4f(c, heat * 0.2);
+  }
+  // ---- fireball: a roiling ball that is brightest inside
+  let p = vec3f(i.uv * 1.7 + seed * 23.0, t * 1.4 + seed * 4.0);
+  let n = fbm3(p);
+  let n2 = fbm3(p * 2.6 + 4.0);
+  var heat = smoothstep(1.0, 0.05, r + (n - 0.5) * 0.95);
+  heat *= 0.6 + 0.8 * n2;
+  heat = clamp(heat * i.col.a * 1.4, 0.0, 1.0);
+  // as it cools the rim goes to dark soot
+  let soot = smoothstep(0.55, 0.0, heat) * smoothstep(0.03, 0.3, heat);
+  // (the faint rim adds almost nothing: no coloured halo against the sky)
+  let c = heatRamp(heat) * i.col.rgb * heat * heat * 18.0;
+  return vec4f(c, clamp(heat * 0.4 + soot * 0.75, 0.0, 1.0));
+}
+`;
+
 // ---------------------------------------------------------------- sky
 export const SKY_WGSL = /* wgsl */ `
 ${COMMON}

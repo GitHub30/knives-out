@@ -288,7 +288,8 @@ fn find_loot(m: &Match, i: usize, radius: f32, ignore: &[u16]) -> Option<u16> {
             continue;
         }
         let d = dist_xz(it.pos.x, it.pos.z, pos.x, pos.z);
-        if d > radius || (it.pos.y - pos.y).abs() > 6.0 {
+        // (not what lies on another storey: bots do not use stairs)
+        if d > radius || (it.pos.y - pos.y).abs() > 2.2 {
             continue;
         }
         if !useful(p, it.kind, it.amount) {

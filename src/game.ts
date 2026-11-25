@@ -3,7 +3,7 @@
 // everyone else, and renders/plays the result.
 
 import type { Core } from './core';
-import { CAR_STRIDE, type Renderer } from './render/renderer';
+import { CAR_STRIDE, PUFF_FIREBALL, PUFF_FLAME, PUFF_SMOKE, Puffs, type Renderer } from './render/renderer';
 import { Instances, rgba } from './render/instances';
 import { drawPlane, emitCharacter, emitItem, line } from './render/models';
 import {
@@ -181,6 +181,7 @@ export class Game {
   private boxes = new Instances(4096);
   private glow = new Instances(1024);
   private smoke = new Instances(512);
+  private puffs = new Puffs();
   private time = 0;
   private shake = 0;
   private phase = -1;
@@ -1072,7 +1073,7 @@ export class Game {
 
   private updateFx(dt: number) {
     const out: Fx[] = [];
-    const B = this.boxes, G = this.glow, S = this.smoke;
+    const B = this.boxes, G = this.glow;
     for (const f of this.fx) {
       f.t += dt;
       if (f.t >= f.life) continue;
@@ -1100,14 +1101,18 @@ export class Game {
         case 'smoke': {
           f.p = add(f.p, scale(f.v, dt));
           f.v = scale(f.v, 1 - dt * 1.5);
-          const s = f.size * (1 + k * 2.5);
-          S.push(f.p, qY(f.t + f.size), [s, s, s], rgba(f.col, Math.round(180 * (1 - k))));
+          // a soft billowing puff: grows, turns slowly and thins out
+          const s = f.size * (0.8 + k * 2.2);
+          const seed = (f.life * 13.37 + f.size * 7.1) % 10;
+          this.puffs.push(f.p, s, rgba(f.col, Math.round(215 * Math.min(1, f.t * 12) * (1 - k) ** 1.3)), seed * 3 + f.t * 0.35, seed, PUFF_SMOKE);
           break;
         }
         case 'fire': {
-          const s = f.size * (0.4 + k);
-          G.push(f.p, qY(k * 3), [s, s, s], rgba(f.col, Math.round(255 * (1 - k))));
-          G.push(f.p, qY(-k * 2), [s * 0.6, s * 0.6, s * 0.6], rgba(0xfff0c0, Math.round(255 * (1 - k))));
+          // a roiling fireball that swells and cools
+          const s = f.size * (0.35 + 0.75 * Math.sqrt(k));
+          const seed = (f.size * 3.3 + f.life * 5.7) % 10;
+          this.puffs.push(f.p, s, rgba(0xffffff, Math.round(255 * (1 - k) ** 0.8)), seed, seed, PUFF_FIREBALL);
+          this.puffs.push([f.p[0], f.p[1] + s * 0.25, f.p[2]], s * 0.7, rgba(0xffffff, Math.round(255 * (1 - k))), seed + 2, seed + 4.2, PUFF_FIREBALL);
           break;
         }
       }
@@ -1294,6 +1299,7 @@ export class Game {
     this.boxes.reset();
     this.glow.reset();
     this.smoke.reset();
+    this.puffs.reset();
     const cam = this.camera();
     let eye = cam.eye;
     if (this.shake > 0) eye = add(eye, [(Math.random() - 0.5) * this.shake * 0.3, (Math.random() - 0.5) * this.shake * 0.3, (Math.random() - 0.5) * this.shake * 0.3]);
@@ -1371,6 +1377,7 @@ export class Game {
       boxes: this.boxes,
       glow: this.glow,
       smoke: this.smoke,
+      puffs: this.puffs,
     });
 
     // ---- audio loops
@@ -1549,13 +1556,18 @@ export class Game {
     }
     // flames: a wreck burns for a while, a car about to go licks at the bonnet
     if ((burning && this.time - car.deadAt < 40) || (hurt && car.hp < 50)) {
-      // several small tongues rather than one block
-      for (let i = 0; i < (burning ? 5 : 1); i++) {
-        const s = (burning ? 0.55 : 0.4) * (0.6 + 0.8 * Math.random());
-        const along = burning ? (Math.random() - 0.5) * dim.hl * 1.3 : 0, across = (Math.random() - 0.5) * (burning ? dim.hw * 1.4 : 0.3);
-        const at: V3 = [p[0] + sn * along + cs * across, p[1] + (burning ? (Math.random() - 0.6) * dim.h * 0.5 : 0.05), p[2] + cs * along - sn * across];
-        this.glow.push(at, qY(Math.random() * 6), [s, s * 1.6, s], rgba(Math.random() < 0.5 ? 0xff7a20 : 0xffb040, 150));
+      // tongues of flame at fixed spots on the body (the shader makes them flicker)
+      const id = car.px * 0.37 + car.pz * 0.11;
+      const fade = burning ? Math.min(1, (40 - (this.time - car.deadAt)) / 8) : 1;
+      for (let i = 0; i < (burning ? 6 : 2); i++) {
+        const h1 = Math.abs(Math.sin(id + i * 12.9898) * 43758.5453) % 1, h2 = Math.abs(Math.sin(id + i * 78.233) * 12543.123) % 1;
+        const s = (burning ? 0.75 + 0.5 * h1 : 0.32 + 0.14 * h1) * (0.6 + 0.4 * fade);
+        const along = burning ? (h1 - 0.5) * dim.hl * 1.4 : (h1 - 0.5) * 0.5, across = (h2 - 0.5) * (burning ? dim.hw * 1.5 : 0.7);
+        const at: V3 = [p[0] + sn * along + cs * across, (burning ? y + dim.h * (0.25 + 0.5 * h2) : p[1]) + s * 1.2, p[2] + cs * along - sn * across];
+        this.puffs.push(at, s, rgba(0xffffff, Math.round(255 * fade)), 0, (id + i * 3.1) % 10, PUFF_FLAME);
       }
+      // the light of the fire on what is around it
+      this.glow.push([p[0], y + 0.3, p[2]], qIdent(), [0.05, 0.05, 0.05], rgba(0xff8030, 60));
     }
   }
 

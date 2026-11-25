@@ -22,6 +22,11 @@ pub const BK_CONTAINER: u8 = 4;
 pub const BK_CONCRETE: u8 = 5;
 /// A parked car (drawn from a model by the client; two collision boxes).
 pub const BK_CAR: u8 = 6;
+/// Decoration only (`World::deco`): painted trim and metalwork.
+pub const BK_TRIM: u8 = 7;
+pub const BK_METAL: u8 = 8;
+/// Storey height: walls plus the slab above them.
+pub const STOREY: f32 = WALL_H + 0.3;
 /// Car half width, half length and height (m).
 pub const CAR_HW: f32 = 0.9;
 pub const CAR_HL: f32 = 2.45;
@@ -65,6 +70,8 @@ pub struct Building {
     pub door_out: (f32, f32),
     pub door_in: (f32, f32),
     pub town: u8,
+    /// Storeys (1 = a bungalow or warehouse).
+    pub floors: u8,
 }
 
 impl Building {
@@ -124,6 +131,8 @@ pub struct World {
     pub rocks: Vec<Rock>,
     pub spots: Vec<Spot>,
     /// Parked cars: x, y (ground), z, yaw (a multiple of a quarter turn).
+    /// Drawn but not solid: window and door frames, sills, pipes, bands.
+    pub deco: Vec<Bx>,
     pub cars: Vec<[f32; 4]>,
     /// Vehicle kind of each car (never changes during a match).
     pub car_kind: Vec<u8>,
@@ -188,6 +197,7 @@ impl World {
             spots: Vec::new(),
             gbox: Vec::new(),
             gcyl: Vec::new(),
+            deco: Vec::new(),
             cars: Vec::new(),
             car_kind: Vec::new(),
             checksum: 0,
@@ -335,7 +345,17 @@ impl World {
                     0
                 };
                 let tier = t.kind;
-                w.try_building(x0, z0, x0 + bw, z0 + bd, side, if big { 1 } else { 0 }, ti as u8, tier, &mut rng);
+                // residential towns: some two-storey houses and a few apartment blocks
+                let mut frng = Rng::new((seed as u64) << 20 ^ ((lx as u64) << 10) ^ lz as u64 ^ 0xF100);
+                if !big && t.kind == 0 && frng.chance(0.2) {
+                    let (aw, ad) = if bw > bd { (frng.range(17.0, 21.0), frng.range(9.0, 10.5)) } else { (frng.range(9.0, 10.5), frng.range(17.0, 21.0)) };
+                    let floors = 3 + frng.below(2) as u8;
+                    if w.try_building(lx - aw * 0.5, lz - ad * 0.5, lx + aw * 0.5, lz + ad * 0.5, side, 3, ti as u8, tier, floors, &mut rng) {
+                        continue;
+                    }
+                }
+                let floors = if !big && frng.chance(if t.kind == 0 { 0.5 } else { 0.25 }) { 2 } else { 1 };
+                w.try_building(x0, z0, x0 + bw, z0 + bd, side, if big { 1 } else { 0 }, ti as u8, tier, floors, &mut rng);
             }
             // crates around town
             let ncr = 6 + rng.below(6);
@@ -432,7 +452,7 @@ impl World {
             let bw = rng.range(6.0, 7.5);
             let bd = rng.range(5.5, 7.0);
             let side = rng.below(4) as u8;
-            w.try_building(x - bw * 0.5, z - bd * 0.5, x + bw * 0.5, z + bd * 0.5, side, 2, 255, 0, &mut rng);
+            w.try_building(x - bw * 0.5, z - bd * 0.5, x + bw * 0.5, z + bd * 0.5, side, 2, 255, 0, 1, &mut rng);
         }
 
         // ---- trees
@@ -604,7 +624,9 @@ impl World {
 
     /// kind: 0 house, 1 warehouse, 2 hut. side: door side 0=-z 1=+x 2=+z 3=-x
     #[allow(clippy::too_many_arguments)]
-    fn try_building(&mut self, x0: f32, z0: f32, x1: f32, z1: f32, side: u8, kind: u8, town: u8, tier: u8, rng: &mut Rng) -> bool {
+    /// kind: 0 house, 1 warehouse, 2 cabin, 3 apartment block.
+    #[allow(clippy::too_many_arguments)]
+    fn try_building(&mut self, x0: f32, z0: f32, x1: f32, z1: f32, side: u8, kind: u8, town: u8, tier: u8, floors: u8, rng: &mut Rng) -> bool {
         if x0 < 20.0 || z0 < 20.0 || x1 > MAP - 20.0 || z1 > MAP - 20.0 {
             return false;
         }
@@ -621,10 +643,15 @@ impl World {
         }
         let y = hi + 0.12;
         let t = 0.3;
-        let wall_col = if kind == 1 { 0x8D949C } else if kind == 2 { 0x8B6A4A } else { WALL_COLS[rng.below(WALL_COLS.len() as u32) as usize] };
-        let roof_col = if kind == 1 { 0x5E646C } else if kind == 2 { 0x4E3B2C } else { ROOF_COLS[rng.below(ROOF_COLS.len() as u32) as usize] };
-        let floor_col = if kind == 1 { 0x7D7B76 } else { 0x9B7B58 };
+        let apt = kind == 3;
+        let wall_col = if kind == 1 { 0x8D949C } else if kind == 2 { 0x8B6A4A } else if apt { [0xD9D4C8, 0xC9CED2, 0xD8C9B4, 0xBFC6BE][rng.below(4) as usize] } else { WALL_COLS[rng.below(WALL_COLS.len() as u32) as usize] };
+        let roof_col = if kind == 1 { 0x5E646C } else if kind == 2 { 0x4E3B2C } else if apt { 0x6A6D70 } else { ROOF_COLS[rng.below(ROOF_COLS.len() as u32) as usize] };
+        let floor_col = if kind == 1 || apt { 0x7D7B76 } else { 0x9B7B58 };
         let hgt = if kind == 1 { 4.4 } else { WALL_H };
+        // the stairs need room: a long side of 7.6 m or more
+        let floors = if (x1 - x0).max(z1 - z0) < 7.6 || kind == 1 || kind == 2 { 1 } else { floors.clamp(1, 4) };
+        let wall_kind = if apt { BK_CONCRETE } else { BK_WALL };
+        let trim_col = if apt { 0x3E4348 } else { 0xECE9E2 };
 
         let first_box = self.boxes.len();
         // floor slab
@@ -666,7 +693,10 @@ impl World {
                 }
                 opens.push((c - 0.65, c + 0.65, 1.0, 2.1));
             }
-            self.wall(along_x, a0, a1, p0, p1, y, hgt, &mut opens, wall_col);
+            self.wall(along_x, a0, a1, p0, p1, y, hgt, &mut opens, wall_col, wall_kind);
+            for &(s0, s1, bot, top) in opens.iter() {
+                self.frame(along_x, s0, s1, y + bot, y + top, p0, p1, bot <= 0.0, trim_col);
+            }
         }
         // door step when the floor sits noticeably above the terrain
         let dy = y - self.height(door.0, door.1);
@@ -680,8 +710,132 @@ impl World {
             };
             self.boxes.push(Bx { min: V3::new(sx0, lo - 0.6, sz0), max: V3::new(sx1, st, sz1), kind: BK_FLOOR, col: 0x8A8178 });
         }
-        // roof
-        self.boxes.push(Bx { min: V3::new(x0 - 0.3, y + hgt, z0 - 0.3), max: V3::new(x1 + 0.3, y + hgt + 0.3, z1 + 0.3), kind: BK_ROOF, col: roof_col });
+        // ---- upper storeys: a dog-leg staircase, a slab with the stairwell cut out, walls
+        let along = x1 - x0 >= z1 - z0; // the stairs run along x
+        let (a_lo, _a_hi, p_lo, p_hi) = if along { (x0 + t, x1 - t, z0 + t, z1 - t) } else { (z0 + t, z1 - t, x0 + t, x1 - t) };
+        const STEPS: usize = 14;
+        let (run, sw) = (0.3f32, 1.15f32);
+        let rl = run * STEPS as f32;
+        // against the side wall away from the door
+        let far_side = if along { side == 0 } else { side == 3 };
+        let a_s = a_lo + 1.35;
+        let lane = |k: usize| if far_side { (p_hi - sw * (k + 1) as f32, p_hi - sw * k as f32) } else { (p_lo + sw * k as f32, p_lo + sw * (k + 1) as f32) };
+        let rect = |a0: f32, a1: f32, q0: f32, q1: f32, ylo: f32, yhi: f32| {
+            if along { (V3::new(a0, ylo, q0), V3::new(a1, yhi, q1)) } else { (V3::new(q0, ylo, a0), V3::new(q1, yhi, a1)) }
+        };
+        for f in 1..floors as usize {
+            let yf = y + STOREY * f as f32;
+            let below = yf - STOREY;
+            // the flight up to this floor: lanes alternate and so does the direction
+            let (l0, l1) = lane((f - 1) % 2);
+            let up = (f - 1) % 2 == 0;
+            for k in 0..STEPS {
+                let (s0, s1) = if up { (a_s + run * k as f32, a_s + run * (k + 1) as f32) } else { (a_s + rl - run * (k + 1) as f32, a_s + rl - run * k as f32) };
+                let top = below + STOREY * (k + 1) as f32 / STEPS as f32;
+                let (mn, mx) = rect(s0, s1, l0, l1, below, top);
+                self.boxes.push(Bx { min: mn, max: mx, kind: BK_FLOOR, col: 0x8A8178 });
+            }
+            // slab around the stairwell
+            let (h0, h1) = (a_s, a_s + rl);
+            let (xa, xb, za, zb) = if along { (x0, x1, z0, z1) } else { (z0, z1, x0, x1) };
+            for (a0, a1, q0, q1) in [(xa, h0, za, zb), (h1, xb, za, zb), (h0, h1, za, l0), (h0, h1, l1, zb)] {
+                if a1 - a0 > 0.01 && q1 - q0 > 0.01 {
+                    let (mn, mx) = rect(a0, a1, q0, q1, yf - 0.3, yf);
+                    self.boxes.push(Bx { min: mn, max: mx, kind: BK_FLOOR, col: floor_col });
+                }
+            }
+            // walls of this storey; an apartment block opens onto balconies at the front
+            for s in 0..4u8 {
+                let along_x = s == 0 || s == 2;
+                let (a0, a1, p0, p1) = match s {
+                    0 => (x0, x1, z0, z0 + t),
+                    2 => (x0, x1, z1 - t, z1),
+                    1 => (z0 + t, z1 - t, x1 - t, x1),
+                    _ => (z0 + t, z1 - t, x0, x0 + t),
+                };
+                let len = a1 - a0;
+                let mut opens: Vec<(f32, f32, f32, f32)> = Vec::new();
+                let n = ((len - 1.5) / if apt { 3.2 } else { 4.0 }).floor().max(1.0) as usize;
+                for k in 0..n {
+                    let c = a0 + len * (k as f32 + 0.5) / n as f32;
+                    if apt && s == side && k % 2 == 0 {
+                        opens.push((c - 0.5, c + 0.5, 0.0, 2.15));
+                    } else {
+                        opens.push((c - 0.7, c + 0.7, 0.95, 2.15));
+                    }
+                }
+                self.wall(along_x, a0, a1, p0, p1, yf, hgt, &mut opens, wall_col, wall_kind);
+                for &(s0, s1, bot, top) in opens.iter() {
+                    self.frame(along_x, s0, s1, yf + bot, yf + top, p0, p1, bot <= 0.0, trim_col);
+                }
+            }
+            if apt {
+                // balcony along the front: slab, solid guard and end walls
+                let (bw, g) = (1.35f32, 0.14f32);
+                let (mn, mx) = match side {
+                    0 => (V3::new(x0, yf - 0.25, z0 - bw), V3::new(x1, yf, z0)),
+                    2 => (V3::new(x0, yf - 0.25, z1), V3::new(x1, yf, z1 + bw)),
+                    1 => (V3::new(x1, yf - 0.25, z0), V3::new(x1 + bw, yf, z1)),
+                    _ => (V3::new(x0 - bw, yf - 0.25, z0), V3::new(x0, yf, z1)),
+                };
+                self.boxes.push(Bx { min: mn, max: mx, kind: BK_CONCRETE, col: 0xB9B7B0 });
+                let (gl, gh) = (yf, yf + 1.05);
+                let guards = match side {
+                    0 => [(mn.x, mn.z, mx.x, mn.z + g), (mn.x, mn.z, mn.x + g, mx.z), (mx.x - g, mn.z, mx.x, mx.z)],
+                    2 => [(mn.x, mx.z - g, mx.x, mx.z), (mn.x, mn.z, mn.x + g, mx.z), (mx.x - g, mn.z, mx.x, mx.z)],
+                    1 => [(mx.x - g, mn.z, mx.x, mx.z), (mn.x, mn.z, mx.x, mn.z + g), (mn.x, mx.z - g, mx.x, mx.z)],
+                    _ => [(mn.x, mn.z, mn.x + g, mx.z), (mn.x, mn.z, mx.x, mn.z + g), (mn.x, mx.z - g, mx.x, mx.z)],
+                };
+                for (gx0, gz0, gx1, gz1) in guards {
+                    self.boxes.push(Bx { min: V3::new(gx0, gl, gz0), max: V3::new(gx1, gh, gz1), kind: BK_CONCRETE, col: wall_col });
+                }
+                // an air-conditioner on every other balcony bay
+                let (cx, cz) = ((mn.x + mx.x) * 0.5, (mn.z + mx.z) * 0.5);
+                let half = if side == 0 || side == 2 { (x1 - x0) * 0.5 } else { (z1 - z0) * 0.5 };
+                for k in 0..3 {
+                    let o = (k as f32 - 1.0) * (half - 1.1);
+                    let (ax, az) = if side == 0 || side == 2 { (cx + o, cz) } else { (cx, cz + o) };
+                    self.deco.push(Bx { min: V3::new(ax - 0.4, yf, az - 0.4), max: V3::new(ax + 0.4, yf + 0.6, az + 0.4), kind: BK_METAL, col: 0xD4D6D2 });
+                }
+            }
+        }
+        let top = y + STOREY * (floors as f32 - 1.0) + hgt;
+        // ---- outside trim: plinth, a band at every floor line, downpipes, a canopy over the door
+        {
+            let e = 0.06;
+            let band = if apt { 0x9FA29F } else { 0xD8D4CA };
+            self.deco.push(Bx { min: V3::new(x0 - e, y - 0.3, z0 - e), max: V3::new(x1 + e, y + 0.35, z1 + e), kind: BK_CONCRETE, col: 0x8C8A84 });
+            for f in 1..floors as usize {
+                let yf = y + STOREY * f as f32;
+                self.deco.push(Bx { min: V3::new(x0 - e, yf - 0.32, z0 - e), max: V3::new(x1 + e, yf - 0.1, z1 + e), kind: BK_CONCRETE, col: band });
+            }
+            if floors > 1 || apt {
+                for (px, pz) in [(x0 - 0.1, z0 - 0.1), (x1 + 0.1, z1 + 0.1)] {
+                    self.deco.push(Bx { min: V3::new(px - 0.05, y, pz - 0.05), max: V3::new(px + 0.05, top, pz + 0.05), kind: BK_METAL, col: 0x5A5E63 });
+                }
+            }
+            let (cx, cz) = (door.0, door.1);
+            let (mn, mx) = match side {
+                0 => (V3::new(cx - 1.2, y + 2.45, z0 - 1.0), V3::new(cx + 1.2, y + 2.57, z0)),
+                2 => (V3::new(cx - 1.2, y + 2.45, z1), V3::new(cx + 1.2, y + 2.57, z1 + 1.0)),
+                1 => (V3::new(x1, y + 2.45, cz - 1.2), V3::new(x1 + 1.0, y + 2.57, cz + 1.2)),
+                _ => (V3::new(x0 - 1.0, y + 2.45, cz - 1.2), V3::new(x0, y + 2.57, cz + 1.2)),
+            };
+            if kind != 1 && kind != 2 {
+                self.deco.push(Bx { min: mn, max: mx, kind: BK_CONCRETE, col: band });
+            }
+        }
+        // roof (an apartment block has a parapet and plant on it)
+        self.boxes.push(Bx { min: V3::new(x0 - 0.3, top, z0 - 0.3), max: V3::new(x1 + 0.3, top + 0.3, z1 + 0.3), kind: BK_ROOF, col: roof_col });
+        if apt {
+            let (rt, ph, pt) = (top + 0.3, 0.8f32, 0.2f32);
+            for (px0, pz0, px1, pz1) in [(x0 - 0.3, z0 - 0.3, x1 + 0.3, z0 - 0.3 + pt), (x0 - 0.3, z1 + 0.3 - pt, x1 + 0.3, z1 + 0.3), (x0 - 0.3, z0 - 0.3, x0 - 0.3 + pt, z1 + 0.3), (x1 + 0.3 - pt, z0 - 0.3, x1 + 0.3, z1 + 0.3)] {
+                self.boxes.push(Bx { min: V3::new(px0, rt, pz0), max: V3::new(px1, rt + ph, pz1), kind: BK_CONCRETE, col: wall_col });
+            }
+            let (cx, cz) = ((x0 + x1) * 0.5, (z0 + z1) * 0.5);
+            self.boxes.push(Bx { min: V3::new(cx - 1.4, rt, cz - 1.1), max: V3::new(cx + 1.4, rt + 1.9, cz + 1.1), kind: BK_CONCRETE, col: 0xA9A8A2 });
+            self.boxes.push(Bx { min: V3::new(cx + 3.0, rt, cz - 0.6), max: V3::new(cx + 4.2, rt + 1.1, cz + 0.6), kind: BK_CONTAINER, col: 0x8F979C });
+        }
 
         // interior: warehouse crates / divider
         let w_ = x1 - x0;
@@ -697,19 +851,19 @@ impl World {
                 let s = 1.3;
                 self.boxes.push(Bx { min: V3::new(cx - s * 0.5, y, cz - s * 0.5), max: V3::new(cx + s * 0.5, y + s, cz + s * 0.5), kind: BK_CRATE, col: 0x9C7A4B });
             }
-        } else if kind == 0 && w_.max(d_) > 9.0 {
+        } else if kind == 0 && floors == 1 && w_.max(d_) > 9.0 {
             // partial divider wall across the longer axis
             if w_ > d_ {
                 let xm = (x0 + x1) * 0.5;
                 if (door.2 - xm).abs() > 1.5 {
                     let mut opens = vec![(z0 + d_ * 0.5 - 0.6, z0 + d_ * 0.5 + 0.6, 0.0, 2.2)];
-                    self.wall(false, z0 + t, z1 - t, xm - 0.1, xm + 0.1, y, hgt, &mut opens, wall_col);
+                    self.wall(false, z0 + t, z1 - t, xm - 0.1, xm + 0.1, y, hgt, &mut opens, wall_col, wall_kind);
                 }
             } else {
                 let zm = (z0 + z1) * 0.5;
                 if (door.3 - zm).abs() > 1.5 {
                     let mut opens = vec![(x0 + w_ * 0.5 - 0.6, x0 + w_ * 0.5 + 0.6, 0.0, 2.2)];
-                    self.wall(true, x0 + t, x1 - t, zm - 0.1, zm + 0.1, y, hgt, &mut opens, wall_col);
+                    self.wall(true, x0 + t, x1 - t, zm - 0.1, zm + 0.1, y, hgt, &mut opens, wall_col, wall_kind);
                 }
             }
         }
@@ -717,25 +871,57 @@ impl World {
         // loot spots (never inside crates / interior walls of this building)
         let area = w_ * d_;
         let n = clampf(area / 22.0, 2.0, 8.0) as u32;
-        let mut placed = 0;
-        let mut tries = 0;
-        while placed < n && tries < n * 6 {
-            tries += 1;
-            let px = rng.range(x0 + 0.9, x1 - 0.9);
-            let pz = rng.range(z0 + 0.9, z1 - 0.9);
-            if self.spot_blocked(px, y + 0.3, pz, first_box) {
-                continue;
+        for f in 0..floors as usize {
+            // upstairs the loot is a little better and there is less of it
+            let fy = y + STOREY * f as f32;
+            let want = if f == 0 { n } else { (n * 2 / 3).max(2) };
+            let ftier = if f > 0 { (tier + 1).min(2) } else { tier };
+            let mut placed = 0;
+            let mut tries = 0;
+            while placed < want && tries < want * 8 {
+                tries += 1;
+                let px = rng.range(x0 + 0.9, x1 - 0.9);
+                let pz = rng.range(z0 + 0.9, z1 - 0.9);
+                if self.spot_blocked(px, fy + 0.3, pz, first_box) {
+                    continue;
+                }
+                // not in the stairwell: there must be floor right here
+                if f > 0 && !self.boxes[first_box..].iter().any(|b| b.kind == BK_FLOOR && (b.max.y - fy).abs() < 0.01 && px > b.min.x + 0.3 && px < b.max.x - 0.3 && pz > b.min.z + 0.3 && pz < b.max.z - 0.3 && b.max.y - b.min.y < 0.35) {
+                    continue;
+                }
+                self.spots.push(Spot { pos: V3::new(px, fy + 0.05, pz), tier: ftier });
+                placed += 1;
             }
-            self.spots.push(Spot { pos: V3::new(px, y + 0.05, pz), tier });
-            placed += 1;
         }
 
-        self.buildings.push(Building { x0, z0, x1, z1, y, door_out: (door.0, door.1), door_in: (door.2, door.3), town });
+        self.buildings.push(Building { x0, z0, x1, z1, y, door_out: (door.0, door.1), door_in: (door.2, door.3), town, floors });
         true
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn wall(&mut self, along_x: bool, a0: f32, a1: f32, p0: f32, p1: f32, y: f32, hgt: f32, opens: &mut [(f32, f32, f32, f32)], col: u32) {
+    /// Frame of a window or door opening: jambs, head, and for a window a
+    /// sill and glazing bars. Decoration only.
+    #[allow(clippy::too_many_arguments)]
+    fn frame(&mut self, along_x: bool, s0: f32, s1: f32, ylo: f32, yhi: f32, p0: f32, p1: f32, door: bool, col: u32) {
+        let mut bar = |a0: f32, a1: f32, y0: f32, y1: f32, q0: f32, q1: f32, kind: u8, col: u32| {
+            let (mn, mx) = if along_x { (V3::new(a0, y0, q0), V3::new(a1, y1, q1)) } else { (V3::new(q0, y0, a0), V3::new(q1, y1, a1)) };
+            self.deco.push(Bx { min: mn, max: mx, kind, col });
+        };
+        let (w, o) = (0.07, 0.035);
+        bar(s0 - w, s0, ylo, yhi + w, p0 - o, p1 + o, BK_TRIM, col);
+        bar(s1, s1 + w, ylo, yhi + w, p0 - o, p1 + o, BK_TRIM, col);
+        bar(s0 - w, s1 + w, yhi, yhi + w, p0 - o, p1 + o, BK_TRIM, col);
+        if !door {
+            bar(s0 - w - 0.04, s1 + w + 0.04, ylo - 0.06, ylo, p0 - 0.12, p1 + 0.12, BK_CONCRETE, 0xCFCBC2);
+            let pm = (p0 + p1) * 0.5;
+            let (sm, ym) = ((s0 + s1) * 0.5, (ylo + yhi) * 0.5);
+            bar(sm - 0.02, sm + 0.02, ylo, yhi, pm - 0.025, pm + 0.025, BK_TRIM, col);
+            bar(s0, s1, ym - 0.02, ym + 0.02, pm - 0.025, pm + 0.025, BK_TRIM, col);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wall(&mut self, along_x: bool, a0: f32, a1: f32, p0: f32, p1: f32, y: f32, hgt: f32, opens: &mut [(f32, f32, f32, f32)], col: u32, kind: u8) {
         opens.sort_by(|a, b| a.0.total_cmp(&b.0));
         let push = |boxes: &mut Vec<Bx>, s0: f32, s1: f32, ylo: f32, yhi: f32| {
             if s1 - s0 < 0.02 || yhi - ylo < 0.02 {
@@ -746,7 +932,7 @@ impl World {
             } else {
                 (V3::new(p0, ylo, s0), V3::new(p1, yhi, s1))
             };
-            boxes.push(Bx { min: mn, max: mx, kind: BK_WALL, col });
+            boxes.push(Bx { min: mn, max: mx, kind, col });
         };
         let mut cur = a0;
         for &(s, e, bot, top) in opens.iter() {
