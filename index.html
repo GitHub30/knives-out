@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss://zonefall-server.6u.workers.dev ws://localhost:* ws://127.0.0.1:*; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'" />
     <meta name="theme-color" content="#0d1620" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="ZONEFALL" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -20,6 +23,7 @@
           <div class="menu-card">
             <h1 class="logo">ZONE<span>FALL</span></h1>
             <p class="tagline">降下・略奪・生存。最後の一人を目指すバトルロイヤル</p>
+            <p id="ios-hint" class="tagline" hidden>iPhone / iPad: 共有ボタン →「ホーム画面に追加」から起動すると、フルスクリーンで遊べます</p>
             <label class="field">
               <span>プレイヤー名</span>
               <input id="name" maxlength="14" autocomplete="off" spellcheck="false" placeholder="名前を入力" />

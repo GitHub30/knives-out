@@ -41,6 +41,7 @@ struct ClientState {
     ray_kind: u32,
     grass: Vec<u8>,
     trees: Vec<f32>,
+    props: Vec<f32>,
 }
 
 #[inline]
@@ -202,9 +203,14 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
     for t in &world.trees {
         trees.extend_from_slice(&[t.x, t.y, t.z, t.h, t.r, t.kind as f32, (t.seed & 0xFFFF) as f32, 0.0]);
     }
+    let mut props = Vec::with_capacity(world.props.len() * 8);
+    for &i in &world.props {
+        let b = world.boxes[i as usize];
+        props.extend_from_slice(&[b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z, (b.kind == world::BK_CRATE) as u8 as f32, b.col as f32]);
+    }
     let checksum = world.checksum;
     unsafe {
-        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass, trees }));
+        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass, trees, props }));
     }
     checksum
 }
@@ -212,6 +218,7 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
 /// kind: 0 terrain verts(u32) 1 terrain indices(u32) 2 terrain chunks(f32)
 ///       3 prop verts(u32) 4 prop chunks(f32) 5 minimap rgba(u8) 6 weapon defs(f32) 7 towns(f32) 8 cars(f32 x4: x y z yaw) 9 car kinds(u8: 0 police car, 1 fire truck)
 ///       10 window panes(f32 x6: min xyz, max xyz) 11 grass mask(u8, 1024 x 1024, one per m2)
+///       13 loose props(f32 x8: min xyz, max xyz, crate?, colour)
 ///       12 trees(f32 x8: x y z height radius kind(0 conifer) seed -)
 #[no_mangle]
 pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
@@ -230,6 +237,7 @@ pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
         10 => c.world.glass.as_ptr() as *const u8,
         11 => c.grass.as_ptr(),
         12 => c.trees.as_ptr() as *const u8,
+        13 => c.props.as_ptr() as *const u8,
         _ => std::ptr::null(),
     }
 }
@@ -252,6 +260,7 @@ pub extern "C" fn cli_mesh_len(kind: u32) -> u32 {
         10 => c.world.glass.len() * 24,
         11 => c.grass.len(),
         12 => c.trees.len() * 4,
+        13 => c.props.len() * 4,
         _ => 0,
     }) as u32
 }
@@ -311,6 +320,17 @@ pub extern "C" fn cli_set_car(k: u32, x: f32, y: f32, z: f32, yaw: f32) {
     if let Some(car) = c.world.cars.get_mut(k as usize) {
         if x.is_finite() && y.is_finite() && z.is_finite() && yaw.is_finite() {
             *car = [x, y, z, yaw];
+        }
+    }
+}
+
+/// Where loose prop `k` is now (the middle of its underside).
+#[no_mangle]
+pub extern "C" fn cli_set_prop(k: u32, x: f32, y: f32, z: f32) {
+    let Some(c) = client() else { return };
+    if let Some(&i) = c.world.props.get(k as usize) {
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            c.world.move_box(i as usize, V3::new(x, y, z));
         }
     }
 }

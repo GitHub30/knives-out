@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 12;
+pub const PROTO: u16 = 13;
 /// A car catches fire below this share of its bodywork, and then explodes
 /// after the fuse (5 s) whatever happens.
 pub const CAR_FIRE_AT: f32 = 0.19;
@@ -413,6 +413,20 @@ struct EvRec {
     dir: V3,
 }
 
+/// A loose crate or container: an axis-aligned box that can be knocked about.
+#[derive(Clone, Copy, Debug)]
+pub struct Prop {
+    /// Its collision box in the world.
+    pub bx: usize,
+    pub crate_: bool,
+    /// Middle of the underside.
+    pub pos: V3,
+    pub vel: V3,
+    pub moving: bool,
+    moved: u32,
+    home: V3,
+}
+
 pub struct Match {
     pub w: World,
     pub rng: Rng,
@@ -463,6 +477,7 @@ pub struct Match {
     car_hit_by: Vec<u8>,
     /// Tick each car caught fire (0 = not burning): it blows up a few seconds later.
     pub car_fire: Vec<u32>,
+    pub props: Vec<Prop>,
     car0: Vec<[f32; 4]>,
 }
 
@@ -526,9 +541,15 @@ impl Match {
             car_hp: Vec::new(),
             car_hit_by: vec![255; ncar],
             car_fire: vec![0; ncar],
+            props: Vec::new(),
             car0,
         };
         m.car_hp = (0..ncar).map(|k| m.car_max_hp(k)).collect();
+        m.props = m.w.props.iter().map(|&i| {
+            let b = m.w.boxes[i as usize];
+            let pos = V3::new((b.min.x + b.max.x) * 0.5, b.min.y, (b.min.z + b.max.z) * 0.5);
+            Prop { bx: i as usize, crate_: b.kind == BK_CRATE, pos, vel: V3::ZERO, moving: false, moved: 0, home: pos }
+        }).collect();
         m.spawn_loot();
         m.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, nx: MAP * 0.5, nz: MAP * 0.5, nr: 780.0, timer: ZONES[0].wait, ..Default::default() };
         m
@@ -832,6 +853,14 @@ impl Match {
             exit = half + 100.0;
         }
         self.plane = Plane { sx, sz, dx, dz, t: (enter - 260.0).max(0.0), enter_t: enter, exit_t: exit, active: true };
+        for k in 0..self.props.len() {
+            let home = self.props[k].home;
+            self.props[k].pos = home;
+            self.props[k].vel = V3::ZERO;
+            self.props[k].moving = false;
+            self.props[k].moved = self.tick;
+            self.w.move_box(self.props[k].bx, home);
+        }
         self.w.cars = self.car0.clone();
         for k in 0..self.car_driver.len() {
             self.car_driver[k] = 255;
@@ -1013,6 +1042,25 @@ impl Match {
         if use_ && self.enter_car(i) {
             return;
         }
+        // leaning on a crate slides it along
+        if c.mx != 0.0 || c.mz != 0.0 {
+            let ms = self.players[i].ms;
+            let wish = (right(c.yaw) * c.mx + fwd(c.yaw) * c.mz).norm();
+            for j in 0..self.props.len() {
+                let pr = self.props[j];
+                if !pr.crate_ || pr.moving {
+                    continue;
+                }
+                let b = self.w.boxes[pr.bx];
+                if (b.min.x - ms.pos.x).abs() > 4.0 || (b.min.z - ms.pos.z).abs() > 4.0 || b.max.y <= ms.pos.y + STEP || b.min.y >= ms.pos.y + 1.5 {
+                    continue;
+                }
+                let (dx, dz) = (clampf(ms.pos.x, b.min.x, b.max.x) - ms.pos.x, clampf(ms.pos.z, b.min.z, b.max.z) - ms.pos.z);
+                if dx * dx + dz * dz < (P_RADIUS + 0.1) * (P_RADIUS + 0.1) && dx * wish.x + dz * wish.z > 0.02 {
+                    self.kick_prop(j, wish * 2.6);
+                }
+            }
+        }
         if pick && self.players[i].pick_cd <= 0.0 {
             self.manual_pickup(i);
         }
@@ -1115,6 +1163,143 @@ impl Match {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Loose props
+    // ------------------------------------------------------------------
+    /// Set a prop moving. Whatever stood on it falls.
+    pub fn kick_prop(&mut self, k: usize, vel: V3) {
+        let p = self.props[k];
+        self.props[k].vel = if p.moving { p.vel + vel * 0.5 } else { vel };
+        self.props[k].moving = true;
+        self.props[k].moved = self.tick;
+        let b = self.w.boxes[p.bx];
+        for j in 0..self.props.len() {
+            let q = self.props[j];
+            let o = self.w.boxes[q.bx];
+            if j != k && !q.moving && (o.min.y - b.max.y).abs() < 0.05 && o.min.x < b.max.x && o.max.x > b.min.x && o.min.z < b.max.z && o.max.z > b.min.z {
+                self.props[j].moving = true;
+                self.props[j].moved = self.tick;
+            }
+        }
+    }
+
+    /// Props near `pos` thrown outwards by a blast.
+    fn blast_props(&mut self, pos: V3, radius: f32) {
+        for k in 0..self.props.len() {
+            let p = self.props[k];
+            let b = self.w.boxes[p.bx];
+            let c = (b.min + b.max) * 0.5;
+            let d = (c - pos).len();
+            if d >= radius {
+                continue;
+            }
+            let f = 1.0 - d / radius;
+            let dir = V3::new(c.x - pos.x, 0.0, c.z - pos.z).norm();
+            let v = if p.crate_ { dir * (16.0 * f + 2.0) + V3::new(0.0, 4.0 + 9.0 * f, 0.0) } else { dir * (4.5 * f) + V3::new(0.0, 2.5 * f, 0.0) };
+            self.kick_prop(k, v);
+        }
+    }
+
+    /// Moving props fly, bounce, slide and come to rest.
+    fn update_props(&mut self) {
+        let tick = self.tick;
+        for k in 0..self.props.len() {
+            if !self.props[k].moving {
+                continue;
+            }
+            let mut p = self.props[k];
+            let b = self.w.boxes[p.bx];
+            let (hx, hz, hy) = ((b.max.x - b.min.x) * 0.5, (b.max.z - b.min.z) * 0.5, b.max.y - b.min.y);
+            let r = hx.min(hz);
+            // out of the grid while it moves, so it does not collide with itself
+            self.w.unlink_box(p.bx);
+            p.vel.y -= 20.0 * DT;
+            let mut np = p.pos + p.vel * DT;
+            let mut q = V3::new(np.x, np.y + 0.05, np.z);
+            if self.w.collide_body(&mut q, r, hy) | self.w.push_cars(&mut q, r, usize::MAX) {
+                // off a wall, a car or another prop: most of the speed is lost
+                let (dx, dz) = (q.x - np.x, q.z - np.z);
+                let l = (dx * dx + dz * dz).sqrt().max(1e-4);
+                let into = (p.vel.x * dx + p.vel.z * dz) / l;
+                if into < 0.0 {
+                    p.vel.x -= dx / l * into * 1.3;
+                    p.vel.z -= dz / l * into * 1.3;
+                }
+                p.vel.x *= 0.8;
+                p.vel.z *= 0.8;
+                np.x = q.x;
+                np.z = q.z;
+            }
+            let g = self.w.ground_below(np.x, np.z, np.y.max(p.pos.y), r);
+            let mut grounded = false;
+            if np.y <= g {
+                np.y = g;
+                grounded = true;
+                if p.vel.y < -4.0 {
+                    p.vel.y *= -0.32;
+                } else {
+                    p.vel.y = 0.0;
+                }
+                let fr = if p.crate_ { 5.0 } else { 11.0 };
+                let k2 = (1.0 - fr * DT).max(0.0);
+                p.vel.x *= k2;
+                p.vel.z *= k2;
+            }
+            np.x = clampf(np.x, 4.0, MAP - 4.0);
+            np.z = clampf(np.z, 4.0, MAP - 4.0);
+            if !np.finite() || !p.vel.finite() {
+                np = p.home;
+                p.vel = V3::ZERO;
+            }
+            p.pos = np;
+            if grounded && p.vel.len() < 0.35 {
+                p.vel = V3::ZERO;
+                p.moving = false;
+            }
+            p.moved = tick;
+            self.props[k] = p;
+            // (move_box unlinks first: harmless for a box already out of the grid)
+            self.w.move_box(p.bx, np);
+        }
+    }
+
+    /// A car knocks crates flying and shoves containers.
+    fn car_hits_props(&mut self, k: usize, v0: f32) {
+        if v0 < 1.5 {
+            return;
+        }
+        let c = self.w.cars[k];
+        let f = fwd(c[3]);
+        let (circles, cr, _) = car_shape(self.w.car_kind[k]);
+        let dir = if self.players[self.car_driver[k] as usize % MAX_PLAYERS].ms.vel.dot(f) >= 0.0 { f } else { f * -1.0 };
+        for j in 0..self.props.len() {
+            let p = self.props[j];
+            let b = self.w.boxes[p.bx];
+            if (b.min.x - c[0]).abs() > 9.0 || (b.min.z - c[2]).abs() > 9.0 || b.min.y > c[1] + 1.6 || b.max.y < c[1] {
+                continue;
+            }
+            let reach = cr + if p.crate_ { 0.1 } else { 0.3 };
+            let touch = circles.iter().any(|&off| {
+                let (x, z) = (c[0] + f.x * off, c[2] + f.z * off);
+                let (dx, dz) = (x - clampf(x, b.min.x, b.max.x), z - clampf(z, b.min.z, b.max.z));
+                dx * dx + dz * dz < reach * reach
+            });
+            if !touch {
+                continue;
+            }
+            let away = V3::new((b.min.x + b.max.x) * 0.5 - c[0], 0.0, (b.min.z + b.max.z) * 0.5 - c[2]).norm();
+            if p.crate_ {
+                if p.moving && p.vel.len() > v0 * 0.6 {
+                    continue; // already on its way
+                }
+                let jitter = self.rng.range(-0.25, 0.25);
+                self.kick_prop(j, (dir * 0.75 + away * 0.45 + right(c[3]) * jitter) * (v0 * 1.25 + 2.0) + V3::new(0.0, 3.5 + v0 * 0.42, 0.0));
+            } else if !p.moving && away.dot(dir) > 0.2 {
+                self.kick_prop(j, dir * (v0 * 0.45).min(5.5));
+            }
+        }
+    }
+
     /// Burning cars blow up when their fuse runs out.
     fn update_car_fires(&mut self) {
         for k in 0..self.car_fire.len() {
@@ -1167,6 +1352,7 @@ impl Match {
                 self.damage(j, who, dmg, false, WK_BOOM, pos);
             }
         }
+        self.blast_props(pos, radius + 1.5);
         for o in 0..self.w.cars.len() {
             let oc = self.w.cars[o];
             let d = dist_xz(oc[0], oc[2], c[0], c[2]);
@@ -1244,6 +1430,7 @@ impl Match {
             self.car_moved[k] = tick;
         }
         let v = car_speed(&ms);
+        self.car_hits_props(k, v0.max(v.abs()));
         // a crash: the speed lost in one step dents the car
         let lost = v0 - v.abs();
         if lost > 5.0 {
@@ -1685,6 +1872,7 @@ impl Match {
                 self.damage(j, n.owner, dmg, false, 200, n.pos);
             }
         }
+        self.blast_props(n.pos, radius);
         for k in 0..self.w.cars.len() {
             let c = self.w.cars[k];
             let d = (V3::new(c[0], c[1] + 0.7, c[2]) - n.pos).len();
@@ -2374,6 +2562,7 @@ impl Match {
                 self.auto_pickups();
                 self.update_nades();
                 self.update_car_fires();
+                self.update_props();
                 self.update_zone();
                 self.zone_damage();
                 self.record_hist();
@@ -2723,6 +2912,28 @@ impl Match {
             ccount += 1;
         }
         self.out[cpos] = ccount;
+        let mut w = Wr::new(&mut self.out);
+        // ---- loose props: the ones that moved lately, the rest a few at a time
+        let ppos = w.len();
+        w.u8(0);
+        let mut pcount = 0u8;
+        for k in 0..self.props.len() {
+            let pr = self.props[k];
+            let fresh = pr.moving || tick.wrapping_sub(pr.moved) < 45;
+            if !(fresh || (k + round) % 32 == 0) || pcount == 255 {
+                continue;
+            }
+            if dist_xz(pr.pos.x, pr.pos.z, center.x, center.z) > INTEREST {
+                continue;
+            }
+            w.u16(k as u16);
+            w.f32(pr.pos.x);
+            w.f32(pr.pos.y);
+            w.f32(pr.pos.z);
+            w.u8(pr.moving as u8);
+            pcount += 1;
+        }
+        self.out[ppos] = pcount;
         let mut w = Wr::new(&mut self.out);
         // ---- events
         let cpos = w.len();

@@ -181,7 +181,6 @@ export function emitCharacter(I: Instances, c: CharState) {
     box(I, torso, [0, 0.27, 0], [0.5, 0.42, 0.31], vc, SHAPE_BOX, GEAR);
     box(I, torso, [0, 0.33, 0.14], [0.3, 0.2, 0.03], rgba(0x1c1f22), SHAPE_BOX, GEAR);
   }
-  box(I, torso, [0, 0.32, g1 ? -0.17 : -0.2], [0.34, 0.42, g1 ? 0.2 : 0.14], rgba(0x4d4a3a), SHAPE_BOX, GEAR);
   // head
   const headPitch = dead ? 0 : -pitch * 0.55 - lean * 0.6;
   const head = child(torso, [0, 0.6, 0], qX(headPitch));

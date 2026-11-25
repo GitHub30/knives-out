@@ -154,6 +154,9 @@ pub struct World {
     pub spots: Vec<Spot>,
     /// Parked cars: x, y (ground), z, yaw (a multiple of a quarter turn).
     /// Drawn but not solid: window and door frames, sills, pipes, bands.
+    /// Loose props (crates and containers): indices into `boxes`. They can be
+    /// knocked about; `move_box` keeps the collision grid in step.
+    pub props: Vec<u32>,
     pub deco: Vec<Bx>,
     /// Window panes (min, max): drawn as glass, not solid.
     pub glass: Vec<[f32; 6]>,
@@ -222,6 +225,7 @@ impl World {
             spots: Vec::new(),
             gbox: Vec::new(),
             gcyl: Vec::new(),
+            props: Vec::new(),
             deco: Vec::new(),
             glass: Vec::new(),
             roofs: Vec::new(),
@@ -540,6 +544,7 @@ impl World {
         });
         w.maxh = w.h.iter().cloned().fold(f32::MIN, f32::max);
         w.build_grid();
+        w.props = (0..w.boxes.len()).filter(|&i| w.boxes[i].kind == BK_CRATE || w.boxes[i].kind == BK_CONTAINER).map(|i| i as u32).collect();
         w.checksum = w.compute_checksum();
         w
     }
@@ -1315,6 +1320,41 @@ impl World {
 
     /// Push a vertical cylinder body (feet at p.y) out of walls/trees/rocks.
     pub fn collide_body(&self, p: &mut V3, r: f32, hgt: f32) -> bool {
+        self.collide_body_ex(p, r, hgt, false)
+    }
+
+    /// Take box `i` out of the collision grid / put it back (around moving it).
+    fn grid_cells(b: &Bx) -> (i32, i32, i32, i32) {
+        cell_range(b.min.x - GRID_MARGIN, b.max.x + GRID_MARGIN, b.min.z - GRID_MARGIN, b.max.z + GRID_MARGIN)
+    }
+    pub fn unlink_box(&mut self, i: usize) {
+        let (x0, x1, z0, z1) = Self::grid_cells(&self.boxes[i]);
+        for cz in z0..=z1 {
+            for cx in x0..=x1 {
+                self.gbox[cz as usize * GN + cx as usize].retain(|&k| k as usize != i);
+            }
+        }
+    }
+    pub fn link_box(&mut self, i: usize) {
+        let (x0, x1, z0, z1) = Self::grid_cells(&self.boxes[i]);
+        for cz in z0..=z1 {
+            for cx in x0..=x1 {
+                self.gbox[cz as usize * GN + cx as usize].push(i as u16);
+            }
+        }
+    }
+    /// Move box `i` so that the middle of its underside is at `pos`.
+    pub fn move_box(&mut self, i: usize, pos: V3) {
+        self.unlink_box(i);
+        let b = &mut self.boxes[i];
+        let (hx, hy, hz) = ((b.max.x - b.min.x) * 0.5, b.max.y - b.min.y, (b.max.z - b.min.z) * 0.5);
+        b.min = V3::new(pos.x - hx, pos.y, pos.z - hz);
+        b.max = V3::new(pos.x + hx, pos.y + hy, pos.z + hz);
+        self.link_box(i);
+    }
+
+    /// `through_crates`: crates do not stop the body (a car ploughs through them).
+    pub fn collide_body_ex(&self, p: &mut V3, r: f32, hgt: f32, through_crates: bool) -> bool {
         let mut hit = false;
         for _ in 0..3 {
             let mut moved = false;
@@ -1327,7 +1367,7 @@ impl World {
                 // Whole body height: a crouched (1.25 m) body cannot slip
                 // through a 1.1 m window gap. Ceilings are resolved first by
                 // the caller, so door lintels above the head are not walls.
-                if b.max.y <= feet + STEP || b.min.y >= feet + hgt - 0.02 {
+                if b.max.y <= feet + STEP || b.min.y >= feet + hgt - 0.02 || (through_crates && b.kind == BK_CRATE) {
                     return;
                 }
                 let cx = px + dx_acc;

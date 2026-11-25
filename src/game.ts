@@ -4,10 +4,10 @@
 
 import type { Core } from './core';
 import { CAR_STRIDE, PUFF_FIREBALL, PUFF_FLAME, PUFF_SMOKE, Puffs, type Renderer } from './render/renderer';
-import { Instances, rgba } from './render/instances';
+import { Instances, rgba, surf } from './render/instances';
 import { drawPlane, emitCharacter, emitItem, line } from './render/models';
 import {
-  add, clamp, dirFrom, invert, lerp, lerpAngle, lookAt, mul, norm, perspectiveRZ, qAxis, qIdent, qMul, qY, rightOf, scale, sub, transformPoint, wrapAngle, type M4, type Q, type V3,
+  add, clamp, dirFrom, invert, lerp, lerpAngle, lookAt, mul, norm, perspectiveRZ, qAxis, qIdent, qMul, qRot, qY, rightOf, scale, sub, transformPoint, wrapAngle, type M4, type Q, type V3,
 } from './render/math';
 import * as P from './protocol';
 import type { Transport } from './net';
@@ -105,6 +105,21 @@ interface CarC {
   smokeT: number;
 }
 
+/** A loose crate or container as the client draws it. */
+interface PropC {
+  hx: number;
+  hy: number;
+  hz: number;
+  crate: boolean;
+  col: number;
+  a: { x: number; y: number; z: number; t: number };
+  b: { x: number; y: number; z: number; t: number };
+  moving: boolean;
+  /** Tumbling while it flies; it rights itself when it comes to rest. */
+  rot: Q;
+  axis: V3;
+}
+
 /** A stretch of tyre mark on the ground. */
 interface Track {
   p: V3;
@@ -121,6 +136,35 @@ const CAR_KINDS = [
 ];
 
 const DT = 1 / 30;
+/** A unit cube with sharp edges (pos + normal, 36 vertices), for crates and containers. */
+function unitCube(): Float32Array {
+  const out: number[] = [];
+  for (let axis = 0; axis < 3; axis++) {
+    for (const s of [-1, 1]) {
+      const n = [0, 0, 0];
+      n[axis] = s;
+      const u = (axis + 1) % 3, v = (axis + 2) % 3;
+      const corner = (a: number, b: number) => {
+        const p = [0, 0, 0];
+        p[axis] = 0.5 * s;
+        p[u] = a;
+        p[v] = b;
+        out.push(p[0], p[1], p[2], n[0], n[1], n[2]);
+      };
+      // counter-clockwise seen from outside
+      const q: [number, number][] = s > 0 ? [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]] : [[-0.5, -0.5], [0.5, 0.5], [0.5, -0.5], [-0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]];
+      for (const [a, b] of q) corner(a, b);
+    }
+  }
+  return new Float32Array(out);
+}
+/** The cube is registered with a renderer once, however many matches are played. */
+const cubeShapes = new WeakMap<object, number>();
+
+/** A colour (0xRRGGBB) scaled in brightness. */
+function tintHex(hex: number, k: number): number {
+  return (Math.min(255, ((hex >> 16) & 255) * k) << 16) | (Math.min(255, ((hex >> 8) & 255) * k) << 8) | Math.min(255, (hex & 255) * k);
+}
 const DEBUG = typeof location !== 'undefined' && new URLSearchParams(location.search).has('debug');
 /** Seconds a tyre mark stays on the ground. */
 const TRACK_LIFE = 50;
@@ -170,6 +214,7 @@ export class Game {
   private glassPanes: Float32Array = new Float32Array(0);
   private glass = new Instances(256);
   private tracks: Track[] = [];
+  private props: PropC[] = [];
   private pending: { cmd: P.CmdQ; shots: number; at: number }[] = [];
   private outbox: P.CmdQ[] = [];
   private seq = 0;
@@ -349,6 +394,12 @@ export class Game {
     });
     this.d.hud.setMap(core.bytes(5), 512);
     this.glassPanes = core.f32(10);
+    const pr = core.f32(13);
+    this.props = [];
+    for (let i = 0; i + 8 <= pr.length; i += 8) {
+      const at = { x: (pr[i] + pr[i + 3]) / 2, y: pr[i + 1], z: (pr[i + 2] + pr[i + 5]) / 2, t: 0 };
+      this.props.push({ hx: (pr[i + 3] - pr[i]) / 2, hy: pr[i + 4] - pr[i + 1], hz: (pr[i + 5] - pr[i + 2]) / 2, crate: pr[i + 6] > 0.5, col: pr[i + 7], a: at, b: { ...at }, moving: false, rot: qIdent(), axis: [1, 0, 0] });
+    }
     const c0 = core.f32(8);
     const kinds = core.bytes(9);
     this.cars = [];
@@ -396,6 +447,7 @@ export class Game {
     for (const e of s.events) this.onEvent(e);
     this.onPhase(s);
     this.onCars(s);
+    this.onProps(s);
     this.reconcile(s);
     if (this.slotReq < 0 || performance.now() - this.slotReqAt > 1200 || s.self.cur === this.slotReq) {
       this.displayCur = s.self.cur;
@@ -670,6 +722,69 @@ export class Game {
     // my own car follows my prediction: keep the server's copy of it out of
     // the way of the camera and of the rays
     if (this.myCar >= 0) core.setCar(this.myCar, 0, -1000, 0, 0);
+  }
+
+  /** Crates and containers that were knocked about: for drawing, and solid in the core where they are now. */
+  private onProps(s: P.Snapshot) {
+    const step = this.welcome?.snapEvery ?? 2;
+    for (const p of s.props) {
+      const k = this.props[p.id];
+      if (!k) continue;
+      k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - step } : k.b;
+      k.b = { x: p.x, y: p.y, z: p.z, t: s.tick };
+      if (p.moving && !k.moving) k.axis = norm([Math.random() - 0.5, (Math.random() - 0.5) * 0.4, Math.random() - 0.5]);
+      k.moving = p.moving;
+      this.d.core.setProp(p.id, p.x, p.y, p.z);
+    }
+  }
+
+  /** Loose props as boxes: crates with their frame planks, containers with their ribs. */
+  private drawProps(eye: V3, dt: number) {
+    const B = this.boxes;
+    let cube = cubeShapes.get(this.d.renderer);
+    if (cube === undefined) {
+      cube = this.d.renderer.addShapes([unitCube()]);
+      cubeShapes.set(this.d.renderer, cube);
+    }
+    const wood = surf(0.82, 0), steel = surf(0.5, 0.55);
+    for (const k of this.props) {
+      const span = k.b.t - k.a.t;
+      const f = span > 0 ? clamp((this.renderTick - k.a.t) / span, 0, 1) : 1;
+      const x = lerp(k.a.x, k.b.x, f), y = lerp(k.a.y, k.b.y, f), z = lerp(k.a.z, k.b.z, f);
+      if ((x - eye[0]) ** 2 + (z - eye[2]) ** 2 > 300 * 300) continue;
+      if (k.moving) {
+        // tumbling with its speed (crates much more than containers)
+        const v = span > 0 ? Math.hypot(k.b.x - k.a.x, k.b.y - k.a.y, k.b.z - k.a.z) / (span / 30) : 0;
+        k.rot = qMul(qAxis(k.axis[0], k.axis[1], k.axis[2], v * dt * (k.crate ? 0.9 : 0.05)), k.rot);
+      } else if (k.rot[3] < 0.9999) {
+        // settling flat again
+        const e = Math.min(1, dt * 9);
+        const q: Q = [k.rot[0] * (1 - e), k.rot[1] * (1 - e), k.rot[2] * (1 - e), k.rot[3] * (1 - e) + e * Math.sign(k.rot[3] || 1)];
+        const l = Math.hypot(...q) || 1;
+        k.rot = [q[0] / l, q[1] / l, q[2] / l, q[3] / l];
+      }
+      const c: V3 = [x, y + k.hy / 2, z];
+      const q = k.rot;
+      const at = (o: V3): V3 => add(c, qRot(q, o));
+      const dark = rgba(tintHex(k.col, k.crate ? 0.7 : 0.72));
+      B.push(c, q, [k.hx * 2, k.hy, k.hz * 2], rgba(k.col), cube, k.crate ? wood : steel);
+      if (k.crate) {
+        // frame planks around the top and the bottom, a brace on each side
+        const e = 0.07;
+        B.push(at([0, k.hy / 2 - e / 2, 0]), q, [k.hx * 2 + 0.04, e, k.hz * 2 + 0.04], dark, cube, wood);
+        B.push(at([0, -k.hy / 2 + e / 2, 0]), q, [k.hx * 2 + 0.04, e, k.hz * 2 + 0.04], dark, cube, wood);
+        B.push(c, q, [e, k.hy, k.hz * 2 + 0.04], dark, cube, wood);
+        B.push(c, q, [k.hx * 2 + 0.04, k.hy, e], dark, cube, wood);
+      } else {
+        // corrugation ribs along the long sides
+        const alongX = k.hx > k.hz;
+        for (let r = 1; r < 10; r++) {
+          const t = (r / 10 - 0.5) * 2;
+          if (alongX) B.push(at([t * k.hx, 0, 0]), q, [0.1, k.hy - 0.2, k.hz * 2 + 0.07], dark, cube, steel);
+          else B.push(at([0, 0, t * k.hz]), q, [k.hx * 2 + 0.07, k.hy - 0.2, 0.1], dark, cube, steel);
+        }
+      }
+    }
   }
 
   private carPose(k: number): { x: number; y: number; z: number; yaw: number } {
@@ -1395,6 +1510,7 @@ export class Game {
     }
     this.updateFx(dt);
     this.drawCars(eye, dt);
+    this.drawProps(eye, dt);
     // window glass near the camera
     this.glass.reset();
     const gp = this.glassPanes;

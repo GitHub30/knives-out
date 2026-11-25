@@ -334,7 +334,8 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
         for off in circles {
             let base = V3::new(np.x + f.x * off, w.height(np.x + f.x * off, np.z + f.z * off) + 0.45, np.z + f.z * off);
             let mut q = base;
-            w.collide_body(&mut q, cr, 1.0);
+            // (crates do not stop a car: it knocks them flying)
+            w.collide_body_ex(&mut q, cr, 1.0, true);
             for (k, o) in w.cars.iter().enumerate() {
                 if k == s.car as usize || (o[0] - q.x).abs() > 8.0 || (o[2] - q.z).abs() > 8.0 || (o[1] - np.y).abs() > 3.0 {
                     continue;

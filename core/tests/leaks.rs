@@ -97,6 +97,9 @@ fn parse(buf: &[u8]) -> Snap {
     // cars: id, pose, driver
     let nc = r.u8() as usize;
     r.skip(nc * 17);
+    // loose props: id, position, moving
+    let np = r.u8() as usize;
+    r.skip(np * 15);
     let ne = r.u16() as usize;
     let mut events = vec![];
     for _ in 0..ne {

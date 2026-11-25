@@ -190,8 +190,8 @@ function cleanName(): string {
   return name;
 }
 
+/** Every match starts full screen and, where the device can be told, in landscape. */
 async function enterFullscreen() {
-  if (!isTouch()) return;
   try {
     if (!document.fullscreenElement && document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
     const o = screen.orientation as ScreenOrientation & { lock?: (o: string) => Promise<void> };
@@ -450,6 +450,11 @@ async function boot() {
     if (info.reason !== 'destroyed') errorBox('GPU デバイスが失われました。ページを再読み込みしてください。');
   });
 
+  // iOS Safari has no fullscreen API for pages: the way to full screen there
+  // is the home-screen app (see manifest.webmanifest and the apple-* tags)
+  const ios = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const standalone = (navigator as Navigator & { standalone?: boolean }).standalone === true || matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+  if (ios && !standalone) $('ios-hint').hidden = false;
   $('btn-solo').addEventListener('click', () => void startGame('offline'));
   $('btn-online').addEventListener('click', () => void startGame('online'));
   $('btn-room').addEventListener('click', () => {

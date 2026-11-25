@@ -349,8 +349,8 @@ pub fn build(w: &World) -> Meshes {
     for b in &w.boxes {
         s.select((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5);
         let c = rgb(b.col);
-        if b.kind == BK_CAR || b.kind == BK_HIDDEN {
-            continue; // drawn from the car model by the client / from their own shapes
+        if b.kind == BK_CAR || b.kind == BK_HIDDEN || b.kind == BK_CRATE || b.kind == BK_CONTAINER {
+            continue; // drawn by the client: car models, own shapes, loose props
         }
         let mat = match b.kind {
             BK_ROOF => MAT_ROOF,

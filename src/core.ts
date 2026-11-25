@@ -38,6 +38,7 @@ interface CoreExports {
   cli_ray_kind(): number;
   cli_building_at(x: number, z: number): number;
   cli_set_car(k: number, x: number, y: number, z: number, yaw: number): void;
+  cli_set_prop(k: number, x: number, y: number, z: number): void;
   cli_pred_ptr(): number;
   cli_pred_step(): void;
 }
@@ -138,6 +139,11 @@ export class Core {
   /** Where car `k` is now, for collisions and rays. */
   setCar(k: number, x: number, y: number, z: number, yaw: number) {
     this.ex.cli_set_car(k, x, y, z, yaw);
+  }
+
+  /** Where loose prop `k` is now (the middle of its underside). */
+  setProp(k: number, x: number, y: number, z: number) {
+    this.ex.cli_set_prop(k, x, y, z);
   }
 
   /** Shared prediction IO block (see lib.rs for layout). */
