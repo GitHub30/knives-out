@@ -205,13 +205,16 @@ export class Sound {
         this.burst(dest, t, 0.03, 'highpass', 3000, 2, 0.5);
         break;
       case 'jump':
-        this.burst(dest, t, 0.5, 'lowpass', 1200, 0.5, 0.4, 0.05);
+        // leaving the plane: a soft falling whoosh, no hiss
+        this.tone(dest, t, 0.3, 300, 150, 0.22);
+        this.burst(dest, t, 0.45, 'lowpass', 420, 0.3, 0.22, 0.12);
         break;
       case 'land':
         this.burst(dest, t, 0.12, 'lowpass', 400, 0.7, 0.8);
         break;
       case 'chute':
-        this.burst(dest, t, 0.35, 'bandpass', 700, 0.6, 0.9, 0.02);
+        this.burst(dest, t, 0.4, 'lowpass', 480, 0.4, 0.6, 0.03);
+        this.tone(dest, t, 0.18, 140, 90, 0.3);
         break;
       case 'throw':
         this.burst(dest, t, 0.12, 'bandpass', 1500, 1, 0.4, 0.01);
@@ -338,12 +341,19 @@ export class Sound {
       src.buffer = this.noise;
       src.loop = true;
       const filter = c.createBiquadFilter();
-      filter.type = name === 'wind' ? 'bandpass' : 'lowpass';
-      filter.frequency.value = name === 'plane' ? 260 : name === 'engine' ? 180 : 800;
-      filter.Q.value = name === 'plane' ? 0.7 : 0.4;
+      filter.type = 'lowpass';
+      filter.frequency.value = name === 'plane' ? 260 : name === 'engine' ? 180 : 260;
+      filter.Q.value = name === 'plane' ? 0.7 : name === 'engine' ? 0.4 : 0.2;
       const gain = c.createGain();
       gain.gain.value = 0;
-      src.connect(filter).connect(gain).connect(this.master);
+      if (name === 'wind') {
+        // a low rush of air: two gentle low-passes take the hiss out of the noise
+        const soft = c.createBiquadFilter();
+        soft.type = 'lowpass';
+        soft.frequency.value = 650;
+        soft.Q.value = 0.2;
+        src.connect(filter).connect(soft).connect(gain).connect(this.master);
+      } else src.connect(filter).connect(gain).connect(this.master);
       src.start();
       let osc: OscillatorNode | undefined;
       if (name !== 'wind') {
@@ -360,9 +370,9 @@ export class Sound {
       }
       l = this.loops[name] = { src, gain, filter, osc };
     }
-    l.gain.gain.setTargetAtTime(level * (name === 'plane' ? 0.5 : name === 'engine' ? 0.3 : 0.35), c.currentTime, 0.15);
+    l.gain.gain.setTargetAtTime(level * (name === 'plane' ? 0.5 : name === 'engine' ? 0.3 : 0.5), c.currentTime, 0.15);
     // engine note: idle to redline with `pitch` 0..1
     if (name === 'engine' && l.osc) l.osc.frequency.setTargetAtTime(42 + pitch * 110, c.currentTime, 0.08);
-    if (name === 'wind' && l.filter) l.filter.frequency.setTargetAtTime(500 + level * 1200, c.currentTime, 0.2);
+    if (name === 'wind' && l.filter) l.filter.frequency.setTargetAtTime(200 + level * 320, c.currentTime, 0.3);
   }
 }

@@ -63,35 +63,30 @@ fn houses_have_doors_and_all_start_shut() {
 }
 
 #[test]
-fn a_shut_door_stops_a_walker_and_the_use_button_opens_it() {
+fn a_door_opens_for_a_walker_and_can_be_shut_behind() {
     let (mut m, a) = game(7);
     let (k, out, inn) = level_door(&m);
     let i = a as usize;
     let mut pad = Pad { seq: 0, yaw: yaw_to(inn.0 - out.0, inn.1 - out.1) };
     m.players[i].ms = MoveState { pos: V3::new(out.0, m.w.height(out.0, out.1), out.1), mode: MODE_GROUND, on_ground: true, ..Default::default() };
     pad.send(&mut m, a, 0, 0);
-    for _ in 0..50 {
-        pad.send(&mut m, a, 127, 0);
-    }
-    let p = m.players[i].ms.pos;
-    assert!(dist_xz(p.x, p.z, inn.0, inn.1) > 1.3, "walked through a shut door: {p:?}");
-    // a shot does not pass it either
-    let eye = V3::new(out.0, p.y + 1.4, out.1);
+    // shut, it stops a shot; standing in front of it does not open it
+    let eye = V3::new(out.0, m.players[i].ms.pos.y + 1.4, out.1);
     let d = V3::new(inn.0 - out.0, 0.0, inn.1 - out.1).norm();
-    assert!(m.w.raycast(eye, d, 3.0).is_some());
-    pad.send(&mut m, a, 0, B_USE);
-    assert!(m.w.door_open[k]);
-    assert!(m.w.raycast(eye, d, 3.0).is_none());
-    pad.send(&mut m, a, 0, 0);
-    // into the doorway: it cannot be shut on the walker
+    assert!(!m.w.door_open[k] && m.w.raycast(eye, d, 3.0).is_some());
+    // walking up to it does
+    let c = m.w.doors[k].hinge + fwd(m.w.doors[k].shut) * (m.w.doors[k].w * 0.5);
     for _ in 0..200 {
         let p = m.players[i].ms.pos;
-        let c = m.w.doors[k].hinge + fwd(m.w.doors[k].shut) * (m.w.doors[k].w * 0.5);
         if dist_xz(p.x, p.z, c.x, c.z) < 0.25 {
             break;
         }
         pad.send(&mut m, a, 127, 0);
     }
+    assert!(m.w.door_open[k], "did not open");
+    let p = m.players[i].ms.pos;
+    assert!(dist_xz(p.x, p.z, c.x, c.z) < 0.3, "stopped at the door: {p:?}");
+    // it cannot be shut on the walker standing in it
     pad.send(&mut m, a, 0, 0);
     pad.send(&mut m, a, 0, B_USE);
     assert!(m.w.door_open[k], "shut on the player standing in it");
@@ -100,14 +95,16 @@ fn a_shut_door_stops_a_walker_and_the_use_button_opens_it() {
         pad.send(&mut m, a, 127, 0);
     }
     let p = m.players[i].ms.pos;
-    assert!(dist_xz(p.x, p.z, inn.0, inn.1) < dist_xz(p.x, p.z, out.0, out.1) && m.w.building_at(p.x, p.z).is_some(), "did not get in: {p:?}");
+    assert!(m.w.building_at(p.x, p.z).is_some(), "did not get in: {p:?}");
+    // shut behind: walking on (away from it) leaves it shut
     pad.send(&mut m, a, 0, 0);
     pad.send(&mut m, a, 0, B_USE);
     assert!(!m.w.door_open[k]);
-    // and it is all shut again for the next match
     pad.send(&mut m, a, 0, 0);
-    pad.send(&mut m, a, 0, B_USE);
-    assert!(m.w.door_open[k]);
+    for _ in 0..4 {
+        pad.send(&mut m, a, 127, 0);
+    }
+    assert!(!m.w.door_open[k], "opened for a walker going away from it");
 }
 
 #[test]

@@ -18,6 +18,7 @@ pub const CAR_FUSE_TICKS: u32 = 150;
 /// Doors: how near one must stand to work it, and how far away an open one
 /// is told to a client (the rest it takes for shut).
 pub const DOOR_REACH: f32 = 2.2;
+pub const DOOR_AUTO: f32 = 1.5;
 pub const DOOR_SEND_R: f32 = 150.0;
 pub const HELI_HP: f32 = 1500.0;
 /// Vehicles shoving each other: how close counts as touching, the closing
@@ -1163,11 +1164,18 @@ impl Match {
         }
         if use_ {
             self.use_door(i);
-        } else if !human && (tick as usize + i) % 4 == 0 {
-            // bots push doors open as they walk up to them
+        } else if c.mx != 0.0 || c.mz != 0.0 {
+            // a door opens by itself for whoever walks up to it (not for one
+            // walking away, so it can be shut behind oneself)
             let pos = self.players[i].ms.pos;
+            let wish = (right(c.yaw) * c.mx + fwd(c.yaw) * c.mz).norm();
             for k in 0..self.w.doors.len() {
-                if !self.w.door_open[k] && self.door_dist(k, pos) < 1.3 {
+                if self.w.door_open[k] || self.door_dist(k, pos) >= DOOR_AUTO {
+                    continue;
+                }
+                let d = self.w.doors[k];
+                let m = d.hinge + fwd(d.shut) * (d.w * 0.5);
+                if (m.x - pos.x) * wish.x + (m.z - pos.z) * wish.z > 0.0 {
                     self.w.set_door(k, true);
                 }
             }

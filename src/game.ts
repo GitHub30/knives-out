@@ -275,7 +275,7 @@ export class Game {
   private nearHeli = -1;
   private nearDoor = -1;
   /** Doors as generated, whether each stands open and how far it has swung (0 shut .. 1 open). */
-  private doors: { x: number; y: number; z: number; w: number; h: number; shut: number; open: number; col: number; isOpen: boolean; a: number }[] = [];
+  private doors: { x: number; y: number; z: number; w: number; h: number; shut: number; open: number; col: number; isOpen: boolean; a: number; hold: number }[] = [];
   /** Things heard lately, for the direction ring. */
   private noises: { kind: NoiseKind; x: number; z: number; t: number; life: number }[] = [];
   private vehNoiseT = 0;
@@ -483,7 +483,7 @@ export class Game {
     const dr = core.f32(15);
     this.doors = [];
     this.noises = [];
-    for (let i = 0; i + 8 <= dr.length; i += 8) this.doors.push({ x: dr[i], y: dr[i + 1], z: dr[i + 2], w: dr[i + 3], h: dr[i + 4], shut: dr[i + 5], open: dr[i + 6], col: dr[i + 7], isOpen: false, a: 0 });
+    for (let i = 0; i + 8 <= dr.length; i += 8) this.doors.push({ x: dr[i], y: dr[i + 1], z: dr[i + 2], w: dr[i + 3], h: dr[i + 4], shut: dr[i + 5], open: dr[i + 6], col: dr[i + 7], isOpen: false, a: 0, hold: 0 });
     for (let k = 0; k < this.doors.length; k++) core.setDoor(k, false);
     const pr = core.f32(13);
     this.props = [];
@@ -938,7 +938,8 @@ export class Game {
     for (let k = 0; k < this.doors.length; k++) {
       const d = this.doors[k];
       const o = open.has(k);
-      if (o === d.isOpen) continue;
+      // (one we just walked into opens at once here; the server follows)
+      if (o === d.isOpen || (!o && this.time < d.hold)) continue;
       d.isOpen = o;
       this.d.core.setDoor(k, o);
       const at: V3 = [d.x + Math.sin(d.shut) * d.w * 0.5, d.y + 1, d.z + Math.cos(d.shut) * d.w * 0.5];
@@ -1963,6 +1964,19 @@ export class Game {
     this.nearCar = ground && me ? this.carInReach(me) : -1;
     this.nearHeli = ground && me && this.nearCar < 0 ? this.heliInReach(me) : -1;
     this.nearDoor = ground && me && this.nearCar < 0 && this.nearHeli < 0 ? this.doorInReach(me) : -1;
+    // doors open by themselves for a walker: do it here too, ahead of the server's word
+    if (ground && me && this.pred && Math.hypot(this.pred.vel[0], this.pred.vel[2]) > 0.5) {
+      for (let k = 0; k < this.doors.length; k++) {
+        const d = this.doors[k];
+        if (d.isOpen || Math.abs(me[1] - d.y) > 1.5) continue;
+        const mx = d.x + Math.sin(d.shut) * d.w * 0.5 - me[0], mz = d.z + Math.cos(d.shut) * d.w * 0.5 - me[2];
+        if (Math.hypot(mx, mz) >= 1.5 || mx * this.pred.vel[0] + mz * this.pred.vel[2] <= 0) continue;
+        d.isOpen = true;
+        d.hold = this.time + 0.6;
+        core.setDoor(k, true);
+        this.d.sound.door(1, 0, true);
+      }
+    }
     const doorText = this.nearDoor >= 0 ? (this.doors[this.nearDoor].isOpen ? 'ドアを閉める' : 'ドアを開ける') : null;
     const landed = flying && !!this.pred?.onGround && Math.hypot(...this.pred.vel) < 1.5;
     let flyText = '';
