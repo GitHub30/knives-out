@@ -84,10 +84,14 @@ interface CarC {
   a: { x: number; y: number; z: number; yaw: number; t: number };
   b: { x: number; y: number; z: number; yaw: number; t: number };
   driver: number;
+  /** 0 police car, 1 fire truck. */
+  kind: number;
 }
-const CAR_HW = 0.9;
-const CAR_HL = 2.45;
-const CAR_VMAX = 24;
+/** Half width, half length, top speed (m/s) and name per vehicle kind. */
+const CAR_KINDS = [
+  { hw: 0.9, hl: 2.45, vmax: 24, name: 'パトカー' },
+  { hw: 1.25, hl: 3.05, vmax: 18, name: '消防車' },
+];
 
 const DT = 1 / 30;
 type Snap = P.Snapshot & { byId: Map<number, P.RemotePlayer> };
@@ -304,13 +308,15 @@ export class Game {
       mapSize: 1024,
       waterLevel: 0,
       cars: core.f32(8),
+      carKinds: core.bytes(9),
     });
     this.d.hud.setMap(core.bytes(5), 512);
     const c0 = core.f32(8);
+    const kinds = core.bytes(9);
     this.cars = [];
     for (let i = 0; i + 4 <= c0.length; i += 4) {
       const at = { x: c0[i], y: c0[i + 1], z: c0[i + 2], yaw: c0[i + 3], t: 0 };
-      this.cars.push({ a: at, b: { ...at }, driver: 255 });
+      this.cars.push({ a: at, b: { ...at }, driver: 255, kind: Math.min(kinds[i >> 2] ?? 0, CAR_KINDS.length - 1) });
     }
     this.myCar = -1;
     core.freeMeshes();
@@ -459,7 +465,7 @@ export class Game {
       case 'kill': {
         const killer = this.nameOf(e.killer);
         const victim = this.nameOf(e.victim);
-        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : WEAPON_SHORT[e.weapon] ?? '?';
+        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : e.weapon === P.WK_TRUCK ? '消防車' : WEAPON_SHORT[e.weapon] ?? '?';
         const mine = e.killer === this.myId ? 'me' : e.victim === this.myId ? 'victim' : '';
         hud.killfeed(killer, victim, (e.head ? '◎ ' : '') + weapon, mine);
         if (e.killer === this.myId && e.victim !== this.myId) hud.showBanner(`キル！ ${victim}${e.head ? '（ヘッドショット）' : ''}`, 2, 'kill');
@@ -628,11 +634,12 @@ export class Game {
       if (c.driver !== 255) continue;
       const dx = me[0] - c.b.x, dz = me[2] - c.b.z;
       const d2 = dx * dx + dz * dz;
-      if (d2 > 25 || Math.abs(me[1] - c.b.y) > 1.5 || d2 >= bd) continue;
+      if (d2 > 36 || Math.abs(me[1] - c.b.y) > 1.5 || d2 >= bd) continue;
       const sn = Math.sin(c.b.yaw), cs = Math.cos(c.b.yaw);
       // into the car's frame (x = right, z = forward), distance to its outline
       const lx = -dx * cs + dz * sn, lz = dx * sn + dz * cs;
-      const ex = Math.max(0, Math.abs(lx) - CAR_HW), ez = Math.max(0, Math.abs(lz) - CAR_HL);
+      const dim = CAR_KINDS[c.kind];
+      const ex = Math.max(0, Math.abs(lx) - dim.hw), ez = Math.max(0, Math.abs(lz) - dim.hl);
       if (Math.hypot(ex, ez) > 1.3) continue;
       bd = d2;
       best = k;
@@ -1203,11 +1210,11 @@ export class Game {
         return { eye: back(sh, ads ? 1.3 : 2.7), dir: d, vfov, scoped: false, pivot: head };
       }
       if (this.pred.mode === P.MODE_DRIVE) {
-        // chase camera: wider with speed
-        const v = Math.hypot(this.pred.vel[0], this.pred.vel[2]);
-        const pivot: V3 = [pos[0], pos[1] + 2.0, pos[2]];
-        const vfov = base * (1 + 0.1 * Math.min(1, v / CAR_VMAX));
-        return { eye: back(pivot, 7.2 + 1.2 * Math.min(1, v / CAR_VMAX)), dir: d, vfov, scoped: false, pivot };
+        // chase camera: wider with speed, further back for the tall truck
+        const kind = this.cars[this.myCar]?.kind ?? 0;
+        const k = Math.min(1, Math.hypot(this.pred.vel[0], this.pred.vel[2]) / CAR_KINDS[kind].vmax);
+        const pivot: V3 = [pos[0], pos[1] + (kind ? 3.7 : 2.0), pos[2]];
+        return { eye: back(pivot, (kind ? 10.5 : 7.2) + 1.2 * k), dir: d, vfov: base * (1 + 0.1 * k), scoped: false, pivot };
       }
       const pivot: V3 = [pos[0], pos[1] + 1.2, pos[2]];
       return { eye: back(pivot, this.pred.mode === P.MODE_PARA ? 8 : 6.5), dir: d, vfov: base, scoped: false, pivot };
@@ -1354,7 +1361,8 @@ export class Game {
     this.nearItem = !!item;
     this.nearCar = ground && me ? this.carInReach(me) : -1;
     const kmh = driving && this.pred ? Math.round(Math.hypot(this.pred.vel[0], this.pred.vel[2]) * 3.6) : 0;
-    const pickup = driving ? '降りる' : item ?? (this.nearCar >= 0 ? 'パトカーに乗る' : null);
+    const carName = CAR_KINDS[this.cars[driving ? this.myCar : this.nearCar]?.kind ?? 0].name;
+    const pickup = driving ? '降りる' : item ?? (this.nearCar >= 0 ? `${carName}に乗る` : null);
     const touch = matchMedia('(pointer: coarse)').matches;
     const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
     hud.setPrompt(
@@ -1362,9 +1370,9 @@ export class Game {
         : driving ? (touch ? `${kmh} km/h` : `${kmh} km/h　[F] 降りる　[Space] ブレーキ`)
         : touch ? null
         : item ? `[F] 拾う: ${item}`
-        : this.nearCar >= 0 ? '[F] パトカーに乗る' : null,
+        : this.nearCar >= 0 ? `[F] ${carName}に乗る` : null,
     );
-    this.d.sound.loop('engine', driving ? 1 : 0, kmh / (CAR_VMAX * 3.6));
+    this.d.sound.loop('engine', driving ? 1 : 0, kmh / (CAR_KINDS[this.cars[this.myCar]?.kind ?? 0].vmax * 3.6));
     const spectating = !alive && s.phase === P.PH_PLAY;
     hud.setSpectate(spectating ? (s.self.spect !== 255 ? this.nameOf(s.self.spect) : '—') : null);
     if (me) hud.drawMinimap(me[0], me[2], this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, this.markers, this.time, 1024);
@@ -1399,9 +1407,10 @@ export class Game {
       if ((c.x - eye[0]) ** 2 + (c.z - eye[2]) ** 2 < 260 * 260) {
         const sn = Math.sin(c.yaw), cs = Math.cos(c.yaw);
         // heights under the axles and the sides: nose up / down and lean
-        const hf = core.height(c.x + sn * 1.4, c.z + cs * 1.4), hb = core.height(c.x - sn * 1.4, c.z - cs * 1.4);
-        const hl = core.height(c.x + cs * 0.8, c.z - sn * 0.8), hr = core.height(c.x - cs * 0.8, c.z + sn * 0.8);
-        const pitch = clamp(Math.atan2(hf - hb, 2.8), -0.6, 0.6), roll = clamp(Math.atan2(hl - hr, 1.6), -0.5, 0.5);
+        const ax = this.cars[k].kind ? 1.9 : 1.4, tr = this.cars[k].kind ? 1.0 : 0.8;
+        const hf = core.height(c.x + sn * ax, c.z + cs * ax), hb = core.height(c.x - sn * ax, c.z - cs * ax);
+        const hl = core.height(c.x + cs * tr, c.z - sn * tr), hr = core.height(c.x - cs * tr, c.z + sn * tr);
+        const pitch = clamp(Math.atan2(hf - hb, ax * 2), -0.6, 0.6), roll = clamp(Math.atan2(hl - hr, tr * 2), -0.5, 0.5);
         q = qMul(qMul(q, qAxis(1, 0, 0, -pitch)), qAxis(0, 0, 1, roll));
         y = Math.max(c.y - 0.4, (hf + hb + hl + hr) / 4) + 0.02;
       }

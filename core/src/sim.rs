@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 8;
+pub const PROTO: u16 = 9;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -1097,13 +1097,15 @@ impl Match {
         self.car_moved[k] = self.tick;
         let c = self.w.cars[k];
         let (f, r) = (fwd(c[3]), right(c[3]));
+        let (hw, hl, _) = self.w.car_dims(k);
+        let (ds, dl) = (hw + 0.65, hl + 0.65);
         // driver's side first, then the other side, the back and the front
         // (never through a wall the car is parked against; with every side
         // walled in, out of the middle of the car)
         let mid = V3::new(c[0], c[1] + 1.0, c[2]);
         let mut out = V3::new(c[0], c[1], c[2]);
         let mut least = f32::MAX;
-        for (sx, sz) in [(-1.55, 0.0), (1.55, 0.0), (0.0, -3.1), (0.0, 3.1)] {
+        for (sx, sz) in [(-ds, 0.0), (ds, 0.0), (0.0, -dl), (0.0, dl)] {
             let (x, z) = (c[0] + r.x * sx + f.x * sz, c[2] + r.z * sx + f.z * sz);
             let y = self.w.ground_below(x, z, c[1] + 1.0, P_RADIUS);
             if (y - c[1]).abs() > 1.2 {
@@ -1161,7 +1163,8 @@ impl Match {
             if v.abs() > 4.0 && tick.wrapping_sub(q.ram_tick) > 24 {
                 q.ram_tick = tick;
                 let dmg = 12.0 + (v.abs() - 4.0) * 5.0;
-                self.damage(j, i as u8, dmg, false, WK_CAR, ms.pos);
+                let wk = if self.w.car_kind[k] == VK_TRUCK { WK_TRUCK } else { WK_CAR };
+                self.damage(j, i as u8, dmg, false, wk, ms.pos);
                 // the hit costs the car some speed
                 let p = &mut self.players[i];
                 p.ms.vel = p.ms.vel * 0.85;
@@ -1559,7 +1562,8 @@ impl Match {
             }
             // a driver is reached over the roof, and shielded a little
             let driving = q.ms.mode == MODE_DRIVE;
-            let c = q.ms.pos + V3::new(0.0, if driving { 1.75 } else { 0.9 }, 0.0);
+            let roof = if driving { self.w.car_dims(q.ms.car as usize).2 + 0.3 } else { 0.9 };
+            let c = q.ms.pos + V3::new(0.0, roof, 0.0);
             let d = (c - n.pos).len();
             if d > radius {
                 continue;
@@ -2497,7 +2501,7 @@ impl Match {
             // re-check each pair every other snapshot round, staggered by target
             if pv.vis_check[j] == 0 || (pv.snap_round.wrapping_add(j as u32)) % 2 == 0 {
                 // a driver is seen through the roof line of the car
-                let lift = if q.ms.mode == MODE_DRIVE { 0.75 } else { 0.0 };
+                let lift = if q.ms.mode == MODE_DRIVE { self.w.car_dims(q.ms.car as usize).2 - 0.7 } else { 0.0 };
                 let head = q.ms.pos + V3::new(0.0, eye_h(q.ms.crouch) + 0.1 + lift, 0.0);
                 let chest = q.ms.pos + V3::new(0.0, 0.9 + lift, 0.0);
                 let visible = !self.w.blocked(ceye, head) || !self.w.blocked(ceye, chest);

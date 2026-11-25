@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 8;
+export const PROTO = 9;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -34,6 +34,7 @@ export const B_USE = 1 << 13;
 /** Kill-feed weapon ids that are not guns. */
 export const WK_NADE = 200;
 export const WK_CAR = 201;
+export const WK_TRUCK = 202;
 
 export const KILLER_ZONE = 255;
 export const ITEM_CHUNKS = 8;

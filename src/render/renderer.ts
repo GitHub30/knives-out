@@ -35,8 +35,9 @@ export interface WorldMeshes {
   heights: Float32Array; // 257 x 257
   mapSize: number;
   waterLevel: number;
-  /** Parked cars: x, y, z, yaw per car. */
+  /** Parked cars: x, y, z, yaw per car, and the vehicle kind of each. */
   cars?: Float32Array;
+  carKinds?: Uint8Array;
 }
 
 export interface FrameView {
@@ -167,11 +168,12 @@ export class Renderer {
   private width = 0;
   private height = 0;
   private captureReq: ((img: { w: number; h: number; rgba: Uint8Array }) => void) | null = null;
-  private carModel: ModelGpu | null = null;
+  /** One model per vehicle kind (0 police car, 1 fire truck). */
+  private carModels: (ModelGpu | null)[] = [null, null];
+  private carKinds: Uint8Array = new Uint8Array(0);
   /** x, y, z, quaternion per car. */
   private cars: Float32Array = new Float32Array(0);
-  private carInst: GPUBuffer | null = null;
-  private carData = new Float32Array(0);
+  private carData: Float32Array[] = [new Float32Array(0), new Float32Array(0)];
   private planeModel: ModelGpu | null = null;
   private planePose: Float32Array | null = null;
   private planeInst: GPUBuffer | null = null;
@@ -509,6 +511,7 @@ export class Renderer {
     for (let i = 0, o = 0; i + 4 <= c4.length; i += 4, o += 7) {
       this.cars.set([c4[i], c4[i + 1], c4[i + 2], 0, Math.sin(c4[i + 3] * 0.5), 0, Math.cos(c4[i + 3] * 0.5)], o);
     }
+    this.carKinds = w.carKinds ?? new Uint8Array(c4.length >> 2);
     this.heightTex?.destroy();
     this.heightTex = d.createTexture({ size: [257, 257], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     d.queue.writeTexture({ texture: this.heightTex }, w.heights.buffer, { offset: w.heights.byteOffset, bytesPerRow: 257 * 4, rowsPerImage: 257 }, [257, 257]);
@@ -622,10 +625,10 @@ export class Renderer {
     });
   }
 
-  async loadCarModel(url: string): Promise<void> {
+  async loadCarModel(url: string, kind = 0): Promise<void> {
     const m = await loadGlb(url);
     if (this.lost) return;
-    this.carModel = this.uploadModel(m);
+    this.carModels[kind] = this.uploadModel(m);
   }
 
   // ------------------------------------------------------------------ targets
@@ -794,17 +797,22 @@ export class Renderer {
 
     // cars near the camera
     const cam = v.camPos;
-    let carCount = 0;
-    if (this.carModel && this.cars.length) {
-      if (this.carData.length < this.cars.length) this.carData = new Float32Array(this.cars.length);
-      for (let i = 0; i + 7 <= this.cars.length; i += 7) {
+    const carDraws: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
+    for (let kind = 0; kind < this.carModels.length; kind++) {
+      const m = this.carModels[kind];
+      if (!m || !this.cars.length) continue;
+      if (this.carData[kind].length < this.cars.length) this.carData[kind] = new Float32Array(this.cars.length);
+      const data = this.carData[kind];
+      let n = 0;
+      for (let i = 0, k = 0; i + 7 <= this.cars.length; i += 7, k++) {
+        if ((this.carKinds[k] ?? 0) !== kind) continue;
         const dx = this.cars[i] - cam[0], dz = this.cars[i + 2] - cam[2];
         if (dx * dx + dz * dz > 260 * 260) continue;
-        const o = carCount * 7;
-        for (let j = 0; j < 7; j++) this.carData[o + j] = this.cars[i + j];
-        carCount++;
+        for (let j = 0; j < 7; j++) data[n * 7 + j] = this.cars[i + j];
+        n++;
       }
-      if (carCount) this.carInst = this.instBuffer('cars', this.carData.buffer as ArrayBuffer, carCount * 28);
+      const inst = n ? this.instBuffer(`cars${kind}`, data.buffer as ArrayBuffer, n * 28) : null;
+      if (inst) carDraws.push({ m, inst, n });
     }
     const planeOn = !!(this.planeModel && this.planePose);
     if (planeOn) {
@@ -839,12 +847,12 @@ export class Renderer {
           sp.setVertexBuffer(1, b);
           sp.draw(mesh.count, v.boxes.lists[s].count);
         }
-        if (carCount && this.carModel && this.carInst) {
+        for (const c of carDraws) {
           sp.setPipeline(this.pipes.modelShadow);
-          sp.setVertexBuffer(0, this.carModel.vb);
-          sp.setVertexBuffer(1, this.carInst);
-          sp.setIndexBuffer(this.carModel.ib, 'uint32');
-          for (const p of this.carModel.parts) if (!p.blend) sp.drawIndexed(p.count, carCount, p.first);
+          sp.setVertexBuffer(0, c.m.vb);
+          sp.setVertexBuffer(1, c.inst);
+          sp.setIndexBuffer(c.m.ib, 'uint32');
+          for (const p of c.m.parts) if (!p.blend) sp.drawIndexed(p.count, c.n, p.first);
         }
         sp.end();
       }
@@ -886,9 +894,8 @@ export class Renderer {
         draws++;
       }
     }
-    const car = carCount && this.carModel && this.carInst ? this.carModel : null;
     const models: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
-    if (car) models.push({ m: car, inst: this.carInst!, n: carCount });
+    models.push(...carDraws);
     if (planeOn && this.planeInst) models.push({ m: this.planeModel!, inst: this.planeInst, n: 1 });
     if (planeOn && this.fanModel && this.fanInst) models.push({ m: this.fanModel, inst: this.fanInst, n: 2 });
     for (const { m, inst, n } of models) {
@@ -923,15 +930,15 @@ export class Renderer {
       pass.setBindGroup(1, this.bgWater);
       pass.draw(6);
     }
-    if (car) {
+    for (const c of carDraws) {
       pass.setPipeline(this.pipes.modelBlend);
-      pass.setVertexBuffer(0, car.vb);
-      pass.setVertexBuffer(1, this.carInst!);
-      pass.setIndexBuffer(car.ib, 'uint32');
-      for (const p of car.parts) {
+      pass.setVertexBuffer(0, c.m.vb);
+      pass.setVertexBuffer(1, c.inst);
+      pass.setIndexBuffer(c.m.ib, 'uint32');
+      for (const p of c.m.parts) {
         if (!p.blend) continue;
         pass.setBindGroup(1, p.bg);
-        pass.drawIndexed(p.count, carCount, p.first);
+        pass.drawIndexed(p.count, c.n, p.first);
         draws++;
       }
     }

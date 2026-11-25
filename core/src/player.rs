@@ -267,6 +267,15 @@ pub const CAR_VREV: f32 = 7.0;
 pub const CAR_CIRCLES: [f32; 3] = [-1.5, 0.0, 1.5];
 pub const CAR_CR: f32 = 0.95;
 
+/// Collision circles (offsets along the body, radius) and top speed per vehicle kind.
+pub fn car_shape(kind: u8) -> ([f32; 3], f32, f32) {
+    if kind == VK_TRUCK {
+        ([-1.85, 0.0, 1.85], 1.3, 18.0)
+    } else {
+        (CAR_CIRCLES, CAR_CR, CAR_VMAX)
+    }
+}
+
 /// Signed speed of a driven car along its heading.
 pub fn car_speed(s: &MoveState) -> f32 {
     let f = fwd(s.airtime);
@@ -279,14 +288,17 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     let mut v = car_speed(s);
     let (thr, steer) = (clampf(c.mz, -1.0, 1.0), clampf(c.mx, -1.0, 1.0));
     let wet = w.height(s.pos.x, s.pos.z) < WATER - 0.45;
-    let vmax = if wet { 3.0 } else { CAR_VMAX };
+    let kind = *w.car_kind.get(s.car as usize).unwrap_or(&0);
+    let (circles, cr, top) = car_shape(kind);
+    let power = if kind == VK_TRUCK { 7.0 } else { 11.0 };
+    let vmax = if wet { 3.0 } else { top };
     if c.has(B_JUMP) {
         v = approach(v, 0.0, 22.0 * dt);
     } else if thr > 0.05 {
         if v < 0.0 {
             v = approach(v, 0.0, 16.0 * dt);
         } else {
-            v += 11.0 * thr * (1.0 - v / vmax).max(0.0) * dt;
+            v += power * thr * (1.0 - v / vmax).max(0.0) * dt;
         }
     } else if thr < -0.05 {
         if v > 0.0 {
@@ -302,11 +314,12 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     }
     // bicycle model: the steering lock closes up with speed
     let lock = 0.62 / (1.0 + v.abs() * 0.085);
-    yaw = wrap_angle(yaw - steer * lock.tan() * v / 2.8 * dt);
+    let wheelbase = if kind == VK_TRUCK { 3.6 } else { 2.8 };
+    yaw = wrap_angle(yaw - steer * lock.tan() * v / wheelbase * dt);
     let f = fwd(yaw);
     let mut np = V3::new(s.pos.x + f.x * v * dt, s.pos.y, s.pos.z + f.z * v * dt);
     // too steep to climb
-    let ahead = if v >= 0.0 { 2.2 } else { -2.2 };
+    let ahead = (circles[2] + 0.7) * if v >= 0.0 { 1.0 } else { -1.0 };
     let rise = w.height(np.x + f.x * ahead, np.z + f.z * ahead) - w.height(np.x, np.z);
     if rise > 1.9 {
         np.x = s.pos.x;
@@ -318,19 +331,20 @@ fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
     // walls, trees and other cars against three circles along the body
     let mut pushed = 0.0f32;
     for _ in 0..2 {
-        for off in CAR_CIRCLES {
+        for off in circles {
             let base = V3::new(np.x + f.x * off, w.height(np.x + f.x * off, np.z + f.z * off) + 0.45, np.z + f.z * off);
             let mut q = base;
-            w.collide_body(&mut q, CAR_CR, 1.0);
+            w.collide_body(&mut q, cr, 1.0);
             for (k, o) in w.cars.iter().enumerate() {
-                if k == s.car as usize || (o[0] - q.x).abs() > 6.0 || (o[2] - q.z).abs() > 6.0 || (o[1] - np.y).abs() > 3.0 {
+                if k == s.car as usize || (o[0] - q.x).abs() > 8.0 || (o[2] - q.z).abs() > 8.0 || (o[1] - np.y).abs() > 3.0 {
                     continue;
                 }
                 let of = fwd(o[3]);
-                for ooff in CAR_CIRCLES {
+                let (ocircles, ocr, _) = car_shape(*w.car_kind.get(k).unwrap_or(&0));
+                for ooff in ocircles {
                     let (dx, dz) = (q.x - (o[0] + of.x * ooff), q.z - (o[2] + of.z * ooff));
                     let d2 = dx * dx + dz * dz;
-                    let rr = CAR_CR * 2.0;
+                    let rr = cr + ocr;
                     if d2 < rr * rr && d2 > 1e-6 {
                         let dl = d2.sqrt();
                         q.x += dx / dl * (rr - dl);

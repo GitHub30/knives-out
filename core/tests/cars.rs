@@ -288,3 +288,54 @@ fn no_getting_in_or_out_through_a_wall() {
     assert_eq!(p.mode, MODE_GROUND);
     assert!(!bl.contains(p.pos.x, p.pos.z), "got out of the car into the building at {:?}", p.pos);
 }
+
+#[test]
+fn every_town_has_a_fire_truck_and_it_drives() {
+    for seed in [7u32, 42, 2024] {
+        let w = World::generate(seed);
+        let trucks = w.car_kind.iter().filter(|&&k| k == VK_TRUCK).count();
+        assert_eq!(w.cars.len(), w.car_kind.len());
+        assert!(trucks >= w.towns.len() / 2, "seed {seed}: only {trucks} fire trucks for {} towns", w.towns.len());
+        assert_eq!(w.car_kind[0], VK_CAR);
+        // nothing is parked inside anything else
+        for a in 0..w.cars.len() {
+            for b in 0..a {
+                let d = dist_xz(w.cars[a][0], w.cars[a][2], w.cars[b][0], w.cars[b][2]);
+                assert!(d > 5.0, "seed {seed}: vehicles {a} and {b} are {d} m apart");
+            }
+        }
+    }
+    let (mut m, a, _b, o) = stage(7);
+    let t = m.w.car_kind.iter().position(|&k| k == VK_TRUCK).expect("a fire truck");
+    m.w.cars[0] = [5.0, 0.0, 5.0, 0.0];
+    m.w.cars[t] = [o.x, m.w.height(o.x, o.z), o.z, std::f32::consts::FRAC_PI_2];
+    // beside the cab: 1.25 m of half width and the body radius away
+    place(&mut m, a, V3::new(o.x, o.y, o.z + 1.25 + 0.7));
+    let mut pad = Pad { seq: 0 };
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, 0);
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, B_USE);
+    assert_eq!(m.players[a as usize].ms.mode, MODE_DRIVE, "did not get into the truck");
+    assert_eq!(m.car_driver[t], a);
+    let mut top = 0.0f32;
+    for _ in 0..120 {
+        pad.go(&mut m, a, 0, 127, 0.0, 0.0, 0);
+        top = top.max(car_speed(&m.players[a as usize].ms));
+    }
+    assert!(m.w.cars[t][0] - o.x > 25.0, "the truck only moved {} m in 4 s", m.w.cars[t][0] - o.x);
+    assert!(top > 9.0 && top < CAR_VMAX - 3.0, "truck top speed {top}: it should be slower than a car");
+    for _ in 0..90 {
+        pad.go(&mut m, a, 0, 0, 0.0, 0.0, B_JUMP);
+    }
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, 0);
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, B_USE);
+    let p = m.players[a as usize].ms;
+    assert_eq!(p.mode, MODE_GROUND);
+    let mut q = p.pos;
+    assert!(!m.w.push_car(t, &mut q, P_RADIUS - 0.01), "got out inside the truck");
+    // tall enough to hide behind, and it stops bullets up there
+    let c = m.w.cars[t];
+    let side = right(c[3]);
+    let from = V3::new(c[0] + side.x * 6.0, c[1] + 2.4, c[2] + side.z * 6.0);
+    let to = V3::new(c[0] - side.x * 6.0, c[1] + 2.4, c[2] - side.z * 6.0);
+    assert!(m.w.blocked(from, to), "the truck body does not block at 2.4 m");
+}

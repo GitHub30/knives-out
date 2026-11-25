@@ -31,6 +31,7 @@ pub const B_MASK: u16 = 0x3FFF;
 /// Kill-feed weapon ids that are not guns.
 pub const WK_NADE: u8 = 200;
 pub const WK_CAR: u8 = 201;
+pub const WK_TRUCK: u8 = 202;
 
 pub const W_FISTS: u8 = 0;
 pub const W_PISTOL: u8 = 1;

@@ -26,6 +26,11 @@ pub const BK_CAR: u8 = 6;
 pub const CAR_HW: f32 = 0.9;
 pub const CAR_HL: f32 = 2.45;
 pub const CAR_H: f32 = 1.45;
+/// Vehicle kinds: 0 = police car, 1 = fire truck.
+pub const VK_CAR: u8 = 0;
+pub const VK_TRUCK: u8 = 1;
+/// Half width, half length and height per vehicle kind.
+pub const CAR_DIMS: [(f32, f32, f32); 2] = [(CAR_HW, CAR_HL, CAR_H), (1.25, 3.05, 3.0)];
 
 pub const CK_TREE: u8 = 0;
 pub const CK_ROCK: u8 = 1;
@@ -120,6 +125,8 @@ pub struct World {
     pub spots: Vec<Spot>,
     /// Parked cars: x, y (ground), z, yaw (a multiple of a quarter turn).
     pub cars: Vec<[f32; 4]>,
+    /// Vehicle kind of each car (never changes during a match).
+    pub car_kind: Vec<u8>,
     gbox: Vec<Vec<u16>>,
     gcyl: Vec<Vec<u16>>,
     pub checksum: u32,
@@ -182,6 +189,7 @@ impl World {
             gbox: Vec::new(),
             gcyl: Vec::new(),
             cars: Vec::new(),
+            car_kind: Vec::new(),
             checksum: 0,
         };
 
@@ -354,16 +362,27 @@ impl World {
             let mut crng = Rng::new((seed as u64) << 8 ^ 0xCA75 ^ ti as u64);
             let want = 2 + crng.below(2) as usize;
             let mut placed = 0;
-            for _ in 0..40 {
-                if placed >= want {
-                    break;
+            // the police cars first, then one fire truck per town
+            for n in 0..70 {
+                let truck = n >= 40;
+                if (!truck && placed >= want) || (truck && placed > want) {
+                    continue;
+                }
+                if truck {
+                    placed = placed.max(want);
                 }
                 let a = crng.range(0.0, TAU);
                 let rr = crng.range(6.0, (t.r - 4.0).max(7.0));
                 let (x, z) = (t.x + a.cos() * rr, t.z + a.sin() * rr);
                 let quarter = crng.below(4);
                 // half extents on x / z (the car is 4.9 m long, 1.8 m wide)
-                let (hx, hz) = if quarter % 2 == 0 { (0.9, 2.45) } else { (2.45, 0.9) };
+                let kind = if truck { VK_TRUCK } else { VK_CAR };
+                let (dw, dl, _) = CAR_DIMS[kind as usize];
+                let (hx, hz) = if quarter % 2 == 0 { (dw, dl) } else { (dl, dw) };
+                // not on top of a car already parked here
+                if w.cars.iter().any(|c| (c[0] - x).abs() < 7.0 && (c[2] - z).abs() < 7.0) {
+                    continue;
+                }
                 let m = 1.6;
                 if w.buildings.iter().any(|b| x + hx > b.x0 - m && x - hx < b.x1 + m && z + hz > b.z0 - m && z - hz < b.z1 + m) {
                     continue;
@@ -380,6 +399,7 @@ impl World {
                 // cars are dynamic (drivable): they collide through `cars`, not as boxes
                 let _ = lo;
                 w.cars.push([x, y, z, yaw]);
+                w.car_kind.push(kind);
                 placed += 1;
             }
             // military perimeter wall
@@ -1144,17 +1164,24 @@ impl World {
             if along < -3.0 || along > lim + 3.0 {
                 continue;
             }
-            if (rel - d * along).len2() > 9.0 {
+            if (rel - d * along).len2() > 16.0 {
                 continue;
             }
             // into the car's frame: x = right, z = forward
             let (f, r) = (fwd(c[3]), right(c[3]));
             let lo = V3::new(-(rel.x * r.x + rel.z * r.z), -rel.y + 0.7, -(rel.x * f.x + rel.z * f.z));
             let ld = V3::new(d.x * r.x + d.z * r.z, d.y, d.x * f.x + d.z * f.z);
-            for (mn, mx) in [
-                (V3::new(-CAR_HW, -0.2, -CAR_HL), V3::new(CAR_HW, 0.98, CAR_HL)),
-                (V3::new(-0.8, 0.98, -1.5), V3::new(0.8, CAR_H, 1.0)),
-            ] {
+            let (hw, hl, hh) = self.car_dims(k);
+            // a car is a body with a cabin on it, a truck one tall box
+            let boxes = if self.car_kind.get(k) == Some(&VK_TRUCK) {
+                [(V3::new(-hw, -0.2, -hl), V3::new(hw, hh, hl)), (V3::ZERO, V3::ZERO)]
+            } else {
+                [(V3::new(-hw, -0.2, -hl), V3::new(hw, 0.98, hl)), (V3::new(-0.8, 0.98, -1.5), V3::new(0.8, hh, 1.0))]
+            };
+            for (mn, mx) in boxes {
+                if mx.y <= mn.y {
+                    continue;
+                }
                 if let Some((t, ax)) = ray_aabb(lo, ld, mn, mx, lim) {
                     if t < lim {
                         lim = t;
@@ -1183,17 +1210,23 @@ impl World {
         hit
     }
 
+    /// Half width, half length and height of car `k`.
+    pub fn car_dims(&self, k: usize) -> (f32, f32, f32) {
+        CAR_DIMS[(*self.car_kind.get(k).unwrap_or(&0) as usize).min(CAR_DIMS.len() - 1)]
+    }
+
     /// Push a body out of car `k`. True if it was touching.
     pub fn push_car(&self, k: usize, p: &mut V3, r: f32) -> bool {
         let mut hit = false;
         if let Some(c) = self.cars.get(k) {
+            let (hw, hl, hh) = self.car_dims(k);
             let (dx, dz) = (p.x - c[0], p.z - c[2]);
-            if dx * dx + dz * dz > 16.0 || p.y > c[1] + CAR_H || p.y + 1.2 < c[1] {
+            if dx * dx + dz * dz > 36.0 || p.y > c[1] + hh || p.y + 1.2 < c[1] {
                 return false;
             }
             let (f, rt) = (fwd(c[3]), right(c[3]));
             let (lx, lz) = (dx * rt.x + dz * rt.z, dx * f.x + dz * f.z);
-            let (qx, qz) = (clampf(lx, -CAR_HW, CAR_HW), clampf(lz, -CAR_HL, CAR_HL));
+            let (qx, qz) = (clampf(lx, -hw, hw), clampf(lz, -hl, hl));
             let (ex, ez) = (lx - qx, lz - qz);
             let d2 = ex * ex + ez * ez;
             if d2 >= r * r {
@@ -1207,7 +1240,7 @@ impl World {
                 push = r - dl;
             } else {
                 // centre inside the car: leave through the nearest side
-                let (px, pz) = (CAR_HW - lx.abs(), CAR_HL - lz.abs());
+                let (px, pz) = (hw - lx.abs(), hl - lz.abs());
                 if px < pz {
                     nx = if lx >= 0.0 { 1.0 } else { -1.0 };
                     nz = 0.0;
