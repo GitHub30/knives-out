@@ -491,8 +491,5 @@ pub fn build(w: &World) -> Meshes {
             x += scale * 0.9;
         }
     }
-    for c in &w.cars {
-        plot(c[0], c[2], rgb(0x20242A), 0.95);
-    }
     Meshes { tv, ti, tchunks, pv, pchunks, map }
 }

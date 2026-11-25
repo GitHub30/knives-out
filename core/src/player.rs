@@ -35,6 +35,8 @@ pub struct MoveState {
     pub crouch: bool,
     pub in_water: bool,
     pub airtime: f32,
+    /// Index of the car being driven (MODE_DRIVE only).
+    pub car: u8,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -191,6 +193,10 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
                 }
             }
             w.collide_body(&mut np, P_RADIUS, hgt);
+            if w.push_cars(&mut np, P_RADIUS, usize::MAX) {
+                // squeezed between a car and a wall: the wall wins
+                w.collide_body(&mut np, P_RADIUS, hgt);
+            }
             let g = w.ground_below(np.x, np.z, prev.y.max(np.y), P_RADIUS);
             let was_ground = s.on_ground;
             let (free_y, free_vy, ev0) = (np.y, s.vel.y, ev);
@@ -242,6 +248,7 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
             }
             s.pos = np;
         }
+        MODE_DRIVE => step_drive(w, s, c, dt),
         _ => {}
     }
     s.pos.x = clampf(s.pos.x, 2.0, MAP - 2.0);
@@ -252,6 +259,104 @@ pub fn step_move(w: &World, s: &mut MoveState, c: &Cmd, speed_mult: f32, dt: f32
         s.vel = V3::ZERO;
     }
     ev
+}
+
+pub const CAR_VMAX: f32 = 24.0;
+pub const CAR_VREV: f32 = 7.0;
+/// Offsets along the car of the three circles it collides with.
+pub const CAR_CIRCLES: [f32; 3] = [-1.5, 0.0, 1.5];
+pub const CAR_CR: f32 = 0.95;
+
+/// Signed speed of a driven car along its heading.
+pub fn car_speed(s: &MoveState) -> f32 {
+    let f = fwd(s.airtime);
+    s.vel.x * f.x + s.vel.z * f.z
+}
+
+/// One step of a driven car: `mz` is the throttle, `mx` steers, jump brakes.
+fn step_drive(w: &World, s: &mut MoveState, c: &Cmd, dt: f32) {
+    let mut yaw = if s.airtime.is_finite() { s.airtime } else { 0.0 };
+    let mut v = car_speed(s);
+    let (thr, steer) = (clampf(c.mz, -1.0, 1.0), clampf(c.mx, -1.0, 1.0));
+    let wet = w.height(s.pos.x, s.pos.z) < WATER - 0.45;
+    let vmax = if wet { 3.0 } else { CAR_VMAX };
+    if c.has(B_JUMP) {
+        v = approach(v, 0.0, 22.0 * dt);
+    } else if thr > 0.05 {
+        if v < 0.0 {
+            v = approach(v, 0.0, 16.0 * dt);
+        } else {
+            v += 11.0 * thr * (1.0 - v / vmax).max(0.0) * dt;
+        }
+    } else if thr < -0.05 {
+        if v > 0.0 {
+            v = approach(v, 0.0, 18.0 * dt);
+        } else {
+            v = approach(v, -CAR_VREV.min(vmax), 5.0 * -thr * dt);
+        }
+    } else {
+        v = approach(v, 0.0, (1.5 + v.abs() * 0.12) * dt);
+    }
+    if v > vmax {
+        v = approach(v, vmax, 14.0 * dt);
+    }
+    // bicycle model: the steering lock closes up with speed
+    let lock = 0.62 / (1.0 + v.abs() * 0.085);
+    yaw = wrap_angle(yaw - steer * lock.tan() * v / 2.8 * dt);
+    let f = fwd(yaw);
+    let mut np = V3::new(s.pos.x + f.x * v * dt, s.pos.y, s.pos.z + f.z * v * dt);
+    // too steep to climb
+    let ahead = if v >= 0.0 { 2.2 } else { -2.2 };
+    let rise = w.height(np.x + f.x * ahead, np.z + f.z * ahead) - w.height(np.x, np.z);
+    if rise > 1.9 {
+        np.x = s.pos.x;
+        np.z = s.pos.z;
+        v = 0.0;
+    } else if rise > 0.5 {
+        v = approach(v, 0.0, (rise - 0.5) * 9.0 * dt);
+    }
+    // walls, trees and other cars against three circles along the body
+    let mut pushed = 0.0f32;
+    for _ in 0..2 {
+        for off in CAR_CIRCLES {
+            let base = V3::new(np.x + f.x * off, w.height(np.x + f.x * off, np.z + f.z * off) + 0.45, np.z + f.z * off);
+            let mut q = base;
+            w.collide_body(&mut q, CAR_CR, 1.0);
+            for (k, o) in w.cars.iter().enumerate() {
+                if k == s.car as usize || (o[0] - q.x).abs() > 6.0 || (o[2] - q.z).abs() > 6.0 || (o[1] - np.y).abs() > 3.0 {
+                    continue;
+                }
+                let of = fwd(o[3]);
+                for ooff in CAR_CIRCLES {
+                    let (dx, dz) = (q.x - (o[0] + of.x * ooff), q.z - (o[2] + of.z * ooff));
+                    let d2 = dx * dx + dz * dz;
+                    let rr = CAR_CR * 2.0;
+                    if d2 < rr * rr && d2 > 1e-6 {
+                        let dl = d2.sqrt();
+                        q.x += dx / dl * (rr - dl);
+                        q.z += dz / dl * (rr - dl);
+                    }
+                }
+            }
+            let (dx, dz) = (q.x - base.x, q.z - base.z);
+            np.x += dx;
+            np.z += dz;
+            pushed += (dx * dx + dz * dz).sqrt();
+        }
+    }
+    if pushed > 1e-4 {
+        // scraping costs speed; a square hit stops the car
+        v *= (1.0 - pushed * 1.5).clamp(0.0, 1.0);
+    }
+    np.x = clampf(np.x, 4.0, MAP - 4.0);
+    np.z = clampf(np.z, 4.0, MAP - 4.0);
+    np.y = w.height(np.x, np.z);
+    s.pos = np;
+    s.vel = V3::new(f.x * v, 0.0, f.z * v);
+    s.airtime = yaw;
+    s.on_ground = true;
+    s.crouch = false;
+    s.in_water = false;
 }
 
 /// The ray through the crosshair of the over-the-shoulder camera, with its

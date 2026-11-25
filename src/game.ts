@@ -7,7 +7,7 @@ import type { Renderer } from './render/renderer';
 import { Instances, rgba } from './render/instances';
 import { emitCharacter, emitItem, emitPlane, line } from './render/models';
 import {
-  add, clamp, dirFrom, invert, lerp, lerpAngle, lookAt, mul, norm, perspectiveRZ, qIdent, qY, rightOf, scale, sub, transformPoint, wrapAngle, type M4, type V3,
+  add, clamp, dirFrom, invert, lerp, lerpAngle, lookAt, mul, norm, perspectiveRZ, qAxis, qIdent, qMul, qY, rightOf, scale, sub, transformPoint, wrapAngle, type M4, type Q, type V3,
 } from './render/math';
 import * as P from './protocol';
 import type { Transport } from './net';
@@ -73,8 +73,21 @@ interface Pred {
   onGround: boolean;
   crouch: boolean;
   inWater: boolean;
+  /** While driving: the car's heading. */
   airtime: number;
+  /** Index of the car being driven (255 = none). */
+  car: number;
 }
+
+/** A car as the client draws it: two timed samples to interpolate between. */
+interface CarC {
+  a: { x: number; y: number; z: number; yaw: number; t: number };
+  b: { x: number; y: number; z: number; yaw: number; t: number };
+  driver: number;
+}
+const CAR_HW = 0.9;
+const CAR_HL = 2.45;
+const CAR_VMAX = 24;
 
 const DT = 1 / 30;
 type Snap = P.Snapshot & { byId: Map<number, P.RemotePlayer> };
@@ -110,6 +123,15 @@ export class Game {
   private pred: Pred | null = null;
   private predPrev: V3 = [0, 0, 0];
   private smooth: V3 = [0, 0, 0];
+  private cars: CarC[] = [];
+  private myCar = -1;
+  /** Free car within reach (-1 = none) and whether an item is, too. */
+  private nearCar = -1;
+  private nearItem = false;
+  private predPrevYaw = 0;
+  private smoothYaw = 0;
+  private lastLookAt = 0;
+  private carPoses = new Float32Array(0);
   private pending: { cmd: P.CmdQ; shots: number; at: number }[] = [];
   private outbox: P.CmdQ[] = [];
   private seq = 0;
@@ -201,6 +223,7 @@ export class Game {
     this.d.transport.close();
     this.d.sound.loop('plane', 0);
     this.d.sound.loop('wind', 0);
+    this.d.sound.loop('engine', 0);
     this.d.input.enabled = false;
     this.d.input.unlock();
     this.d.touch.releaseAll();
@@ -283,6 +306,13 @@ export class Game {
       cars: core.f32(8),
     });
     this.d.hud.setMap(core.bytes(5), 512);
+    const c0 = core.f32(8);
+    this.cars = [];
+    for (let i = 0; i + 4 <= c0.length; i += 4) {
+      const at = { x: c0[i], y: c0[i + 1], z: c0[i + 2], yaw: c0[i + 3], t: 0 };
+      this.cars.push({ a: at, b: { ...at }, driver: 255 });
+    }
+    this.myCar = -1;
     core.freeMeshes();
     for (const p of w.players) this.players.set(p.id, p);
     for (const it of w.items) this.items.set(it.id, it);
@@ -317,6 +347,7 @@ export class Game {
     }
     for (const e of s.events) this.onEvent(e);
     this.onPhase(s);
+    this.onCars(s);
     this.reconcile(s);
     if (this.slotReq < 0 || performance.now() - this.slotReqAt > 1200 || s.self.cur === this.slotReq) {
       this.displayCur = s.self.cur;
@@ -428,7 +459,7 @@ export class Game {
       case 'kill': {
         const killer = this.nameOf(e.killer);
         const victim = this.nameOf(e.victim);
-        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === 200 ? 'グレネード' : WEAPON_SHORT[e.weapon] ?? '?';
+        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : WEAPON_SHORT[e.weapon] ?? '?';
         const mine = e.killer === this.myId ? 'me' : e.victim === this.myId ? 'victim' : '';
         hud.killfeed(killer, victim, (e.head ? '◎ ' : '') + weapon, mine);
         if (e.killer === this.myId && e.victim !== this.myId) hud.showBanner(`キル！ ${victim}${e.head ? '（ヘッドショット）' : ''}`, 2, 'kill');
@@ -534,7 +565,7 @@ export class Game {
     io[0] = p.pos[0]; io[1] = p.pos[1]; io[2] = p.pos[2];
     io[3] = p.vel[0]; io[4] = p.vel[1]; io[5] = p.vel[2];
     io[6] = p.mode; io[7] = p.onGround ? 1 : 0; io[8] = p.crouch ? 1 : 0; io[9] = p.inWater ? 1 : 0; io[10] = p.airtime; io[11] = mult;
-    io[12] = q.mx; io[13] = q.mz; io[14] = q.yaw; io[15] = q.pitch; io[16] = q.buttons;
+    io[12] = q.mx; io[13] = q.mz; io[14] = q.yaw; io[15] = q.pitch; io[16] = q.buttons; io[18] = p.car;
     this.d.core.predStep();
     const o = this.d.core.pred();
     p.pos = [o[0], o[1], o[2]];
@@ -555,6 +586,60 @@ export class Game {
     }
   }
 
+  /** Car poses from the server: for drawing, and for collisions in the core. */
+  private onCars(s: P.Snapshot) {
+    const core = this.d.core;
+    let mine = -1;
+    for (const c of s.cars) {
+      const k = this.cars[c.id];
+      if (!k) continue;
+      // a car that sat still starts moving from where it stood one snapshot ago
+      k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - (this.welcome?.snapEvery ?? 2) } : k.b;
+      k.b = { x: c.x, y: c.y, z: c.z, yaw: c.yaw, t: s.tick };
+      k.driver = c.driver;
+      if (c.driver === this.myId) mine = c.id;
+      core.setCar(c.id, c.x, c.y, c.z, c.yaw);
+    }
+    const driving = s.self.alive && s.self.mode === P.MODE_DRIVE;
+    this.myCar = driving ? (mine >= 0 ? mine : this.myCar) : -1;
+    // my own car follows my prediction: keep the server's copy of it out of
+    // the way of the camera and of the rays
+    if (this.myCar >= 0) core.setCar(this.myCar, 0, -1000, 0, 0);
+  }
+
+  private carPose(k: number): { x: number; y: number; z: number; yaw: number } {
+    const c = this.cars[k];
+    if (k === this.myCar && this.pred && this.pred.mode === P.MODE_DRIVE) {
+      const p = this.renderPos();
+      const a = clamp(this.cmdAcc / DT, 0, 1);
+      return { x: p[0], y: p[1], z: p[2], yaw: lerpAngle(this.predPrevYaw, this.pred.airtime, a) + this.smoothYaw };
+    }
+    const span = c.b.t - c.a.t;
+    const f = span > 0 ? clamp((this.renderTick - c.a.t) / span, 0, 1) : 1;
+    return { x: lerp(c.a.x, c.b.x, f), y: lerp(c.a.y, c.b.y, f), z: lerp(c.a.z, c.b.z, f), yaw: lerpAngle(c.a.yaw, c.b.yaw, f) };
+  }
+
+  /** The free car a player at `me` could get into, or -1. */
+  private carInReach(me: V3): number {
+    let best = -1;
+    let bd = 1e9;
+    for (let k = 0; k < this.cars.length; k++) {
+      const c = this.cars[k];
+      if (c.driver !== 255) continue;
+      const dx = me[0] - c.b.x, dz = me[2] - c.b.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > 25 || Math.abs(me[1] - c.b.y) > 1.5 || d2 >= bd) continue;
+      const sn = Math.sin(c.b.yaw), cs = Math.cos(c.b.yaw);
+      // into the car's frame (x = right, z = forward), distance to its outline
+      const lx = -dx * cs + dz * sn, lz = dx * sn + dz * cs;
+      const ex = Math.max(0, Math.abs(lx) - CAR_HW), ez = Math.max(0, Math.abs(lz) - CAR_HL);
+      if (Math.hypot(ex, ez) > 1.3) continue;
+      bd = d2;
+      best = k;
+    }
+    return best;
+  }
+
   private reconcile(s: P.Snapshot) {
     const me = s.self;
     const sorted = [...this.rttSamples].sort((x, y) => x - y);
@@ -564,13 +649,14 @@ export class Game {
     // (its debt then says nothing about the network)
     if (me.debt >= 4 && !document.hidden && tnow - this.lastFrame < 150 && tnow - this.lastGapEnd > pathRtt + 600) this.stallSeenAt = tnow;
     this.pending = this.pending.filter((p) => p.cmd.seq > s.ack);
-    const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND);
+    const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND || (me.mode === P.MODE_DRIVE && this.myCar >= 0));
     if (!predictable) {
       this.pred = null;
       return;
     }
     const old = this.pred ? ([...this.pred.pos] as V3) : null;
-    this.pred = { pos: [...me.pos], vel: [...me.vel], mode: me.mode, onGround: me.onGround, crouch: me.crouch, inWater: me.inWater, airtime: me.airtime };
+    const oldYaw = this.pred && this.pred.mode === P.MODE_DRIVE && me.mode === P.MODE_DRIVE ? this.pred.airtime : null;
+    this.pred = { pos: [...me.pos], vel: [...me.vel], mode: me.mode, onGround: me.onGround, crouch: me.crouch, inWater: me.inWater, airtime: me.airtime, car: me.mode === P.MODE_DRIVE ? this.myCar : 255 };
     const mult = this.speedMult(me);
     // The server stood in for late commands with idle steps and drops that many of
     // the oldest when they arrive, so they must not be replayed. Only commands old
@@ -580,6 +666,19 @@ export class Game {
     let skip = 0;
     while (skip < me.debt && skip < this.pending.length && this.pending[skip].at < late) skip++;
     for (let k = skip; k < this.pending.length; k++) this.step(this.pending[k].cmd, mult, false);
+    if (oldYaw !== null) {
+      const dy = wrapAngle(oldYaw - this.pred.airtime);
+      if (Math.abs(dy) < 0.5) {
+        this.smoothYaw += dy;
+        this.predPrevYaw -= dy;
+      } else {
+        this.smoothYaw = 0;
+        this.predPrevYaw = this.pred.airtime;
+      }
+    } else {
+      this.smoothYaw = 0;
+      this.predPrevYaw = this.pred.airtime;
+    }
     if (old) {
       const dlt = sub(old, this.pred.pos);
       if (Math.hypot(dlt[0], dlt[1], dlt[2]) < 3) {
@@ -643,13 +742,24 @@ export class Game {
     if (inp.ads && weapon > 0) b |= P.B_ADS;
     if (inp.crouch) b |= P.B_CROUCH;
     if (inp.sprint && !wantFire && !(b & P.B_ADS)) b |= P.B_SPRINT;
+    const driving = this.pred?.mode === P.MODE_DRIVE;
+    if (driving) {
+      // at the wheel: throttle and steering only, Space is the brake
+      b = inp.keys.has('Space') ? P.B_JUMP : 0;
+      if (e) {
+        e.jump = e.reload = e.nade = false;
+        e.heal = 0;
+        e.slot = -1;
+      }
+    }
     if (e) {
       if (e.jump) {
         b |= P.B_JUMP;
         if (inp.crouch && this.pred?.mode === P.MODE_GROUND) inp.crouch = false;
       }
       if (e.reload) b |= P.B_RELOAD;
-      if (e.pickup) b |= P.B_PICKUP;
+      // one key: leave the car, get into one, or pick up what lies here
+      if (e.pickup) b |= driving || (this.nearCar >= 0 && !this.nearItem) ? P.B_USE : P.B_PICKUP;
       if (e.spect) b |= P.B_SPECT;
       if (e.nade) b |= P.B_NADE;
       let heal = e.heal;
@@ -683,6 +793,7 @@ export class Game {
     this.outbox.push(q);
     if (this.pred) {
       this.predPrev = [...this.pred.pos];
+      this.predPrevYaw = this.pred.airtime;
       this.step(q, this.speedMult(me), true);
     }
   }
@@ -1009,6 +1120,18 @@ export class Game {
       const sens = (this.d.settings.sens * 0.0022 * (zoom > 1 ? this.d.settings.adsSens : 1)) / zoom;
       this.yaw = wrapAngle(this.yaw - lx * sens);
       this.pitch = clamp(this.pitch - ly * sens * (this.d.settings.invertY ? -1 : 1), -1.45, 1.45);
+      if (lx !== 0 || ly !== 0) this.lastLookAt = this.time;
+      // at the wheel the camera swings back behind the car when left alone
+      const p = this.pred;
+      if (p && p.mode === P.MODE_DRIVE && this.time - this.lastLookAt > 1.2) {
+        const v = Math.hypot(p.vel[0], p.vel[2]);
+        if (v > 2) {
+          const fwd = p.vel[0] * Math.sin(p.airtime) + p.vel[2] * Math.cos(p.airtime) >= 0;
+          const k = 1 - Math.exp(-dt * 2.5);
+          this.yaw = wrapAngle(this.yaw + wrapAngle(p.airtime + (fwd ? 0 : Math.PI) - this.yaw) * k);
+          this.pitch += (-0.2 - this.pitch) * k;
+        }
+      }
     }
     // recoil recovery
     if (this.recoil > 0) {
@@ -1044,6 +1167,7 @@ export class Game {
     if (Math.abs(err) > 10) this.renderTick = est;
     else this.renderTick += dt * 30 + err * Math.min(1, dt * 4);
     this.smooth = scale(this.smooth, Math.exp(-dt * 10));
+    this.smoothYaw *= Math.exp(-dt * 10);
     this.shake = Math.max(0, this.shake - dt * 2);
   }
 
@@ -1077,6 +1201,13 @@ export class Game {
         const sideK = hs >= 0 ? Math.max(0, hs - 0.2) : side;
         const sh: V3 = [head[0] + r[0] * sideK, head[1] + 0.28, head[2] + r[2] * sideK];
         return { eye: back(sh, ads ? 1.3 : 2.7), dir: d, vfov, scoped: false, pivot: head };
+      }
+      if (this.pred.mode === P.MODE_DRIVE) {
+        // chase camera: wider with speed
+        const v = Math.hypot(this.pred.vel[0], this.pred.vel[2]);
+        const pivot: V3 = [pos[0], pos[1] + 2.0, pos[2]];
+        const vfov = base * (1 + 0.1 * Math.min(1, v / CAR_VMAX));
+        return { eye: back(pivot, 7.2 + 1.2 * Math.min(1, v / CAR_VMAX)), dir: d, vfov, scoped: false, pivot };
       }
       const pivot: V3 = [pos[0], pos[1] + 1.2, pos[2]];
       return { eye: back(pivot, this.pred.mode === P.MODE_PARA ? 8 : 6.5), dir: d, vfov: base, scoped: false, pivot };
@@ -1113,7 +1244,8 @@ export class Game {
     const tsec = this.time;
     const seen = new Set<number>();
     for (const p of this.interpAll()) {
-      if (p.id === this.myId || p.mode === P.MODE_PLANE) continue;
+      // a driver sits inside the car
+      if (p.id === this.myId || p.mode === P.MODE_PLANE || (p.mode === P.MODE_DRIVE && p.alive)) continue;
       const dx = p.x - eye[0], dz = p.z - eye[2];
       if (dx * dx + dz * dz > 420 * 420) continue;
       seen.add(p.id);
@@ -1127,7 +1259,7 @@ export class Game {
     for (const id of this.anims.keys()) if (!seen.has(id) && id !== this.myId) this.anims.get(id)!.seen += dt;
 
     // ---- me
-    if (this.pred && s.self.alive && !cam.scoped) {
+    if (this.pred && s.self.alive && !cam.scoped && this.pred.mode !== P.MODE_DRIVE) {
       const pos = this.renderPos();
       const a = this.anim(this.myId, pos[0], pos[2], true, dt, this.pred.onGround && !this.pred.inWater && !this.pred.crouch, 0);
       const weapon = this.displayCur < 2 ? s.self.slots[this.displayCur].kind : 0;
@@ -1160,6 +1292,7 @@ export class Game {
       emitPlane(this.boxes, [s.plane.sx + s.plane.dx * t, 330, s.plane.sz + s.plane.dz * t], Math.atan2(s.plane.dx, s.plane.dz), tsec);
     }
     this.updateFx(dt);
+    this.drawCars(eye);
 
     const me = this.myPos();
     const shadowCenter: V3 = this.pred ? this.renderPos() : cam.pivot;
@@ -1215,10 +1348,22 @@ export class Game {
     if (s.self.reloadT > 0 && weapon > 0) hud.setProgress('リロード', 1 - s.self.reloadT / wd[weapon].reload);
     else if (s.self.healT > 0 && s.self.healKind > 0) hud.setProgress('回復中', 1 - s.self.healT / HEAL_TIME[s.self.healKind - 1]);
     else hud.setProgress(null, 0);
-    const pickup = ground && me ? this.nearestPickup(me) : null;
+    const item = ground && me ? this.nearestPickup(me) : null;
+    const driving = alive && this.pred?.mode === P.MODE_DRIVE;
+    this.nearItem = !!item;
+    this.nearCar = ground && me ? this.carInReach(me) : -1;
+    const kmh = driving && this.pred ? Math.round(Math.hypot(this.pred.vel[0], this.pred.vel[2]) * 3.6) : 0;
+    const pickup = driving ? '降りる' : item ?? (this.nearCar >= 0 ? 'パトカーに乗る' : null);
     const touch = matchMedia('(pointer: coarse)').matches;
     const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
-    hud.setPrompt(needLock ? 'クリックしてマウス操作を開始' : pickup && !touch ? `[F] 拾う: ${pickup}` : null);
+    hud.setPrompt(
+      needLock ? 'クリックしてマウス操作を開始'
+        : driving ? (touch ? `${kmh} km/h` : `${kmh} km/h　[F] 降りる　[Space] ブレーキ`)
+        : touch ? null
+        : item ? `[F] 拾う: ${item}`
+        : this.nearCar >= 0 ? '[F] パトカーに乗る' : null,
+    );
+    this.d.sound.loop('engine', driving ? 1 : 0, kmh / (CAR_VMAX * 3.6));
     const spectating = !alive && s.phase === P.PH_PLAY;
     hud.setSpectate(spectating ? (s.self.spect !== 255 ? this.nameOf(s.self.spect) : '—') : null);
     if (me) hud.drawMinimap(me[0], me[2], this.yaw, s.phase === P.PH_PLAY ? s.zone : null, s.phase === P.PH_PLAY ? { ...s.plane, t: this.planeT() } : null, this.markers, this.time, 1024);
@@ -1235,7 +1380,39 @@ export class Game {
       nades: s.self.nades,
       heals: s.self.heals[0] + s.self.heals[1] + s.self.heals[2],
       dead: !alive,
+      driving,
     });
+  }
+
+  /** Hand the renderer where every car is, settled on the ground it stands on. */
+  private drawCars(eye: V3) {
+    const core = this.d.core;
+    const n = this.cars.length;
+    if (this.carPoses.length !== n * 7) this.carPoses = new Float32Array(n * 7);
+    const out = this.carPoses;
+    for (let k = 0; k < n; k++) {
+      const c = this.carPose(k);
+      const o = k * 7;
+      let q: Q = qY(c.yaw);
+      let y = c.y;
+      if ((c.x - eye[0]) ** 2 + (c.z - eye[2]) ** 2 < 260 * 260) {
+        const sn = Math.sin(c.yaw), cs = Math.cos(c.yaw);
+        // heights under the axles and the sides: nose up / down and lean
+        const hf = core.height(c.x + sn * 1.4, c.z + cs * 1.4), hb = core.height(c.x - sn * 1.4, c.z - cs * 1.4);
+        const hl = core.height(c.x + cs * 0.8, c.z - sn * 0.8), hr = core.height(c.x - cs * 0.8, c.z + sn * 0.8);
+        const pitch = clamp(Math.atan2(hf - hb, 2.8), -0.6, 0.6), roll = clamp(Math.atan2(hl - hr, 1.6), -0.5, 0.5);
+        q = qMul(qMul(q, qAxis(1, 0, 0, -pitch)), qAxis(0, 0, 1, roll));
+        y = Math.max(c.y - 0.4, (hf + hb + hl + hr) / 4) + 0.02;
+      }
+      out[o] = c.x;
+      out[o + 1] = y;
+      out[o + 2] = c.z;
+      out[o + 3] = q[0];
+      out[o + 4] = q[1];
+      out[o + 5] = q[2];
+      out[o + 6] = q[3];
+    }
+    this.d.renderer.setCars(out);
   }
 
   private nearestPickup(me: V3): string | null {

@@ -164,6 +164,7 @@ export class Renderer {
   private height = 0;
   private captureReq: ((img: { w: number; h: number; rgba: Uint8Array }) => void) | null = null;
   private carModel: ModelGpu | null = null;
+  /** x, y, z, quaternion per car. */
   private cars: Float32Array = new Float32Array(0);
   private carInst: GPUBuffer | null = null;
   private carData = new Float32Array(0);
@@ -492,7 +493,12 @@ export class Renderer {
     this.pChunks = readChunks(w.propChunks, 8);
     this.mapSize = w.mapSize;
     this.waterLevel = w.waterLevel;
-    this.cars = w.cars ?? new Float32Array(0);
+    // parked poses until the game says where the cars are now
+    const c4 = w.cars ?? new Float32Array(0);
+    this.cars = new Float32Array((c4.length >> 2) * 7);
+    for (let i = 0, o = 0; i + 4 <= c4.length; i += 4, o += 7) {
+      this.cars.set([c4[i], c4[i + 1], c4[i + 2], 0, Math.sin(c4[i + 3] * 0.5), 0, Math.cos(c4[i + 3] * 0.5)], o);
+    }
     this.heightTex?.destroy();
     this.heightTex = d.createTexture({ size: [257, 257], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     d.queue.writeTexture({ texture: this.heightTex }, w.heights.buffer, { offset: w.heights.byteOffset, bytesPerRow: 257 * 4, rowsPerImage: 257 }, [257, 257]);
@@ -579,6 +585,11 @@ export class Renderer {
   }
 
   /** Load the parked-car model (drawn at the world's car spots once it is ready). */
+  /** Where the cars are this frame: x, y, z and a quaternion per car. */
+  setCars(poses: Float32Array) {
+    this.cars = poses;
+  }
+
   async loadCarModel(url: string): Promise<void> {
     const m = await loadGlb(url);
     if (this.lost) return;
@@ -753,18 +764,12 @@ export class Renderer {
     const cam = v.camPos;
     let carCount = 0;
     if (this.carModel && this.cars.length) {
-      if (this.carData.length < (this.cars.length / 4) * 7) this.carData = new Float32Array((this.cars.length / 4) * 7);
-      for (let i = 0; i + 4 <= this.cars.length; i += 4) {
+      if (this.carData.length < this.cars.length) this.carData = new Float32Array(this.cars.length);
+      for (let i = 0; i + 7 <= this.cars.length; i += 7) {
         const dx = this.cars[i] - cam[0], dz = this.cars[i + 2] - cam[2];
         if (dx * dx + dz * dz > 260 * 260) continue;
-        const o = carCount * 7, half = this.cars[i + 3] * 0.5;
-        this.carData[o] = this.cars[i];
-        this.carData[o + 1] = this.cars[i + 1];
-        this.carData[o + 2] = this.cars[i + 2];
-        this.carData[o + 3] = 0;
-        this.carData[o + 4] = Math.sin(half);
-        this.carData[o + 5] = 0;
-        this.carData[o + 6] = Math.cos(half);
+        const o = carCount * 7;
+        for (let j = 0; j < 7; j++) this.carData[o + j] = this.cars[i + j];
         carCount++;
       }
       if (carCount) this.carInst = this.instBuffer('cars', this.carData.buffer as ArrayBuffer, carCount * 28);

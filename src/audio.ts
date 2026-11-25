@@ -209,7 +209,7 @@ export class Sound {
   }
 
   /** Continuous loops: plane engine / freefall wind. level 0 stops. */
-  loop(name: 'plane' | 'wind', level: number) {
+  loop(name: 'plane' | 'wind' | 'engine', level: number, pitch = 0) {
     if (!this.ctx) return;
     const c = this.ctx;
     let l = this.loops[name];
@@ -237,20 +237,20 @@ export class Sound {
       src.buffer = this.noise;
       src.loop = true;
       const filter = c.createBiquadFilter();
-      filter.type = name === 'plane' ? 'lowpass' : 'bandpass';
-      filter.frequency.value = name === 'plane' ? 260 : 800;
+      filter.type = name === 'wind' ? 'bandpass' : 'lowpass';
+      filter.frequency.value = name === 'plane' ? 260 : name === 'engine' ? 180 : 800;
       filter.Q.value = name === 'plane' ? 0.7 : 0.4;
       const gain = c.createGain();
       gain.gain.value = 0;
       src.connect(filter).connect(gain).connect(this.master);
       src.start();
       let osc: OscillatorNode | undefined;
-      if (name === 'plane') {
+      if (name !== 'wind') {
         osc = c.createOscillator();
         osc.type = 'sawtooth';
-        osc.frequency.value = 58;
+        osc.frequency.value = name === 'engine' ? 42 : 58;
         const og = c.createGain();
-        og.gain.value = 0.12;
+        og.gain.value = name === 'engine' ? 0.5 : 0.12;
         const of = c.createBiquadFilter();
         of.type = 'lowpass';
         of.frequency.value = 300;
@@ -259,7 +259,9 @@ export class Sound {
       }
       l = this.loops[name] = { src, gain, filter, osc };
     }
-    l.gain.gain.setTargetAtTime(level * (name === 'plane' ? 0.5 : 0.35), c.currentTime, 0.15);
+    l.gain.gain.setTargetAtTime(level * (name === 'plane' ? 0.5 : name === 'engine' ? 0.3 : 0.35), c.currentTime, 0.15);
+    // engine note: idle to redline with `pitch` 0..1
+    if (name === 'engine' && l.osc) l.osc.frequency.setTargetAtTime(42 + pitch * 110, c.currentTime, 0.08);
     if (name === 'wind' && l.filter) l.filter.frequency.setTargetAtTime(500 + level * 1200, c.currentTime, 0.2);
   }
 }

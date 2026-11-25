@@ -9,6 +9,9 @@ pub const MODE_FALL: u8 = 1;
 pub const MODE_PARA: u8 = 2;
 pub const MODE_GROUND: u8 = 3;
 pub const MODE_DEAD: u8 = 4;
+/// Driving a car: `MoveState.pos`/`vel` are the car's, `airtime` holds its
+/// heading and `car` its index.
+pub const MODE_DRIVE: u8 = 5;
 
 // Command buttons (held state unless noted as edge).
 pub const B_FIRE: u16 = 1 << 0;
@@ -22,7 +25,12 @@ pub const B_SPECT: u16 = 1 << 7; // edge
 // bits 8-9: slot request edge (0 none, 1 = slot A, 2 = slot B, 3 = fists)
 // bits 10-11: heal request edge (0 none, 1 bandage, 2 medkit, 3 drink)
 pub const B_NADE: u16 = 1 << 12; // edge
-pub const B_MASK: u16 = 0x1FFF;
+pub const B_USE: u16 = 1 << 13; // edge: enter / leave a car
+pub const B_MASK: u16 = 0x3FFF;
+
+/// Kill-feed weapon ids that are not guns.
+pub const WK_NADE: u8 = 200;
+pub const WK_CAR: u8 = 201;
 
 pub const W_FISTS: u8 = 0;
 pub const W_PISTOL: u8 = 1;

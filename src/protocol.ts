@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 7;
+export const PROTO = 8;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -18,6 +18,8 @@ export const MODE_FALL = 1;
 export const MODE_PARA = 2;
 export const MODE_GROUND = 3;
 export const MODE_DEAD = 4;
+/** Driving a car: the self state's pos/vel are the car's and airtime is its heading. */
+export const MODE_DRIVE = 5;
 
 export const B_FIRE = 1 << 0;
 export const B_ADS = 1 << 1;
@@ -28,6 +30,10 @@ export const B_RELOAD = 1 << 5;
 export const B_PICKUP = 1 << 6;
 export const B_SPECT = 1 << 7;
 export const B_NADE = 1 << 12;
+export const B_USE = 1 << 13;
+/** Kill-feed weapon ids that are not guns. */
+export const WK_NADE = 200;
+export const WK_CAR = 201;
 
 export const KILLER_ZONE = 255;
 export const ITEM_CHUNKS = 8;
@@ -230,6 +236,8 @@ export interface Snapshot {
   plane: PlaneState;
   players: RemotePlayer[];
   nades: { id: number; x: number; y: number; z: number }[];
+  /** Cars that moved lately (plus a rotating few): driver 255 = empty, 254 = someone unseen. */
+  cars: { id: number; x: number; y: number; z: number; yaw: number; driver: number }[];
   events: GameEvent[];
 }
 
@@ -378,6 +386,9 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
   const nades: Snapshot['nades'] = [];
   const nn = r.u8();
   for (let i = 0; i < nn && !r.bad; i++) nades.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32() });
+  const cars: Snapshot['cars'] = [];
+  const nc = r.u8();
+  for (let i = 0; i < nc && !r.bad; i++) cars.push({ id: r.u8(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, driver: r.u8() });
   const events: GameEvent[] = [];
   const ne = r.u16();
   for (let i = 0; i < ne && !r.bad; i++) {
@@ -447,7 +458,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
     }
   }
   if (r.bad) return null;
-  return { tick, ack, phase, phaseT, alive, total, winner, self, zone, plane, players, nades, events };
+  return { tick, ack, phase, phaseT, alive, total, winner, self, zone, plane, players, nades, cars, events };
 }
 
 export interface CmdQ {
@@ -466,7 +477,7 @@ export function quantizeCmd(seq: number, view: number, mx: number, mz: number, y
   t -= Math.floor(t);
   const yq = Math.floor(t * 65536) & 0xffff;
   const pq = Math.trunc((Math.max(-1.5, Math.min(1.5, pitch)) * 32767) / 1.5);
-  return { seq: seq >>> 0, view: view >>> 0, mx: q8(mx), mz: q8(mz), yaw: yq, pitch: pq, buttons: buttons & 0x1fff };
+  return { seq: seq >>> 0, view: view >>> 0, mx: q8(mx), mz: q8(mz), yaw: yq, pitch: pq, buttons: buttons & 0x3fff };
 }
 
 export function encodeInputs(cmds: CmdQ[]): Uint8Array<ArrayBuffer> {

@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 7;
+pub const PROTO: u16 = 8;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -34,7 +34,7 @@ const BACKLOG_T: u8 = 30;
 pub const REWIND_MAX: f32 = 15.0;
 const REWIND_MARGIN: f32 = 4.0;
 /// Buttons that act on a single command (carried over when one is dropped).
-const EDGE_BUTTONS: u16 = B_JUMP | B_RELOAD | B_PICKUP | B_SPECT | B_NADE | B_FIRE;
+const EDGE_BUTTONS: u16 = B_JUMP | B_RELOAD | B_PICKUP | B_SPECT | B_NADE | B_FIRE | B_USE;
 /// ADS with at least this zoom is a first-person scope.
 pub const SCOPE_ZOOM: f32 = 3.5;
 
@@ -276,6 +276,8 @@ pub struct Player {
     pub last_cmd: Cmd,
     /// Buttons of the previous simulated command (press-edge detection).
     pub prev_buttons: u16,
+    /// Tick a car last ran this player over.
+    pub ram_tick: u32,
     pub pick_cd: f32,
     pub spect_cd: f32,
     pub spect: u8,
@@ -448,6 +450,11 @@ pub struct Match {
     item_actor: u8,
     /// Alive count at the start of the current tick (shared placement).
     pub alive_start: usize,
+    /// Cars: who drives each (255 = nobody), the tick each last moved, and
+    /// where they are parked at the start of a match. Poses are in `w.cars`.
+    pub car_driver: Vec<u8>,
+    car_moved: Vec<u32>,
+    car0: Vec<[f32; 4]>,
 }
 
 impl Match {
@@ -464,6 +471,8 @@ impl Match {
     pub fn with_secrets(seed: u32, slots: usize, flags: u32, secret: u64, combat: u64) -> Match {
         let w = World::generate(seed);
         let slots = slots.clamp(2, MAX_PLAYERS);
+        let ncar = w.cars.len();
+        let car0 = w.cars.clone();
         let mut m = Match {
             w,
             rng: Rng::new(secret ^ (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5EED),
@@ -503,6 +512,9 @@ impl Match {
             ilog_n: 0,
             item_actor: 255,
             alive_start: 0,
+            car_driver: vec![255; ncar],
+            car_moved: vec![0; ncar],
+            car0,
         };
         m.spawn_loot();
         m.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, nx: MAP * 0.5, nz: MAP * 0.5, nr: 780.0, timer: ZONES[0].wait, ..Default::default() };
@@ -718,7 +730,8 @@ impl Match {
             self.ev_pinfo(i, true);
             self.players[i] = Player::default();
         } else {
-            // AI takes over the abandoned character.
+            // AI takes over the abandoned character (bots do not drive).
+            self.exit_car(i);
             let seed = self.rng.u32();
             let pl = self.plane;
             let p = &mut self.players[i];
@@ -806,6 +819,11 @@ impl Match {
             exit = half + 100.0;
         }
         self.plane = Plane { sx, sz, dx, dz, t: (enter - 260.0).max(0.0), enter_t: enter, exit_t: exit, active: true };
+        self.w.cars = self.car0.clone();
+        for k in 0..self.car_driver.len() {
+            self.car_driver[k] = 255;
+            self.car_moved[k] = self.tick;
+        }
         self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
         self.pick_next_zone();
         let ppos = self.plane.pos();
@@ -900,7 +918,7 @@ impl Match {
         let prev = self.players[i].prev_buttons;
         // Humans get one action per press: holding a button must not repeat it.
         let pressed = |b: u16| c.has(b) && (!human || prev & b == 0);
-        let (pick, spect) = (pressed(B_PICKUP), pressed(B_SPECT));
+        let (pick, spect, use_) = (pressed(B_PICKUP), pressed(B_SPECT), pressed(B_USE));
         {
             let p = &mut self.players[i];
             p.prev_buttons = c.buttons;
@@ -920,10 +938,18 @@ impl Match {
             }
             return;
         }
+        if mode == MODE_DRIVE && use_ && car_speed(&self.players[i].ms).abs() < 9.0 {
+            self.exit_car(i);
+            return;
+        }
         let mult = self.players[i].speed_mult();
         let w = &self.w;
         let p = &mut self.players[i];
         let ev = step_move(w, &mut p.ms, &c, mult, DT);
+        if mode == MODE_DRIVE {
+            self.car_moved_by(i);
+            return;
+        }
         if ev & EV_LANDED != 0 && mode != MODE_GROUND {
             let pos = p.ms.pos;
             let start = self.ev_begin();
@@ -967,6 +993,9 @@ impl Match {
                 p.reload_t = 0.0;
             }
         }
+        if use_ && self.enter_car(i) {
+            return;
+        }
         if pick && self.players[i].pick_cd <= 0.0 {
             self.manual_pickup(i);
         }
@@ -1003,6 +1032,139 @@ impl Match {
                         Self::start_reload(&mut self.players[i]);
                     }
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cars
+    // ------------------------------------------------------------------
+    /// Get into the nearest free car within reach.
+    fn enter_car(&mut self, i: usize) -> bool {
+        let pos = self.players[i].ms.pos;
+        let mut best: Option<(usize, f32)> = None;
+        for k in 0..self.w.cars.len() {
+            if self.car_driver[k] != 255 {
+                continue;
+            }
+            let c = self.w.cars[k];
+            if (pos.y - c[1]).abs() > 1.6 {
+                continue;
+            }
+            // distance to the body: how far a 1.5 m circle overlaps it
+            let mut q = pos;
+            if !self.w.push_car(k, &mut q, 1.5) {
+                continue;
+            }
+            // not through a wall
+            if self.w.blocked_static(pos + V3::new(0.0, 1.0, 0.0), V3::new(c[0], c[1] + 1.0, c[2])) {
+                continue;
+            }
+            let d = dist_xz(pos.x, pos.z, c[0], c[2]);
+            if best.map_or(true, |b| d < b.1) {
+                best = Some((k, d));
+            }
+        }
+        let Some((k, _)) = best else { return false };
+        let c = self.w.cars[k];
+        self.car_driver[k] = i as u8;
+        self.car_moved[k] = self.tick;
+        let p = &mut self.players[i];
+        p.ms = MoveState { pos: V3::new(c[0], c[1], c[2]), mode: MODE_DRIVE, on_ground: true, airtime: c[3], car: k as u8, ..Default::default() };
+        p.ads = false;
+        p.reload_t = 0.0;
+        p.heal_t = 0.0;
+        p.firing_t = 0.0;
+        true
+    }
+
+    /// The car `i` drives, if any.
+    fn car_of(&self, i: usize) -> Option<usize> {
+        let p = &self.players[i];
+        let k = p.ms.car as usize;
+        (p.ms.mode == MODE_DRIVE && k < self.car_driver.len() && self.car_driver[k] == i as u8).then_some(k)
+    }
+
+    /// Step out beside the car (which stops where it is).
+    fn exit_car(&mut self, i: usize) {
+        let Some(k) = self.car_of(i) else {
+            if self.players[i].ms.mode == MODE_DRIVE {
+                self.players[i].ms.mode = MODE_GROUND;
+            }
+            return;
+        };
+        self.car_driver[k] = 255;
+        self.car_moved[k] = self.tick;
+        let c = self.w.cars[k];
+        let (f, r) = (fwd(c[3]), right(c[3]));
+        // driver's side first, then the other side, the back and the front
+        // (never through a wall the car is parked against; with every side
+        // walled in, out of the middle of the car)
+        let mid = V3::new(c[0], c[1] + 1.0, c[2]);
+        let mut out = V3::new(c[0], c[1], c[2]);
+        let mut least = f32::MAX;
+        for (sx, sz) in [(-1.55, 0.0), (1.55, 0.0), (0.0, -3.1), (0.0, 3.1)] {
+            let (x, z) = (c[0] + r.x * sx + f.x * sz, c[2] + r.z * sx + f.z * sz);
+            let y = self.w.ground_below(x, z, c[1] + 1.0, P_RADIUS);
+            if (y - c[1]).abs() > 1.2 {
+                continue;
+            }
+            let at = V3::new(x, y, z);
+            if self.w.blocked_static(mid, at + V3::new(0.0, 1.0, 0.0)) {
+                continue;
+            }
+            let mut q = at;
+            self.w.collide_body(&mut q, P_RADIUS, 1.8);
+            self.w.push_cars(&mut q, P_RADIUS, usize::MAX);
+            let moved = (q - at).len();
+            if moved < least {
+                least = moved;
+                out = q;
+            }
+            if moved < 0.01 {
+                break;
+            }
+        }
+        let p = &mut self.players[i];
+        p.ms = MoveState { pos: out, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+        p.switch_t = p.switch_t.max(0.35);
+    }
+
+    /// After the driver's step: move the car with them and run people over.
+    fn car_moved_by(&mut self, i: usize) {
+        let Some(k) = self.car_of(i) else {
+            self.exit_car(i);
+            return;
+        };
+        let tick = self.tick;
+        let ms = self.players[i].ms;
+        let now = [ms.pos.x, ms.pos.y, ms.pos.z, ms.airtime];
+        if self.w.cars[k] != now {
+            self.w.cars[k] = now;
+            self.car_moved[k] = tick;
+        }
+        let v = car_speed(&ms);
+        for j in 0..MAX_PLAYERS {
+            let q = &self.players[j];
+            if j == i || !q.used || !q.alive || q.ms.mode != MODE_GROUND {
+                continue;
+            }
+            let mut at = q.ms.pos;
+            if !self.w.push_car(k, &mut at, P_RADIUS) {
+                continue;
+            }
+            let hgt = body_h(q.ms.crouch);
+            self.w.collide_body(&mut at, P_RADIUS, hgt);
+            let q = &mut self.players[j];
+            q.ms.pos.x = at.x;
+            q.ms.pos.z = at.z;
+            if v.abs() > 4.0 && tick.wrapping_sub(q.ram_tick) > 24 {
+                q.ram_tick = tick;
+                let dmg = 12.0 + (v.abs() - 4.0) * 5.0;
+                self.damage(j, i as u8, dmg, false, WK_CAR, ms.pos);
+                // the hit costs the car some speed
+                let p = &mut self.players[i];
+                p.ms.vel = p.ms.vel * 0.85;
             }
         }
     }
@@ -1127,7 +1289,7 @@ impl Match {
                 continue;
             }
             let q = &self.players[j];
-            if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_DRIVE {
                 continue;
             }
             let h = if self.players[shooter].bot { HistE::of(q) } else {
@@ -1224,6 +1386,16 @@ impl Match {
                     end = eye + dd * h.0;
                     victim = None;
                     hit_kind = 3;
+                }
+            }
+            if victim.is_none() && hit_kind == 3 && wh.map_or(false, |h| h.2 == BK_CAR) && (end - alt).len2() < 0.01 {
+                // the bodywork takes some of a bullet that hits an occupied car
+                if let Some((_, _, k)) = self.w.ray_cars(o, d, tw + 0.05) {
+                    let dr = self.car_driver[k] as usize;
+                    if dr < MAX_PLAYERS && dr != i {
+                        let fall = if tw <= def.f0 { 1.0 } else if tw >= def.f1 { def.fmin } else { lerpf(1.0, def.fmin, (tw - def.f0) / (def.f1 - def.f0)) };
+                        self.damage(dr, i as u8, def.dmg * fall * 0.55, false, wk, self.players[i].ms.pos);
+                    }
                 }
             }
             if let Some((j, dist, head)) = victim {
@@ -1385,7 +1557,9 @@ impl Match {
             if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
                 continue;
             }
-            let c = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+            // a driver is reached over the roof, and shielded a little
+            let driving = q.ms.mode == MODE_DRIVE;
+            let c = q.ms.pos + V3::new(0.0, if driving { 1.75 } else { 0.9 }, 0.0);
             let d = (c - n.pos).len();
             if d > radius {
                 continue;
@@ -1394,7 +1568,7 @@ impl Match {
                 continue;
             }
             let k = 1.0 - d / radius;
-            let dmg = 115.0 * k.powf(1.4);
+            let dmg = 115.0 * k.powf(1.4) * if driving { 0.7 } else { 1.0 };
             if dmg > 1.0 {
                 self.damage(j, n.owner, dmg, false, 200, n.pos);
             }
@@ -1410,7 +1584,7 @@ impl Match {
         let mut armor_hit = false;
         {
             let q = &mut self.players[j];
-            if attacker != KILLER_ZONE && weapon != 200 {
+            if attacker != KILLER_ZONE && weapon != WK_NADE {
                 if head && q.helm > 0 {
                     let red = ARMOR_RED[q.helm as usize];
                     dmg *= 1.0 - red;
@@ -1479,6 +1653,13 @@ impl Match {
             q.place = place;
             q.killer = attacker;
             q.death_tick = tick;
+            if q.ms.mode == MODE_DRIVE {
+                let k = q.ms.car as usize;
+                if k < self.car_driver.len() && self.car_driver[k] == j as u8 {
+                    self.car_driver[k] = 255;
+                    self.car_moved[k] = tick;
+                }
+            }
             q.ms.mode = MODE_DEAD;
             q.ms.vel = V3::ZERO;
             q.reload_t = 0.0;
@@ -2315,8 +2496,10 @@ impl Match {
             let pv = &self.players[i];
             // re-check each pair every other snapshot round, staggered by target
             if pv.vis_check[j] == 0 || (pv.snap_round.wrapping_add(j as u32)) % 2 == 0 {
-                let head = q.ms.pos + V3::new(0.0, eye_h(q.ms.crouch) + 0.1, 0.0);
-                let chest = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+                // a driver is seen through the roof line of the car
+                let lift = if q.ms.mode == MODE_DRIVE { 0.75 } else { 0.0 };
+                let head = q.ms.pos + V3::new(0.0, eye_h(q.ms.crouch) + 0.1 + lift, 0.0);
+                let chest = q.ms.pos + V3::new(0.0, 0.9 + lift, 0.0);
                 let visible = !self.w.blocked(ceye, head) || !self.w.blocked(ceye, chest);
                 let pv = &mut self.players[i];
                 pv.vis_check[j] = tick;
@@ -2389,6 +2572,34 @@ impl Match {
             w.f32(pos.y);
             w.f32(pos.z);
         }
+        // ---- cars: the ones that moved lately (or are driven), and the
+        // rest a few at a time so every client converges on the same poses
+        let ncar = self.w.cars.len().min(255);
+        let round = (tick / self.snap_every.max(1)) as usize;
+        let cpos = w.len();
+        w.u8(0);
+        let mut ccount = 0u8;
+        for k in 0..ncar {
+            let c = self.w.cars[k];
+            let dr = self.car_driver[k];
+            let fresh = dr != 255 || tick.wrapping_sub(self.car_moved[k]) < 45;
+            if !(fresh || (k + round) % 16 == 0) {
+                continue;
+            }
+            if dr as usize != i && dist_xz(c[0], c[2], center.x, center.z) > INTEREST {
+                continue;
+            }
+            w.u8(k as u8);
+            w.f32(c[0]);
+            w.f32(c[1]);
+            w.f32(c[2]);
+            w.u16(q_yaw(c[3]));
+            // a driver this viewer is not sent stays anonymous
+            w.u8(if dr as usize == i { dr } else if (dr as usize) < MAX_PLAYERS && send[dr as usize] { dr } else if dr != 255 { 254 } else { 255 });
+            ccount += 1;
+        }
+        self.out[cpos] = ccount;
+        let mut w = Wr::new(&mut self.out);
         // ---- events
         let cpos = w.len();
         w.u16(0);

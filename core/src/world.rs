@@ -22,6 +22,10 @@ pub const BK_CONTAINER: u8 = 4;
 pub const BK_CONCRETE: u8 = 5;
 /// A parked car (drawn from a model by the client; two collision boxes).
 pub const BK_CAR: u8 = 6;
+/// Car half width, half length and height (m).
+pub const CAR_HW: f32 = 0.9;
+pub const CAR_HL: f32 = 2.45;
+pub const CAR_H: f32 = 1.45;
 
 pub const CK_TREE: u8 = 0;
 pub const CK_ROCK: u8 = 1;
@@ -373,12 +377,8 @@ impl World {
                 }
                 let y = hi;
                 let yaw = quarter as f32 * (TAU / 4.0);
-                // body up to the bonnet, then the cabin (set back a little)
-                w.boxes.push(Bx { min: V3::new(x - hx, lo - 0.2, z - hz), max: V3::new(x + hx, y + 0.98, z + hz), kind: BK_CAR, col: 0x1B1E22 });
-                let (f, cab) = (fwd(yaw), 1.25);
-                let (cx, cz) = (x - f.x * 0.25, z - f.z * 0.25);
-                let (chx, chz) = if quarter % 2 == 0 { (0.8, cab) } else { (cab, 0.8) };
-                w.boxes.push(Bx { min: V3::new(cx - chx, y + 0.98, cz - chz), max: V3::new(cx + chx, y + 1.45, cz + chz), kind: BK_CAR, col: 0x1B1E22 });
+                // cars are dynamic (drivable): they collide through `cars`, not as boxes
+                let _ = lo;
                 w.cars.push([x, y, z, yaw]);
                 placed += 1;
             }
@@ -1108,13 +1108,121 @@ impl World {
 
     /// First hit along a normalized ray: (distance, normal, kind).
     pub fn raycast(&self, o: V3, d: V3, maxt: f32) -> Option<(f32, V3, u8)> {
-        let obj = self.ray_objects(o, d, maxt);
+        self.raycast_opt(o, d, maxt, true)
+    }
+
+    /// True if something other than a car obstructs the segment a->b.
+    pub fn blocked_static(&self, a: V3, b: V3) -> bool {
+        let dv = b - a;
+        let l = dv.len();
+        l > 1e-4 && self.raycast_opt(a, dv * (1.0 / l), l - 0.05, false).is_some()
+    }
+
+    fn raycast_opt(&self, o: V3, d: V3, maxt: f32, cars: bool) -> Option<(f32, V3, u8)> {
+        let mut obj = self.ray_objects(o, d, maxt);
+        if cars {
+            if let Some((t, n, _)) = self.ray_cars(o, d, obj.map_or(maxt, |h| h.0)) {
+                obj = Some((t, n, BK_CAR));
+            }
+        }
         let lim = obj.map_or(maxt, |h| h.0);
         if let Some(t) = self.ray_terrain(o, d, lim) {
             let p = o + d * t;
             return Some((t, self.normal(p.x, p.z), HIT_TERRAIN));
         }
         obj
+    }
+
+    /// First car hit along a normalized ray: (distance, normal, car index).
+    pub fn ray_cars(&self, o: V3, d: V3, maxt: f32) -> Option<(f32, V3, usize)> {
+        let mut best: Option<(f32, V3, usize)> = None;
+        let mut lim = maxt;
+        for (k, c) in self.cars.iter().enumerate() {
+            // quick reject: closest approach of the ray to the car centre
+            let rel = V3::new(c[0] - o.x, c[1] + 0.7 - o.y, c[2] - o.z);
+            let along = rel.dot(d);
+            if along < -3.0 || along > lim + 3.0 {
+                continue;
+            }
+            if (rel - d * along).len2() > 9.0 {
+                continue;
+            }
+            // into the car's frame: x = right, z = forward
+            let (f, r) = (fwd(c[3]), right(c[3]));
+            let lo = V3::new(-(rel.x * r.x + rel.z * r.z), -rel.y + 0.7, -(rel.x * f.x + rel.z * f.z));
+            let ld = V3::new(d.x * r.x + d.z * r.z, d.y, d.x * f.x + d.z * f.z);
+            for (mn, mx) in [
+                (V3::new(-CAR_HW, -0.2, -CAR_HL), V3::new(CAR_HW, 0.98, CAR_HL)),
+                (V3::new(-0.8, 0.98, -1.5), V3::new(0.8, CAR_H, 1.0)),
+            ] {
+                if let Some((t, ax)) = ray_aabb(lo, ld, mn, mx, lim) {
+                    if t < lim {
+                        lim = t;
+                        let n = match ax {
+                            0 => r * -ld.x.signum(),
+                            1 => V3::new(0.0, -ld.y.signum(), 0.0),
+                            _ => f * -ld.z.signum(),
+                        };
+                        best = Some((t, n, k));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Push a standing body (circle of radius `r` at `p`) out of the cars.
+    /// `skip` is a car index to ignore (usize::MAX for none).
+    pub fn push_cars(&self, p: &mut V3, r: f32, skip: usize) -> bool {
+        let mut hit = false;
+        for k in 0..self.cars.len() {
+            if k != skip {
+                hit |= self.push_car(k, p, r);
+            }
+        }
+        hit
+    }
+
+    /// Push a body out of car `k`. True if it was touching.
+    pub fn push_car(&self, k: usize, p: &mut V3, r: f32) -> bool {
+        let mut hit = false;
+        if let Some(c) = self.cars.get(k) {
+            let (dx, dz) = (p.x - c[0], p.z - c[2]);
+            if dx * dx + dz * dz > 16.0 || p.y > c[1] + CAR_H || p.y + 1.2 < c[1] {
+                return false;
+            }
+            let (f, rt) = (fwd(c[3]), right(c[3]));
+            let (lx, lz) = (dx * rt.x + dz * rt.z, dx * f.x + dz * f.z);
+            let (qx, qz) = (clampf(lx, -CAR_HW, CAR_HW), clampf(lz, -CAR_HL, CAR_HL));
+            let (ex, ez) = (lx - qx, lz - qz);
+            let d2 = ex * ex + ez * ez;
+            if d2 >= r * r {
+                return false;
+            }
+            let (nx, nz, push);
+            if d2 > 1e-8 {
+                let dl = d2.sqrt();
+                nx = ex / dl;
+                nz = ez / dl;
+                push = r - dl;
+            } else {
+                // centre inside the car: leave through the nearest side
+                let (px, pz) = (CAR_HW - lx.abs(), CAR_HL - lz.abs());
+                if px < pz {
+                    nx = if lx >= 0.0 { 1.0 } else { -1.0 };
+                    nz = 0.0;
+                    push = px + r;
+                } else {
+                    nx = 0.0;
+                    nz = if lz >= 0.0 { 1.0 } else { -1.0 };
+                    push = pz + r;
+                }
+            }
+            p.x += (rt.x * nx + f.x * nz) * push;
+            p.z += (rt.z * nx + f.z * nz) * push;
+            hit = true;
+        }
+        hit
     }
 
     /// True if the segment a->b is obstructed.

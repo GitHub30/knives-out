@@ -287,6 +287,17 @@ pub extern "C" fn cli_building_at(x: f32, z: f32) -> i32 {
     client().and_then(|c| c.world.building_at(x, z)).map_or(-1, |k| k as i32)
 }
 
+/// Where car `k` is now (cars move: the server sends their poses).
+#[no_mangle]
+pub extern "C" fn cli_set_car(k: u32, x: f32, y: f32, z: f32, yaw: f32) {
+    let Some(c) = client() else { return };
+    if let Some(car) = c.world.cars.get_mut(k as usize) {
+        if x.is_finite() && y.is_finite() && z.is_finite() && yaw.is_finite() {
+            *car = [x, y, z, yaw];
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cli_pred_ptr() -> *mut f32 {
     client().map_or(std::ptr::null_mut(), |c| c.pred.as_mut_ptr())
@@ -294,7 +305,8 @@ pub extern "C" fn cli_pred_ptr() -> *mut f32 {
 
 /// Prediction IO layout (f32):
 ///  0-2 pos, 3-5 vel, 6 mode, 7 on_ground, 8 crouch, 9 in_water, 10 airtime, 11 speed_mult,
-///  12 mx_q, 13 mz_q, 14 yaw_q, 15 pitch_q, 16 buttons, 17 out events
+///  12 mx_q, 13 mz_q, 14 yaw_q, 15 pitch_q, 16 buttons, 17 out events, 18 car index
+/// While driving (mode 5) pos/vel are the car's and airtime is its heading.
 #[no_mangle]
 pub extern "C" fn cli_pred_step() {
     let Some(c) = client() else { return };
@@ -307,6 +319,7 @@ pub extern "C" fn cli_pred_step() {
         crouch: p[8] != 0.0,
         in_water: p[9] != 0.0,
         airtime: p[10],
+        car: if p[18] >= 0.0 && p[18] < 255.0 { p[18] as u8 } else { 255 },
     };
     if !s.pos.finite() || !s.vel.finite() {
         return;

@@ -106,18 +106,18 @@ export class TouchControls {
   }
 
   /** Context-dependent appearance. */
-  setState(s: { plane: boolean; air: boolean; canJumpPlane: boolean; pickup: string | null; ads: boolean; crouch: boolean; nades: number; heals: number; dead: boolean }) {
+  setState(s: { plane: boolean; air: boolean; canJumpPlane: boolean; pickup: string | null; ads: boolean; crouch: boolean; nades: number; heals: number; dead: boolean; driving?: boolean }) {
     const jump = this.btns.get('jump')!;
     jump.classList.toggle('big', s.plane || s.air);
     jump.dataset.label = s.plane ? (s.canJumpPlane ? '降下' : '待機') : s.air ? '開傘' : '';
     jump.classList.toggle('disabled', s.plane && !s.canJumpPlane);
-    const combat = !s.plane && !s.air && !s.dead;
+    const combat = !s.plane && !s.air && !s.dead && !s.driving;
     for (const id of ['fire', 'fireL', 'ads', 'crouch', 'reload'] as TouchButton[]) this.btns.get(id)!.style.display = combat ? '' : 'none';
     this.btns.get('nade')!.style.display = combat && s.nades > 0 ? '' : 'none';
     this.btns.get('heal')!.style.display = combat && s.heals > 0 ? '' : 'none';
-    this.btns.get('jump')!.style.display = s.dead ? 'none' : '';
+    this.btns.get('jump')!.style.display = s.dead || s.driving ? 'none' : '';
     const pick = this.btns.get('pickup')!;
-    pick.style.display = s.pickup && combat ? '' : 'none';
+    pick.style.display = s.pickup && (combat || s.driving) ? '' : 'none';
     const label = pick.querySelector('.tb-label');
     if (label && label.textContent !== (s.pickup ?? '')) label.textContent = s.pickup ?? '';
     this.btns.get('ads')!.classList.toggle('on', s.ads);

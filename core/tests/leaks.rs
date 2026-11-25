@@ -94,6 +94,9 @@ fn parse(buf: &[u8]) -> Snap {
         r.u16();
         nades.push(V3::new(r.f32(), r.f32(), r.f32()));
     }
+    // cars: id, pose, driver
+    let nc = r.u8() as usize;
+    r.skip(nc * 16);
     let ne = r.u16() as usize;
     let mut events = vec![];
     for _ in 0..ne {
