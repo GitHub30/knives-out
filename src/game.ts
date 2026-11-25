@@ -345,6 +345,7 @@ export class Game {
       cars: core.f32(8),
       carKinds: core.bytes(9),
       grass: core.bytes(11),
+      trees: core.f32(12),
     });
     this.d.hud.setMap(core.bytes(5), 512);
     this.glassPanes = core.f32(10);

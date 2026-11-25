@@ -7,6 +7,7 @@ import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMu
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
 import { loadGlb, type GltfModel } from './gltf';
+import { TreeRenderer } from './trees';
 
 export interface Quality {
   shadowSize: number; // 0 disables shadows
@@ -42,6 +43,8 @@ export interface WorldMeshes {
   carKinds?: Uint8Array;
   /** Where grass grows: 1024 x 1024 bytes, one per square metre. */
   grass?: Uint8Array;
+  /** Trees: x, y, z, height, radius, kind (0 conifer), seed, - per tree. */
+  trees?: Float32Array;
 }
 
 export interface FrameView {
@@ -212,6 +215,7 @@ export class Renderer {
   private depthTex: GPUTexture | null = null;
   private bglDepth!: GPUBindGroupLayout;
   private bglGrass!: GPUBindGroupLayout;
+  private trees: TreeRenderer | null = null;
   private bgGrass: GPUBindGroup | null = null;
   private grassTex: GPUTexture | null = null;
   private bgDepth: GPUBindGroup | null = null;
@@ -635,6 +639,10 @@ export class Renderer {
     this.heightTex = d.createTexture({ size: [257, 257], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     d.queue.writeTexture({ texture: this.heightTex }, w.heights.buffer, { offset: w.heights.byteOffset, bytesPerRow: 257 * 4, rowsPerImage: 257 }, [257, 257]);
     this.bgWater = d.createBindGroup({ layout: this.bglWater, entries: [{ binding: 0, resource: this.heightTex.createView() }] });
+    if (w.trees) {
+      this.trees ??= new TreeRenderer(d, { bglMain: this.bglMain, bglShadow: this.bglShadow, format: HDR });
+      this.trees.setTrees(w.trees);
+    }
     this.grassTex?.destroy();
     this.grassTex = null;
     this.bgGrass = null;
@@ -979,6 +987,9 @@ export class Renderer {
       this.fanInst = this.instBuffer('fans', this.fanPose.buffer as ArrayBuffer, 64);
     }
     this.planePose = null;
+    // trees: sorted into runs by kind and distance for this frame
+    const treeLod: [number, number] = this.quality.grass >= 2 ? [36, 105] : this.quality.grass === 1 ? [26, 80] : [18, 60];
+    this.trees?.prepare(cam, frustumPlanes(v.viewProj), treeLod, this.quality.drawDist);
     const enc = d.createCommandEncoder();
 
     // ---------------- shadow passes (near and far cascade)
@@ -1006,6 +1017,7 @@ export class Renderer {
           sp.setVertexBuffer(1, b);
           sp.draw(mesh.count, v.boxes.lists[s].count);
         }
+        this.trees?.drawShadow(sp, k);
         for (const c of carDraws) {
           sp.setPipeline(this.pipes.modelShadow);
           sp.setVertexBuffer(0, c.m.vb);
@@ -1052,6 +1064,11 @@ export class Renderer {
         tris += c.count / 3;
         draws++;
       }
+    }
+    if (this.trees) {
+      this.trees.draw(pass);
+      tris += this.trees.tris;
+      draws += 12;
     }
     // grass around the camera (from the air there is nothing to see of it)
     if (this.bgGrass && this.quality.grass > 0 && cam[1] < 140) {

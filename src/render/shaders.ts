@@ -2,7 +2,7 @@
 // ambient, two shadow cascades, height fog) into a float target; a post pass
 // adds bloom, tonemaps (ACES), anti-aliases (FXAA) and grades.
 
-const FRAME = /* wgsl */ `
+export const FRAME = /* wgsl */ `
 struct Frame {
   viewProj: mat4x4f,
   lightVP0: mat4x4f,   // near shadow cascade (the cascade being drawn, in shadow passes)
@@ -61,7 +61,7 @@ fn qrot(q: vec4f, v: vec3f) -> vec3f {
 }
 `;
 
-const COMMON = /* wgsl */ `
+export const COMMON = /* wgsl */ `
 ${FRAME}
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var shadowMap: texture_depth_2d_array;

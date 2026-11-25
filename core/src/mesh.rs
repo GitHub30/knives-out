@@ -161,6 +161,7 @@ impl Soup {
         self.vert(c.0, pack_n(c.1), col);
     }
     /// Smooth tapered trunk / pole.
+    #[allow(dead_code)]
     fn trunk(&mut self, x: f32, z: f32, y0: f32, y1: f32, r0: f32, r1: f32, sides: usize, lean: (f32, f32), col: u32) {
         for k in 0..sides {
             let (a0, a1) = (k as f32 * TAU / sides as f32, (k + 1) as f32 * TAU / sides as f32);
@@ -175,6 +176,7 @@ impl Soup {
         }
     }
     /// Smooth cone skirt (a pine bough layer), drooping at the rim.
+    #[allow(dead_code)]
     fn skirt(&mut self, x: f32, z: f32, y0: f32, y1: f32, r: f32, sides: usize, rot: f32, seed: u32, col: u32, col_in: u32) {
         let mut rng = Rng::new(seed as u64 | 1);
         let apex = V3::new(x, y1, z);
@@ -429,43 +431,7 @@ pub fn build(w: &World) -> Meshes {
             s.tri(at(ae, p0, r.y), at(ae, p1, r.y), at(ae, pm, r.y + r.rise), c, wall);
         }
     }
-    for t in &w.trees {
-        s.select(t.x, t.z);
-        let mut r = Rng::new(t.seed as u64);
-        let trunk = pack_c(rgb(0x4A3A2A), MAT_BARK);
-        let rot = r.range(0.0, TAU);
-        if t.kind == 0 {
-            // pine: a straight trunk under layered, drooping boughs
-            let top = t.y + t.h;
-            s.trunk(t.x, t.z, t.y - 0.4, t.y + t.h * 0.8, 0.3, 0.07, 8, (0.0, 0.0), trunk);
-            let base = [0x24482A, 0x2B5530, 0x213F28, 0x315A33];
-            let ci = r.below(4) as usize;
-            let c1 = pack_c(rgb(base[ci]), MAT_LEAF);
-            let c2 = pack_c(shade(rgb(base[ci]), 0.55), MAT_LEAF);
-            let layers = 5;
-            for k in 0..layers {
-                let f = k as f32 / layers as f32;
-                let y0 = t.y + t.h * (0.2 + f * 0.62);
-                let y1 = if k == layers - 1 { top } else { y0 + t.h * 0.3 };
-                let rr = t.r * (1.0 - f * 0.78);
-                s.skirt(t.x, t.z, y0, y1, rr, 9, rot + k as f32 * 0.7, t.seed ^ (k as u32 * 977), c1, c2);
-            }
-        } else {
-            let lean = (r.range(-0.4, 0.4), r.range(-0.4, 0.4));
-            s.trunk(t.x, t.z, t.y - 0.4, t.y + t.h * 0.6, 0.42, 0.2, 8, lean, trunk);
-            let palettes: [[u32; 3]; 4] = [[0x3F7A2E, 0x4C8A36, 0x356627], [0x58893A, 0x669940, 0x4A7730], [0xB07E2C, 0xC28C33, 0x966A26], [0x7A9238, 0x889F40, 0x687E2E]];
-            let pal = palettes[if r.chance(0.07) { 2 } else { [0usize, 1, 3][r.below(3) as usize] }];
-            let cols = [pack_c(rgb(pal[0]), MAT_LEAF), pack_c(rgb(pal[1]), MAT_LEAF), pack_c(rgb(pal[2]), MAT_LEAF)];
-            let c = V3::new(t.x + lean.0, t.y + t.h * 0.7, t.z + lean.1);
-            s.lump(c, t.r * 1.2, t.r * 0.95, t.r * 1.2, t.seed, 0.16, 1, &cols, false);
-            for k in 0..2u32 {
-                let a = rot + k as f32 * 2.4 + r.range(-0.4, 0.4);
-                let off = V3::new(a.cos() * t.r * 0.8, r.range(-0.4, 0.35) * t.r, a.sin() * t.r * 0.8);
-                let q = r.range(0.7, 0.95);
-                s.lump(c + off, t.r * q, t.r * q * 0.8, t.r * q, t.seed ^ (k + 3) * 7919, 0.18, 1, &cols, false);
-            }
-        }
-    }
+    // (trees are not part of this mesh: the client grows them from the tree list)
     for rk in &w.rocks {
         s.select(rk.x, rk.z);
         let g = [0x7F7D77, 0x74726D, 0x8A867D, 0x6A6965];
