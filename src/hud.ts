@@ -88,6 +88,7 @@ export class Hud {
   private impactText!: HTMLElement;
   private noiseEls: HTMLDivElement[] = [];
   mapOpen = false;
+  onMapOpen: () => void = () => {};
   onSlot: (s: number) => void = () => {};
   onHeal: (k: number) => void = () => {};
   onSpectNext: () => void = () => {};
@@ -117,6 +118,12 @@ export class Hud {
     el('div', 'compass-needle', this.compass);
 
     const mm = el('div', 'minimap', root);
+    // tapping the minimap opens the full map
+    mm.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.onMapOpen();
+    });
     this.mini = el('canvas', '', mm);
     this.mini.width = 200;
     this.mini.height = 200;

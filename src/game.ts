@@ -925,7 +925,8 @@ export class Game {
     if (!p || p.mode !== P.MODE_FLY) return null;
     const pos = this.renderPos();
     const off = clamp(wrapAngle(this.yaw - p.airtime), -1.05, 1.05);
-    const d = dirFrom(p.airtime + off, clamp(this.pitch, -1.3, 0.6));
+    // (as the server does: flatter than a downward look, so they land ahead of the nose)
+    const d = dirFrom(p.airtime + off, this.pitch < 0 ? Math.max(this.pitch * 0.72, -0.9) : Math.min(this.pitch, 0.6));
     const mid: V3 = [pos[0], pos[1] + 2, pos[2]];
     const reach = 380;
     const t = this.d.core.ray(mid, d, reach);

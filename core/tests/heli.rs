@@ -380,7 +380,10 @@ fn missile_hits_what_it_is_aimed_at() {
     let p = m.players[a as usize].ms;
     assert!(p.pos.y - o.y > 8.0 && p.vel.len() < 0.01);
     let mid = p.pos + V3::new(0.0, 2.0, 0.0);
-    let pitch = (t.y - mid.y).atan2(t.x - mid.x);
+    // (a pilot looks further down than the missiles go: see missile_pitch)
+    let want = (t.y - mid.y).atan2(t.x - mid.x);
+    let pitch = if want < 0.0 { want / 0.72 } else { want };
+    assert!((missile_pitch(pitch) - want).abs() < 1e-4);
     // not while only looking
     pad.go(&mut m, a, 0, 0, EAST, pitch, 0);
     assert!(m.missiles.is_empty());
@@ -396,7 +399,7 @@ fn missile_hits_what_it_is_aimed_at() {
     assert_eq!(wr.missiles.len(), 1);
     assert_eq!(wr.missiles[0].0, ms.id);
     assert!((wr.missiles[0].1 - ms.pos).len() < 1e-3);
-    assert!(wrap_angle(wr.missiles[0].2 - EAST).abs() < 0.1 && (wr.missiles[0].3 - pitch).abs() < 0.1, "direction on the wire {} {}", wr.missiles[0].2, wr.missiles[0].3);
+    assert!(wrap_angle(wr.missiles[0].2 - EAST).abs() < 0.1 && (wr.missiles[0].3 - want).abs() < 0.1, "direction on the wire {} {}", wr.missiles[0].2, wr.missiles[0].3);
     m.flush();
     let mut last = ms.pos;
     let mut flew = 0;
@@ -448,7 +451,8 @@ fn missile_hits_what_it_is_aimed_at() {
     }
     let mid = m.players[a as usize].ms.pos + V3::new(0.0, 2.0, 0.0);
     let c = m.w.cars[0];
-    let pitch = (c[1] + 0.8 - mid.y).atan2(c[0] - mid.x);
+    let want = (c[1] + 0.8 - mid.y).atan2(c[0] - mid.x);
+    let pitch = if want < 0.0 { want / 0.72 } else { want };
     pad.go(&mut m, a, 0, 0, EAST, pitch, B_FIRE);
     for _ in 0..40 {
         pad.go(&mut m, a, 0, 0, EAST, pitch, 0);
@@ -678,7 +682,7 @@ fn a_pilot_who_disconnects_bails_out_and_the_helicopter_comes_down() {
 
 #[test]
 fn snapshot_carries_helicopters() {
-    assert_eq!(PROTO, 16);
+    assert_eq!(PROTO, 17);
     let (mut m, ids, o) = stage(42, 3);
     let (a, b) = (ids[0], ids[1]);
     // b watches from the far end of the open run, the third from the far corner

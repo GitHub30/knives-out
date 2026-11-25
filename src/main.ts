@@ -442,6 +442,7 @@ async function boot() {
   hud.onHeal = (k) => (input.edges.heal = k);
   hud.onSpectNext = () => (input.edges.spect = true);
   hud.onLeave = () => quitToMenu();
+  hud.onMapOpen = () => (input.edges.map = true);
   hud.onMapClose = () => (input.edges.map = true);
   touch.onButton = () => sound.unlock();
   window.addEventListener('resize', () => renderer.resize());

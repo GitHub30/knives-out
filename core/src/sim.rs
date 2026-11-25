@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 16;
+pub const PROTO: u16 = 17;
 /// A car catches fire below this share of its bodywork, and then explodes
 /// after the fuse (5 s) whatever happens.
 pub const CAR_FIRE_AT: f32 = 0.19;
@@ -39,6 +39,12 @@ pub const HELI_SHOVE_MIN: f32 = 2.5;
 pub const HELI_AMMO: u8 = 200;
 pub const MISSILE_CD: f32 = 0.1;
 pub const MISSILE_SPEED: f32 = 95.0;
+/// The pitch the missiles leave at for a pilot looking along `pitch`: flatter
+/// than a downward look, so they land ahead of the nose where the pilot
+/// (watching from above and behind) can see them.
+pub fn missile_pitch(pitch: f32) -> f32 {
+    if pitch < 0.0 { (pitch * 0.72).max(-0.9) } else { pitch.min(0.6) }
+}
 pub const MISSILE_LIFE: u32 = 120;
 /// A missile's blast: radius, damage to a player / a vehicle at its centre.
 pub const MISSILE_R: f32 = 9.5;
@@ -2355,7 +2361,7 @@ impl Match {
         let p = &self.players[i];
         // only ahead: within 60 degrees of the nose, and not straight up
         let off = clampf(wrap_angle(p.yaw - c[3]), -1.05, 1.05);
-        let d = dir_from(c[3] + off, clampf(p.pitch, -1.3, 0.6));
+        let d = dir_from(c[3] + off, missile_pitch(p.pitch));
         let (f, r) = (fwd(c[3]), right(c[3]));
         let pos = V3::new(c[0], c[1], c[2]);
         let side = if h.side { 1.0 } else { -1.0 };

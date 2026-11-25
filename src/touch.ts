@@ -75,7 +75,6 @@ export class TouchControls {
     mk('nade', ICONS.nade, 'グレネード');
     mk('heal', ICONS.heal, '回復');
     mk('pickup', '', '拾う');
-    mk('map', ICONS.map, 'マップ');
     mk('menu', ICONS.menu, 'メニュー');
 
     root.addEventListener('pointerdown', (e) => this.down(e));
