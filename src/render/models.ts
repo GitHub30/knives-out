@@ -351,8 +351,8 @@ export function emitItem(I: Instances, glow: Instances, kind: number, x: number,
 }
 
 /** The transport: the airliner model once it has loaded, simple shapes until then. */
-export function drawPlane(r: { hasPlaneModel: boolean; setPlane(p: ArrayLike<number>, yaw: number, roll?: number): void }, I: Instances, p: V3, yaw: number, t: number, roll = 0) {
-  if (r.hasPlaneModel) r.setPlane(p, yaw, roll);
+export function drawPlane(r: { hasPlaneModel: boolean; setPlane(p: ArrayLike<number>, yaw: number, roll?: number, time?: number): void }, I: Instances, p: V3, yaw: number, t: number, roll = 0) {
+  if (r.hasPlaneModel) r.setPlane(p, yaw, roll, t);
   else emitPlane(I, p, yaw, t);
 }
 

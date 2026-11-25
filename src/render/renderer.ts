@@ -3,7 +3,7 @@
 // bloom + tonemap + FXAA into the swap chain.
 
 import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
-import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, type M4, type V3 } from './math';
+import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
 import { loadGlb, type GltfModel } from './gltf';
@@ -104,6 +104,10 @@ function cylinderVerts(seg: number): Float32Array {
   return new Float32Array(out);
 }
 
+/** Engine axes at the intake lips in the airliner's frame, and the fan speed (rad/s). */
+const FAN_AXES: V3[] = [[9.75, -3.0, 11.0], [-9.75, -3.0, 11.0]];
+const FAN_SPEED = 9;
+
 interface ModelGpu {
   vb: GPUBuffer;
   ib: GPUBuffer;
@@ -171,6 +175,9 @@ export class Renderer {
   private planeModel: ModelGpu | null = null;
   private planePose: Float32Array | null = null;
   private planeInst: GPUBuffer | null = null;
+  private fanModel: ModelGpu | null = null;
+  private fanPose = new Float32Array(14);
+  private fanInst: GPUBuffer | null = null;
   // dynamic resolution
   private dyn = 1;
   private lastT = 0;
@@ -593,20 +600,26 @@ export class Renderer {
     this.cars = poses;
   }
 
-  /** Load the airliner (the transport everyone jumps from). */
-  async loadPlaneModel(url: string): Promise<void> {
-    const m = await loadGlb(url);
+  /** Load the airliner (the transport everyone jumps from) and its engine fans. */
+  async loadPlaneModel(url: string, fanUrl: string): Promise<void> {
+    const [m, f] = await Promise.all([loadGlb(url), loadGlb(fanUrl)]);
     if (this.lost) return;
+    this.fanModel = this.uploadModel(f);
     this.planeModel = this.uploadModel(m);
   }
   get hasPlaneModel() {
     return !!this.planeModel;
   }
-  /** Draw the airliner in the next frame: nose along fwd(yaw), banked by `roll`. */
-  setPlane(p: ArrayLike<number>, yaw: number, roll = 0) {
-    const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2), cr = Math.cos(roll / 2), sr = Math.sin(roll / 2);
-    // yaw about Y, then roll about the plane's own Z
-    this.planePose = new Float32Array([p[0], p[1], p[2], sy * sr, sy * cr, cy * sr, cy * cr]);
+  /** Draw the airliner in the next frame: nose along fwd(yaw), banked by `roll`, fans turning with `time`. */
+  setPlane(p: ArrayLike<number>, yaw: number, roll = 0, time = 0) {
+    const q = qMul(qAxis(0, 1, 0, yaw), qAxis(0, 0, 1, roll));
+    this.planePose = new Float32Array([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
+    // the fans sit on the engine axes (see scripts/build-b777.py) and spin about them
+    FAN_AXES.forEach((at, k) => {
+      const o = qRot(q, at);
+      const fq = qMul(q, qAxis(0, 0, 1, -time * FAN_SPEED));
+      this.fanPose.set([p[0] + o[0], p[1] + o[1], p[2] + o[2], fq[0], fq[1], fq[2], fq[3]], k * 7);
+    });
   }
 
   async loadCarModel(url: string): Promise<void> {
@@ -794,7 +807,10 @@ export class Renderer {
       if (carCount) this.carInst = this.instBuffer('cars', this.carData.buffer as ArrayBuffer, carCount * 28);
     }
     const planeOn = !!(this.planeModel && this.planePose);
-    if (planeOn) this.planeInst = this.instBuffer('plane', this.planePose!.buffer as ArrayBuffer, 28);
+    if (planeOn) {
+      this.planeInst = this.instBuffer('plane', this.planePose!.buffer as ArrayBuffer, 28);
+      this.fanInst = this.instBuffer('fans', this.fanPose.buffer as ArrayBuffer, 56);
+    }
     this.planePose = null;
     const enc = d.createCommandEncoder();
 
@@ -874,6 +890,7 @@ export class Renderer {
     const models: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
     if (car) models.push({ m: car, inst: this.carInst!, n: carCount });
     if (planeOn && this.planeInst) models.push({ m: this.planeModel!, inst: this.planeInst, n: 1 });
+    if (planeOn && this.fanModel && this.fanInst) models.push({ m: this.fanModel, inst: this.fanInst, n: 2 });
     for (const { m, inst, n } of models) {
       pass.setPipeline(this.pipes.model);
       pass.setVertexBuffer(0, m.vb);

@@ -27,28 +27,51 @@ GLASS = (18, 24, 32)
 
 
 # ------------------------------------------------------------------ fuselage shape
+def pchip(pts):
+    """Monotone cubic through (x, y) points: no overshoot between them."""
+    p = np.asarray(pts, float)
+    x, y = p[:, 0], p[:, 1]
+    h, d = np.diff(x), np.diff(y) / np.diff(x)
+    m = np.zeros(len(x))
+    m[0], m[-1] = d[0], d[-1]
+    for k in range(1, len(x) - 1):
+        if d[k - 1] * d[k] > 0:
+            w1, w2 = 2 * h[k] + h[k - 1], h[k] + 2 * h[k - 1]
+            m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k])
+
+    def f(q):
+        q = np.asarray(q, float)
+        i = np.clip(np.searchsorted(x, q) - 1, 0, len(x) - 2)
+        t = np.clip((q - x[i]) / h[i], 0, 1)
+        h00, h10, h01, h11 = 2 * t ** 3 - 3 * t ** 2 + 1, t ** 3 - 2 * t ** 2 + t, -2 * t ** 3 + 3 * t ** 2, t ** 3 - t ** 2
+        return h00 * y[i] + h10 * h[i] * m[i] + h01 * y[i + 1] + h11 * h[i] * m[i + 1]
+    return f
+
+
+# The nose, from the side view: a blunt radome whose upper line runs straight
+# into the windshield (no step), reaching the full section about 10 m back.
+NOSE_TIP_Y = -0.62
+_nose_top = pchip([(0, NOSE_TIP_Y), (0.05, -0.3), (0.25, 0.02), (0.7, 0.4), (1.4, 0.8), (2.3, 1.2), (3.0, 1.75), (3.6, 2.15), (4.5, 2.56), (5.5, 2.82), (7.0, 2.99), (8.6, 3.085), (10.2, R)])
+_nose_bot = pchip([(0, NOSE_TIP_Y), (0.05, -0.96), (0.25, -1.32), (0.7, -1.74), (1.4, -2.14), (2.3, -2.5), (3.5, -2.82), (5.0, -3.01), (6.2, -3.085), (7.2, -R)])
+_nose_hw = pchip([(0, 0.0), (0.05, 0.33), (0.25, 0.7), (0.7, 1.1), (1.4, 1.5), (2.3, 1.86), (3.5, 2.32), (5.0, 2.76), (6.5, 3.0), (8.2, R)])
+
+
 def fus_top(s):
     s = np.asarray(s, float)
-    t = np.clip(s / 8.8, 0, 1)
-    nose = -0.75 + (R + 0.75) * (1 - (1 - t) ** 2.0) ** 0.6
     tail = R - 0.55 * np.clip((s - 56.0) / (L - 56.0), 0, 1) ** 1.3
-    return np.where(s < 8.8, nose, tail)
+    return np.where(s < 10.2, _nose_top(s), tail)
 
 
 def fus_bot(s):
     s = np.asarray(s, float)
-    t = np.clip(s / 6.2, 0, 1)
-    nose = -0.75 - (R - 0.75) * (1 - (1 - t) ** 2.0) ** 0.5
     tail = -R + 4.75 * np.clip((s - 45.5) / (L - 45.5), 0, 1) ** 1.55
-    return np.where(s < 6.2, nose, tail)
+    return np.where(s < 7.2, _nose_bot(s), tail)
 
 
 def fus_half_width(s):
     s = np.asarray(s, float)
-    t = np.clip(s / 7.8, 0, 1)
-    nose = R * (1 - (1 - t) ** 2.0) ** 0.54
     tail = R * (1 - np.clip((s - 49.0) / (L - 49.0), 0, 1) ** 1.45) + 0.1
-    return np.minimum(np.where(s < 7.8, nose, R), tail)
+    return np.minimum(np.where(s < 8.2, _nose_hw(s), R), tail)
 
 
 def fus_point(s, th):
@@ -270,20 +293,25 @@ def fuselage_texture(W=4096, H=1024, ss=2):
             (cx, cy) = px(a, yy, side)
             d.ellipse([cx - 3 * ss, cy - 3 * ss, cx + 3 * ss, cy + 3 * ss], fill=(120, 124, 130))
 
-    # cockpit glazing: (station, degrees from the belly) per pane, left side
+    # cockpit glazing, as in the side view: the sills run level about 0.7 m
+    # above the axis, the windshield climbs the nose line to the centre post
+    # and the last side pane is cut back at its upper rear corner.
+    # Corners are (station, height); None = on the centre line.
     panes = [
-        [(2.42, 179.3), (3.9, 179.3), (4.08, 152.0), (2.75, 147.5)],
-        [(2.8, 145.5), (4.12, 150.0), (4.6, 131.0), (3.62, 124.5)],
-        [(3.7, 122.8), (4.66, 129.2), (5.52, 127.0), (5.08, 119.0)],
+        [(2.34, None), (3.46, None), (3.98, 1.74), (3.0, 0.78)],
+        [(3.08, 0.76), (4.06, 1.72), (4.72, 1.72), (4.3, 0.74)],
+        [(4.38, 0.74), (4.8, 1.72), (5.2, 1.6), (5.74, 1.1), (5.6, 0.74)],
     ]
     for side in (1, -1):
         for pane in panes:
             poly = []
-            for (a, deg) in pane:
-                thv = math.radians(deg) if side > 0 else 2 * math.pi - math.radians(deg)
-                poly.append((a / L * w, thv / (2 * math.pi) * h))
+            for (a, yy) in pane:
+                if yy is None:
+                    poly.append((a / L * w, (0.5 - 0.0045 * side) * h))
+                else:
+                    poly.append(px(a, yy, side))
             d.polygon(poly, fill=GLASS)
-            d.line(poly + [poly[0]], fill=(96, 100, 108), width=ss * 2, joint='curve')
+            d.line(poly + [poly[0]], fill=(104, 108, 116), width=ss * 3, joint='curve')
 
     def paste(text_img, s_mid, y_mid, height_m, side):
         """Stick an upright, outside-view image on a side of the fuselage."""
@@ -387,14 +415,16 @@ def fin_texture(N=1024):
     im = Image.new('RGB', (n, n), WHITE)
     d = ImageDraw.Draw(im)
     s0, s1, y0, y1 = FIN_BOX
-    cx, cy, r = (64.75 - s0) / (s1 - s0) * n, (1 - (7.55 - y0) / (y1 - y0)) * n, 1.92
-    rx, ry = r / (s1 - s0) * n, r / (y1 - y0) * n
-    d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=RED)
-    # rudder hinge line and its split
+    # rudder hinge line and its split, under the roundel
     def p(sv, yv):
         return ((sv - s0) / (s1 - s0) * n, (1 - (yv - y0) / (y1 - y0)) * n)
     d.line([p(64.3, 2.7), p(69.3, 12.1)], fill=(205, 208, 213), width=ss * 2)
     d.line([p(66.2, 6.6), p(68.9, 6.6)], fill=(205, 208, 213), width=ss * 2)
+    # the roundel: about two thirds of the chord across, a little below
+    # mid-height and close to the leading edge
+    cx, cy = p(65.0, 6.6)
+    rx, ry = 1.95 / (s1 - s0) * n, 1.95 / (y1 - y0) * n
+    d.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=RED)
     return im.resize((N, N), Image.LANCZOS)
 
 
@@ -501,13 +531,6 @@ def build():
         duct = revolve([(0.34, 1.52), (0.9, 1.55), (1.25, 1.6)], c, seg=56)
         M['dark'].add(*grid(*duct, outward=None))
         M['dark'].idx[-1] = M['dark'].idx[-1][:, ::-1]  # seen from the inside
-        # the fan disc and the spinner
-        thf = np.linspace(0, 2 * math.pi, 57)
-        rr = np.array([0.0, 0.48, 1.6])[:, None]
-        zz = np.array([0.55, 1.15, 1.22])[:, None]
-        fan = np.stack([ex + rr * np.cos(thf), cy + rr * np.sin(thf), zc - zz + 0 * thf], -1)
-        fuv = np.stack([0.5 + 0.5 * rr / 1.6 * np.cos(thf) * side, 0.5 - 0.5 * rr / 1.6 * np.sin(thf)], -1)
-        M['fan'].add(*grid(fan, fuv, outward=(0, 0, 1)))
         # fan nozzle lip, core cowl, turbine nozzle and plug
         M['dark'].add(*grid(*revolve([(5.75, 1.6), (5.72, 1.5), (5.2, 1.42)], c, seg=56), outward=None))
         M['white'].add(*grid(*revolve([(5.0, 1.36), (5.6, 1.3), (6.3, 1.12), (7.0, 0.9), (7.45, 0.78)], c, seg=48)))
@@ -523,6 +546,21 @@ def build():
     return {k: m.done() for k, m in M.items() if m.n}
 
 
+FAN_AT = (9.75, -3.0, ORIGIN_S - 24.0)  # engine axis at the intake lip (left engine)
+
+
+def build_fan():
+    """The fan and spinner on their own, about the Z axis, so the game can spin them."""
+    m = Mesh()
+    thf = np.linspace(0, 2 * math.pi, 73)
+    rr = np.array([0.0, 0.14, 0.3, 0.48, 1.6])[:, None]
+    zz = np.array([0.5, 0.6, 0.82, 1.15, 1.22])[:, None]
+    fan = np.stack([rr * np.cos(thf), rr * np.sin(thf), -zz + 0 * thf], -1)
+    fuv = np.stack([0.5 + 0.5 * rr / 1.6 * np.cos(thf), 0.5 - 0.5 * rr / 1.6 * np.sin(thf)], -1)
+    m.add(*grid(fan, fuv, outward=(0, 0, 1)))
+    return {'fan': m.done()}
+
+
 def png(im):
     b = io.BytesIO()
     im.save(b, 'PNG', optimize=True)
@@ -535,23 +573,30 @@ def jpg(im, q=90):
     return b.getvalue()
 
 
+MATS = {
+    'fuselage': dict(color=(0.86, 0.86, 0.86), rough=0.3, metal=0.0),
+    'wingtop': dict(color=(0.84, 0.84, 0.84), rough=0.42, metal=0.1),
+    'grey': dict(color=(0.6, 0.62, 0.65), rough=0.42, metal=0.1),
+    'fin': dict(color=(0.86, 0.86, 0.86), rough=0.3, metal=0.0),
+    'white': dict(color=(0.81, 0.815, 0.825), rough=0.3, metal=0.0),
+    'chrome': dict(color=(0.86, 0.87, 0.89), rough=0.16, metal=1.0),
+    'fan': dict(rough=0.45, metal=0.5),
+    'dark': dict(color=(0.03, 0.032, 0.036), rough=0.6, metal=0.2),
+    'hot': dict(color=(0.3, 0.27, 0.24), rough=0.38, metal=1.0),
+    'red_l': dict(color=(0.6, 0.02, 0.02), rough=0.3, metal=0.0, emissive=(6.0, 0.15, 0.1)),
+    'green_l': dict(color=(0.02, 0.5, 0.1), rough=0.3, metal=0.0, emissive=(0.1, 5.0, 0.6)),
+    'white_l': dict(color=(0.9, 0.9, 0.9), rough=0.3, metal=0.0, emissive=(5.0, 5.0, 5.0)),
+}
+
+
 def main(out):
-    meshes = build()
-    textures = {'fuselage': jpg(fuselage_texture()), 'wingtop': jpg(wing_texture(), 88), 'fin': jpg(fin_texture(), 88), 'fan': jpg(fan_texture(), 88)}
-    mats = {
-        'fuselage': dict(color=(0.86, 0.86, 0.86), rough=0.3, metal=0.0),
-        'wingtop': dict(color=(0.84, 0.84, 0.84), rough=0.42, metal=0.1),
-        'grey': dict(color=(0.6, 0.62, 0.65), rough=0.42, metal=0.1),
-        'fin': dict(color=(0.86, 0.86, 0.86), rough=0.3, metal=0.0),
-        'white': dict(color=(0.81, 0.815, 0.825), rough=0.3, metal=0.0),
-        'chrome': dict(color=(0.86, 0.87, 0.89), rough=0.16, metal=1.0),
-        'fan': dict(rough=0.45, metal=0.5),
-        'dark': dict(color=(0.03, 0.032, 0.036), rough=0.6, metal=0.2),
-        'hot': dict(color=(0.3, 0.27, 0.24), rough=0.38, metal=1.0),
-        'red_l': dict(color=(0.6, 0.02, 0.02), rough=0.3, metal=0.0, emissive=(6.0, 0.15, 0.1)),
-        'green_l': dict(color=(0.02, 0.5, 0.1), rough=0.3, metal=0.0, emissive=(0.1, 5.0, 0.6)),
-        'white_l': dict(color=(0.9, 0.9, 0.9), rough=0.3, metal=0.0, emissive=(5.0, 5.0, 5.0)),
-    }
+    write(out, build(), {'fuselage': jpg(fuselage_texture()), 'wingtop': jpg(wing_texture(), 88), 'fin': jpg(fin_texture(), 88)})
+    write(out.replace('.glb', '_fan.glb'), build_fan(), {'fan': jpg(fan_texture(), 88)})
+    print('fan axis (left engine):', FAN_AT)
+
+
+def write(out, meshes, textures):
+    mats = MATS
     bin_ = bytearray()
     views, accessors, images, texs, materials, prims = [], [], [], [], [], []
 

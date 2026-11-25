@@ -3,6 +3,7 @@ import { Core, coreModule } from './core';
 import { Renderer, QUALITY_PRESETS, type Quality } from './render/renderer';
 import carModelUrl from './assets/police_crown_osaka_game.glb?url';
 import planeModelUrl from './assets/b777_300er.glb?url';
+import planeFanUrl from './assets/b777_300er_fan.glb?url';
 import g1Url from './assets/unitree_g1.bin?url';
 import { setG1Shapes } from './render/models';
 import { add, dirFrom, invert, lookAt, mul, perspectiveRZ, type V3 } from './render/math';
@@ -386,7 +387,7 @@ async function boot() {
       .catch((e) => console.warn('G1 model:', e));
     // the parked cars appear once their model has loaded
     renderer.loadCarModel(new URL(carModelUrl, document.baseURI).href).catch((e) => console.warn('car model:', e));
-    renderer.loadPlaneModel(new URL(planeModelUrl, document.baseURI).href).catch((e) => console.warn('plane model:', e));
+    renderer.loadPlaneModel(new URL(planeModelUrl, document.baseURI).href, new URL(planeFanUrl, document.baseURI).href).catch((e) => console.warn('plane model:', e));
   } catch (e) {
     show('nogpu', true);
     show('menu', false);
