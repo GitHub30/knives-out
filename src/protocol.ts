@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 9;
+export const PROTO = 10;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -35,6 +35,7 @@ export const B_USE = 1 << 13;
 export const WK_NADE = 200;
 export const WK_CAR = 201;
 export const WK_TRUCK = 202;
+export const WK_BOOM = 203;
 
 export const KILLER_ZONE = 255;
 export const ITEM_CHUNKS = 8;
@@ -238,7 +239,8 @@ export interface Snapshot {
   players: RemotePlayer[];
   nades: { id: number; x: number; y: number; z: number }[];
   /** Cars that moved lately (plus a rotating few): driver 255 = empty, 254 = someone unseen. */
-  cars: { id: number; x: number; y: number; z: number; yaw: number; driver: number }[];
+  /** hp: bodywork left in 255ths, 0 = a burnt-out wreck. */
+  cars: { id: number; x: number; y: number; z: number; yaw: number; driver: number; hp: number }[];
   events: GameEvent[];
 }
 
@@ -389,7 +391,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
   for (let i = 0; i < nn && !r.bad; i++) nades.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32() });
   const cars: Snapshot['cars'] = [];
   const nc = r.u8();
-  for (let i = 0; i < nc && !r.bad; i++) cars.push({ id: r.u8(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, driver: r.u8() });
+  for (let i = 0; i < nc && !r.bad; i++) cars.push({ id: r.u8(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, driver: r.u8(), hp: r.u8() });
   const events: GameEvent[] = [];
   const ne = r.u16();
   for (let i = 0; i < ne && !r.bad; i++) {

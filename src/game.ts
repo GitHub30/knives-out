@@ -3,7 +3,7 @@
 // everyone else, and renders/plays the result.
 
 import type { Core } from './core';
-import type { Renderer } from './render/renderer';
+import { CAR_STRIDE, type Renderer } from './render/renderer';
 import { Instances, rgba } from './render/instances';
 import { drawPlane, emitCharacter, emitItem, line } from './render/models';
 import {
@@ -86,14 +86,40 @@ interface CarC {
   driver: number;
   /** 0 police car, 1 fire truck. */
   kind: number;
+  /** Bodywork left in 255ths (0 = wreck) and when it blew up (-1 = intact). */
+  hp: number;
+  deadAt: number;
+  /** Drawn state: wheel roll and steering angles, the pose of the last frame. */
+  spin: number;
+  steer: number;
+  px: number;
+  pz: number;
+  pyaw: number;
+  speed: number;
+  /** Distance since the last tyre mark, the rear wheel spots it ended at, time to the next smoke puff. */
+  trackAcc: number;
+  trackAt: (V3 | null)[];
+  smokeT: number;
+}
+
+/** A stretch of tyre mark on the ground. */
+interface Track {
+  p: V3;
+  q: Q;
+  len: number;
+  w: number;
+  a: number;
+  t: number;
 }
 /** Half width, half length, top speed (m/s) and name per vehicle kind. */
 const CAR_KINDS = [
-  { hw: 0.9, hl: 2.45, vmax: 24, name: 'パトカー' },
-  { hw: 1.25, hl: 3.05, vmax: 18, name: '消防車' },
+  { hw: 0.9, hl: 2.45, vmax: 24, name: 'パトカー', wheelR: 0.334, base: 2.92, rear: 1.37, track: 0.77, tyre: 0.24, h: 1.45 },
+  { hw: 1.25, hl: 3.05, vmax: 18, name: '消防車', wheelR: 0.385, base: 2.82, rear: 1.22, track: 0.7, tyre: 0.5, h: 3.0 },
 ];
 
 const DT = 1 / 30;
+/** Seconds a tyre mark stays on the ground. */
+const TRACK_LIFE = 50;
 type Snap = P.Snapshot & { byId: Map<number, P.RemotePlayer> };
 const HEAL_TIME = [3, 6, 2];
 const EYE = (c: boolean) => (c ? 1.12 : 1.62);
@@ -136,6 +162,7 @@ export class Game {
   private smoothYaw = 0;
   private lastLookAt = 0;
   private carPoses = new Float32Array(0);
+  private tracks: Track[] = [];
   private pending: { cmd: P.CmdQ; shots: number; at: number }[] = [];
   private outbox: P.CmdQ[] = [];
   private seq = 0;
@@ -316,9 +343,13 @@ export class Game {
     this.cars = [];
     for (let i = 0; i + 4 <= c0.length; i += 4) {
       const at = { x: c0[i], y: c0[i + 1], z: c0[i + 2], yaw: c0[i + 3], t: 0 };
-      this.cars.push({ a: at, b: { ...at }, driver: 255, kind: Math.min(kinds[i >> 2] ?? 0, CAR_KINDS.length - 1) });
+      this.cars.push({
+        a: at, b: { ...at }, driver: 255, kind: Math.min(kinds[i >> 2] ?? 0, CAR_KINDS.length - 1), hp: 255, deadAt: -1,
+        spin: 0, steer: 0, px: at.x, pz: at.z, pyaw: at.yaw, speed: 0, trackAcc: 0, trackAt: [null, null], smokeT: 0,
+      });
     }
     this.myCar = -1;
+    this.tracks = [];
     core.freeMeshes();
     for (const p of w.players) this.players.set(p.id, p);
     for (const it of w.items) this.items.set(it.id, it);
@@ -465,7 +496,7 @@ export class Game {
       case 'kill': {
         const killer = this.nameOf(e.killer);
         const victim = this.nameOf(e.victim);
-        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : e.weapon === P.WK_TRUCK ? '消防車' : WEAPON_SHORT[e.weapon] ?? '?';
+        const weapon = e.killer === P.KILLER_ZONE ? '圏外' : e.weapon === P.WK_NADE ? 'グレネード' : e.weapon === P.WK_CAR ? 'パトカー' : e.weapon === P.WK_TRUCK ? '消防車' : e.weapon === P.WK_BOOM ? '車両爆発' : WEAPON_SHORT[e.weapon] ?? '?';
         const mine = e.killer === this.myId ? 'me' : e.victim === this.myId ? 'victim' : '';
         hud.killfeed(killer, victim, (e.head ? '◎ ' : '') + weapon, mine);
         if (e.killer === this.myId && e.victim !== this.myId) hud.showBanner(`キル！ ${victim}${e.head ? '（ヘッドショット）' : ''}`, 2, 'kill');
@@ -603,6 +634,13 @@ export class Game {
       k.a = s.tick - k.b.t > 8 ? { ...k.b, t: s.tick - (this.welcome?.snapEvery ?? 2) } : k.b;
       k.b = { x: c.x, y: c.y, z: c.z, yaw: c.yaw, t: s.tick };
       k.driver = c.driver;
+      if (c.hp === 0 && k.hp > 0) {
+        // it just blew up (unless this is old news from far away)
+        const near = Math.hypot(c.x - this.camEye[0], c.z - this.camEye[2]) < 320;
+        k.deadAt = near ? this.time : this.time - 1000;
+        if (near) this.spawnCarExplosion([c.x, c.y + 1, c.z], k.kind);
+      } else if (c.hp > 0 && k.hp === 0) k.deadAt = -1;
+      k.hp = c.hp;
       if (c.driver === this.myId) mine = c.id;
       core.setCar(c.id, c.x, c.y, c.z, c.yaw);
     }
@@ -631,7 +669,7 @@ export class Game {
     let bd = 1e9;
     for (let k = 0; k < this.cars.length; k++) {
       const c = this.cars[k];
-      if (c.driver !== 255) continue;
+      if (c.driver !== 255 || c.hp === 0) continue;
       const dx = me[0] - c.b.x, dz = me[2] - c.b.z;
       const d2 = dx * dx + dz * dz;
       if (d2 > 36 || Math.abs(me[1] - c.b.y) > 1.5 || d2 >= bd) continue;
@@ -1015,6 +1053,23 @@ export class Game {
     }
   }
 
+  /** A vehicle going up: a bigger, longer fireball than a grenade, with wreckage thrown out. */
+  private spawnCarExplosion(p: V3, kind: number) {
+    const big = kind ? 1.4 : 1;
+    this.fx.push({ k: 'fire', t: 0, life: 0.7, p, v: [0, 0, 0], d: [0, 0, 0], len: 0, col: 0xff8a30, size: 7.5 * big });
+    this.fx.push({ k: 'fire', t: 0, life: 1.1, p: [p[0], p[1] + 1.5, p[2]], v: [0, 0, 0], d: [0, 0, 0], len: 0, col: 0xff5a18, size: 4.5 * big });
+    for (let i = 0; i < 34; i++) {
+      const a = Math.random() * Math.PI * 2, r = Math.random();
+      this.fx.push({ k: 'smoke', t: 0, life: 2.4 + Math.random() * 1.8, p: [p[0] + Math.cos(a) * r, p[1] + Math.random(), p[2] + Math.sin(a) * r], v: [Math.cos(a) * 5 * r, 3 + Math.random() * 6, Math.sin(a) * 5 * r], d: [0, 0, 0], len: 0, col: i % 3 ? 0x1c1a19 : 0x5a3a24, size: 1.6 + Math.random() * 1.4 });
+      this.fx.push({ k: 'debris', t: 0, life: 1.1 + Math.random() * 0.9, p: [...p], v: [Math.cos(a) * (6 + Math.random() * 14), 6 + Math.random() * 13, Math.sin(a) * (6 + Math.random() * 14)], d: [0, 0, 0], len: 0, col: i % 2 ? 0xffb060 : 0xff6a20, size: 0.14 + Math.random() * 0.12 });
+    }
+    for (let i = 0; i < 24; i++) {
+      this.fx.push({ k: 'spark', t: 0, life: 0.6 + Math.random() * 0.7, p: [...p], v: [(Math.random() - 0.5) * 18, 5 + Math.random() * 10, (Math.random() - 0.5) * 18], d: [0, 0, 0], len: 0, col: 0x2a2a2c, size: 0.12 + Math.random() * 0.16 });
+    }
+    const d = Math.hypot(p[0] - this.camEye[0], p[1] - this.camEye[1], p[2] - this.camEye[2]);
+    this.shake = Math.max(this.shake, clamp(1.6 - d / 45, 0, 1.2));
+  }
+
   private updateFx(dt: number) {
     const out: Fx[] = [];
     const B = this.boxes, G = this.glow, S = this.smoke;
@@ -1300,7 +1355,7 @@ export class Game {
       drawPlane(this.d.renderer, this.boxes, [s.plane.sx + s.plane.dx * t, 330, s.plane.sz + s.plane.dz * t], Math.atan2(s.plane.dx, s.plane.dz), tsec);
     }
     this.updateFx(dt);
-    this.drawCars(eye);
+    this.drawCars(eye, dt);
 
     const me = this.myPos();
     const shadowCenter: V3 = this.pred ? this.renderPos() : cam.pivot;
@@ -1367,7 +1422,7 @@ export class Game {
     const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
     hud.setPrompt(
       needLock ? 'クリックしてマウス操作を開始'
-        : driving ? (touch ? `${kmh} km/h` : `${kmh} km/h　[F] 降りる　[Space] ブレーキ`)
+        : driving ? `${kmh} km/h　車体 ${Math.ceil(((this.cars[this.myCar]?.hp ?? 255) / 255) * 100)}%` + (touch ? '' : '　[F] 降りる　[Space] ブレーキ')
         : touch ? null
         : item ? `[F] 拾う: ${item}`
         : this.nearCar >= 0 ? `[F] ${carName}に乗る` : null,
@@ -1393,36 +1448,139 @@ export class Game {
     });
   }
 
-  /** Hand the renderer where every car is, settled on the ground it stands on. */
-  private drawCars(eye: V3) {
+  /**
+   * Hand the renderer every car: settled on the ground it stands on, its
+   * wheels rolled by the distance covered, wrecks charred. Also lays tyre
+   * marks behind moving cars and smoke over damaged ones.
+   */
+  private drawCars(eye: V3, dt: number) {
     const core = this.d.core;
     const n = this.cars.length;
-    if (this.carPoses.length !== n * 7) this.carPoses = new Float32Array(n * 7);
+    if (this.carPoses.length !== n * CAR_STRIDE) this.carPoses = new Float32Array(n * CAR_STRIDE);
     const out = this.carPoses;
     for (let k = 0; k < n; k++) {
+      const car = this.cars[k], dim = CAR_KINDS[car.kind];
       const c = this.carPose(k);
-      const o = k * 7;
+      const o = k * CAR_STRIDE;
+      const sn = Math.sin(c.yaw), cs = Math.cos(c.yaw);
+      const near = (c.x - eye[0]) ** 2 + (c.z - eye[2]) ** 2 < 260 * 260;
+      // how it moved since the last frame
+      const mx = c.x - car.px, mz = c.z - car.pz;
+      const moved = Math.hypot(mx, mz);
+      const along = mx * sn + mz * cs;
+      const turned = wrapAngle(c.yaw - car.pyaw);
+      const prevSpeed = car.speed;
+      if (moved < 4 && dt > 0) {
+        car.spin = (car.spin + along / dim.wheelR) % (Math.PI * 2);
+        car.speed = lerp(car.speed, along / dt, Math.min(1, dt * 12));
+        const want = Math.abs(car.speed) > 0.6 ? clamp(Math.atan2((dim.base * turned) / dt, Math.abs(car.speed)) * Math.sign(car.speed), -0.6, 0.6) : car.steer;
+        car.steer = lerp(car.steer, want, Math.min(1, dt * 10));
+      } else if (moved >= 4) {
+        car.trackAt = [null, null];
+        car.speed = 0;
+      }
+      car.px = c.x;
+      car.pz = c.z;
+      car.pyaw = c.yaw;
+
       let q: Q = qY(c.yaw);
       let y = c.y;
-      if ((c.x - eye[0]) ** 2 + (c.z - eye[2]) ** 2 < 260 * 260) {
-        const sn = Math.sin(c.yaw), cs = Math.cos(c.yaw);
+      let tint = 1;
+      if (near) {
         // heights under the axles and the sides: nose up / down and lean
-        const ax = this.cars[k].kind ? 1.9 : 1.4, tr = this.cars[k].kind ? 1.0 : 0.8;
+        const ax = car.kind ? 1.9 : 1.4, tr = car.kind ? 1.0 : 0.8;
         const hf = core.height(c.x + sn * ax, c.z + cs * ax), hb = core.height(c.x - sn * ax, c.z - cs * ax);
         const hl = core.height(c.x + cs * tr, c.z - sn * tr), hr = core.height(c.x - cs * tr, c.z + sn * tr);
-        const pitch = clamp(Math.atan2(hf - hb, ax * 2), -0.6, 0.6), roll = clamp(Math.atan2(hl - hr, tr * 2), -0.5, 0.5);
-        q = qMul(qMul(q, qAxis(1, 0, 0, -pitch)), qAxis(0, 0, 1, roll));
+        let pitch = clamp(Math.atan2(hf - hb, ax * 2), -0.6, 0.6), roll = clamp(Math.atan2(hl - hr, tr * 2), -0.5, 0.5);
         y = Math.max(c.y - 0.4, (hf + hb + hl + hr) / 4) + 0.02;
+        if (car.hp === 0) {
+          // thrown up by the blast, then it settles askew
+          const t = this.time - car.deadAt;
+          const side = k % 2 ? 1 : -1;
+          if (t < 1.0) {
+            const u = t / 1.0;
+            y += (car.kind ? 0.9 : 1.7) * 4 * u * (1 - u);
+            roll += side * 0.55 * Math.sin(u * Math.PI);
+            pitch += 0.35 * Math.sin(u * Math.PI * 2);
+          }
+          roll += side * 0.05;
+          y -= 0.06;
+          tint = 0.13;
+        } else tint = 0.72 + 0.28 * Math.min(1, car.hp / 128);
+        q = qMul(qMul(q, qAxis(1, 0, 0, -pitch)), qAxis(0, 0, 1, roll));
+        this.carSmoke(car, c, y, dt, sn, cs);
+        if (car.hp > 0 && moved > 1e-4 && moved < 4 && c.y > 0.2) this.layTracks(car, c, moved, sn, cs, (prevSpeed - Math.abs(car.speed)) / Math.max(dt, 1e-3));
       }
-      out[o] = c.x;
-      out[o + 1] = y;
-      out[o + 2] = c.z;
-      out[o + 3] = q[0];
-      out[o + 4] = q[1];
-      out[o + 5] = q[2];
-      out[o + 6] = q[3];
+      out.set([c.x, y, c.z, q[0], q[1], q[2], q[3], tint, car.spin, car.hp === 0 ? 0.3 * (k % 2 ? 1 : -1) : car.steer], o);
     }
     this.d.renderer.setCars(out);
+    // tyre marks: thin dark strips that fade away
+    const S = this.smoke;
+    const keep: Track[] = [];
+    for (const t of this.tracks) {
+      const age = this.time - t.t;
+      if (age > TRACK_LIFE) continue;
+      keep.push(t);
+      if ((t.p[0] - eye[0]) ** 2 + (t.p[2] - eye[2]) ** 2 > 140 * 140) continue;
+      S.push(t.p, t.q, [t.w, 0.02, t.len], rgba(0x0b0b0c, Math.round(255 * t.a * Math.min(1, (TRACK_LIFE - age) / 12))));
+    }
+    this.tracks = keep.length > 1600 ? keep.slice(keep.length - 1600) : keep;
+  }
+
+  /** Smoke from a damaged engine, fire and black smoke from a wreck. */
+  private carSmoke(car: CarC, c: { x: number; y: number; z: number }, y: number, dt: number, sn: number, cs: number) {
+    const hurt = car.hp > 0 && car.hp < 110;
+    const burning = car.hp === 0 && this.time - car.deadAt < 75;
+    if (!hurt && !burning) return;
+    const dim = CAR_KINDS[car.kind];
+    car.smokeT -= dt;
+    // the bonnet of a running car, the middle of a wreck
+    const f = hurt ? dim.hl * 0.72 : 0;
+    const p: V3 = [c.x + sn * f, y + (hurt ? Math.min(1.0, dim.h * 0.7) : dim.h * 0.6), c.z + cs * f];
+    if (car.smokeT <= 0) {
+      const bad = car.hp < 50;
+      car.smokeT = burning ? 0.11 : bad ? 0.1 : 0.22;
+      this.fx.push({
+        k: 'smoke', t: 0, life: burning ? 2.6 + Math.random() * 1.6 : 1.3 + Math.random() * 0.7,
+        p: [p[0] + (Math.random() - 0.5) * (burning ? 1.6 : 0.4), p[1], p[2] + (Math.random() - 0.5) * (burning ? 1.6 : 0.4)],
+        v: [(Math.random() - 0.5) * 0.8 + car.speed * sn * 0.3, 1.6 + Math.random() * 1.6, (Math.random() - 0.5) * 0.8 + car.speed * cs * 0.3],
+        d: [0, 0, 0], len: 0, col: burning ? 0x121110 : bad ? 0x2a2826 : 0x8d8a86, size: burning ? 0.9 + Math.random() * 0.7 : 0.35 + Math.random() * 0.25,
+      });
+    }
+    // flames: a wreck burns for a while, a car about to go licks at the bonnet
+    if ((burning && this.time - car.deadAt < 40) || (hurt && car.hp < 50)) {
+      // several small tongues rather than one block
+      for (let i = 0; i < (burning ? 5 : 1); i++) {
+        const s = (burning ? 0.55 : 0.4) * (0.6 + 0.8 * Math.random());
+        const along = burning ? (Math.random() - 0.5) * dim.hl * 1.3 : 0, across = (Math.random() - 0.5) * (burning ? dim.hw * 1.4 : 0.3);
+        const at: V3 = [p[0] + sn * along + cs * across, p[1] + (burning ? (Math.random() - 0.6) * dim.h * 0.5 : 0.05), p[2] + cs * along - sn * across];
+        this.glow.push(at, qY(Math.random() * 6), [s, s * 1.6, s], rgba(Math.random() < 0.5 ? 0xff7a20 : 0xffb040, 150));
+      }
+    }
+  }
+
+  /** Marks behind the rear wheels: faint on a steady run, black when the tyres slide. */
+  private layTracks(car: CarC, c: { x: number; y: number; z: number; yaw: number }, moved: number, sn: number, cs: number, decel: number) {
+    const dim = CAR_KINDS[car.kind];
+    car.trackAcc += moved;
+    if (car.trackAcc < 0.55) return;
+    car.trackAcc = 0;
+    const core = this.d.core;
+    const sliding = decel > 7 || (Math.abs(car.steer) > 0.2 && Math.abs(car.speed) > 9);
+    const a = sliding ? 0.62 : 0.2;
+    for (let side = 0; side < 2; side++) {
+      const s = side ? 1 : -1;
+      const wx = c.x - sn * dim.rear + cs * dim.track * s, wz = c.z - cs * dim.rear - sn * dim.track * s;
+      const now: V3 = [wx, core.height(wx, wz) + 0.045, wz];
+      const was = car.trackAt[side];
+      car.trackAt[side] = now;
+      if (!was) continue;
+      const dx = now[0] - was[0], dy = now[1] - was[1], dz = now[2] - was[2];
+      const len = Math.hypot(dx, dz);
+      if (len < 0.05 || len > 3) continue;
+      const q = qMul(qY(Math.atan2(dx, dz)), qAxis(1, 0, 0, -Math.atan2(dy, len)));
+      this.tracks.push({ p: [(now[0] + was[0]) / 2, (now[1] + was[1]) / 2, (now[2] + was[2]) / 2], q, len: len * 1.08, w: dim.tyre, a, t: this.time });
+    }
   }
 
   private nearestPickup(me: V3): string | null {

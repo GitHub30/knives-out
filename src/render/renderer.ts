@@ -3,7 +3,7 @@
 // bloom + tonemap + FXAA into the swap chain.
 
 import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
-import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type V3 } from './math';
+import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
 import { loadGlb, type GltfModel } from './gltf';
@@ -105,6 +105,9 @@ function cylinderVerts(seg: number): Float32Array {
   return new Float32Array(out);
 }
 
+/** Floats per car handed to `setCars`. */
+export const CAR_STRIDE = 10;
+
 /** Engine axes at the intake lips in the airliner's frame, and the fan speed (rad/s). */
 const FAN_AXES: V3[] = [[9.75, -3.0, 11.0], [-9.75, -3.0, 11.0]];
 const FAN_SPEED = 9;
@@ -170,15 +173,17 @@ export class Renderer {
   private captureReq: ((img: { w: number; h: number; rgba: Uint8Array }) => void) | null = null;
   /** One model per vehicle kind (0 police car, 1 fire truck). */
   private carModels: (ModelGpu | null)[] = [null, null];
+  /** Wheels per vehicle kind, grouped by wheel mesh: where each sits on the car. */
+  private carWheels: { m: ModelGpu; at: { pos: V3; quat: Q; front: boolean }[]; data: Float32Array }[][] = [[], []];
   private carKinds: Uint8Array = new Uint8Array(0);
-  /** x, y, z, quaternion per car. */
+  /** Per car (CAR_STRIDE floats): x, y, z, quaternion, tint, wheel spin, steering angle. */
   private cars: Float32Array = new Float32Array(0);
   private carData: Float32Array[] = [new Float32Array(0), new Float32Array(0)];
   private planeModel: ModelGpu | null = null;
   private planePose: Float32Array | null = null;
   private planeInst: GPUBuffer | null = null;
   private fanModel: ModelGpu | null = null;
-  private fanPose = new Float32Array(14);
+  private fanPose = new Float32Array(16);
   private fanInst: GPUBuffer | null = null;
   // dynamic resolution
   private dyn = 1;
@@ -367,11 +372,12 @@ export class Renderer {
         ],
       },
       {
-        arrayStride: 28,
+        arrayStride: 32,
         stepMode: 'instance',
         attributes: [
           { shaderLocation: 4, offset: 0, format: 'float32x3' },
           { shaderLocation: 5, offset: 12, format: 'float32x4' },
+          { shaderLocation: 6, offset: 28, format: 'float32' },
         ],
       },
     ];
@@ -507,9 +513,9 @@ export class Renderer {
     this.waterLevel = w.waterLevel;
     // parked poses until the game says where the cars are now
     const c4 = w.cars ?? new Float32Array(0);
-    this.cars = new Float32Array((c4.length >> 2) * 7);
-    for (let i = 0, o = 0; i + 4 <= c4.length; i += 4, o += 7) {
-      this.cars.set([c4[i], c4[i + 1], c4[i + 2], 0, Math.sin(c4[i + 3] * 0.5), 0, Math.cos(c4[i + 3] * 0.5)], o);
+    this.cars = new Float32Array((c4.length >> 2) * CAR_STRIDE);
+    for (let i = 0, o = 0; i + 4 <= c4.length; i += 4, o += CAR_STRIDE) {
+      this.cars.set([c4[i], c4[i + 1], c4[i + 2], 0, Math.sin(c4[i + 3] * 0.5), 0, Math.cos(c4[i + 3] * 0.5), 1, 0, 0], o);
     }
     this.carKinds = w.carKinds ?? new Uint8Array(c4.length >> 2);
     this.heightTex?.destroy();
@@ -598,7 +604,7 @@ export class Renderer {
   }
 
   /** Load the parked-car model (drawn at the world's car spots once it is ready). */
-  /** Where the cars are this frame: x, y, z and a quaternion per car. */
+  /** The cars this frame, CAR_STRIDE floats each: x, y, z, quaternion, tint (1 = intact), wheel spin and steering (rad). */
   setCars(poses: Float32Array) {
     this.cars = poses;
   }
@@ -616,18 +622,29 @@ export class Renderer {
   /** Draw the airliner in the next frame: nose along fwd(yaw), banked by `roll`, fans turning with `time`. */
   setPlane(p: ArrayLike<number>, yaw: number, roll = 0, time = 0) {
     const q = qMul(qAxis(0, 1, 0, yaw), qAxis(0, 0, 1, roll));
-    this.planePose = new Float32Array([p[0], p[1], p[2], q[0], q[1], q[2], q[3]]);
+    this.planePose = new Float32Array([p[0], p[1], p[2], q[0], q[1], q[2], q[3], 1]);
     // the fans sit on the engine axes (see scripts/build-b777.py) and spin about them
     FAN_AXES.forEach((at, k) => {
       const o = qRot(q, at);
       const fq = qMul(q, qAxis(0, 0, 1, -time * FAN_SPEED));
-      this.fanPose.set([p[0] + o[0], p[1] + o[1], p[2] + o[2], fq[0], fq[1], fq[2], fq[3]], k * 7);
+      this.fanPose.set([p[0] + o[0], p[1] + o[1], p[2] + o[2], fq[0], fq[1], fq[2], fq[3], 1], k * 8);
     });
   }
 
   async loadCarModel(url: string, kind = 0): Promise<void> {
-    const m = await loadGlb(url);
+    const m = await loadGlb(url, 'Wheel');
     if (this.lost) return;
+    // wheels are drawn on their own so they can turn
+    const groups = new Map<GltfModel, { m: ModelGpu; at: { pos: V3; quat: Q; front: boolean }[]; data: Float32Array }>();
+    for (const w of m.wheels) {
+      let g = groups.get(w.model);
+      if (!g) {
+        g = { m: this.uploadModel(w.model), at: [], data: new Float32Array(0) };
+        groups.set(w.model, g);
+      }
+      g.at.push({ pos: w.pos, quat: w.quat, front: w.pos[2] > 0 });
+    }
+    this.carWheels[kind] = [...groups.values()];
     this.carModels[kind] = this.uploadModel(m);
   }
 
@@ -798,26 +815,46 @@ export class Renderer {
     // cars near the camera
     const cam = v.camPos;
     const carDraws: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
+    const nCars = Math.floor(this.cars.length / CAR_STRIDE);
     for (let kind = 0; kind < this.carModels.length; kind++) {
       const m = this.carModels[kind];
-      if (!m || !this.cars.length) continue;
-      if (this.carData[kind].length < this.cars.length) this.carData[kind] = new Float32Array(this.cars.length);
+      if (!m || !nCars) continue;
+      if (this.carData[kind].length < nCars * 8) this.carData[kind] = new Float32Array(nCars * 8);
       const data = this.carData[kind];
+      const wheels = this.carWheels[kind];
+      for (const g of wheels) if (g.data.length < nCars * g.at.length * 8) g.data = new Float32Array(nCars * g.at.length * 8);
       let n = 0;
-      for (let i = 0, k = 0; i + 7 <= this.cars.length; i += 7, k++) {
+      for (let k = 0; k < nCars; k++) {
         if ((this.carKinds[k] ?? 0) !== kind) continue;
-        const dx = this.cars[i] - cam[0], dz = this.cars[i + 2] - cam[2];
+        const i = k * CAR_STRIDE, c = this.cars;
+        const dx = c[i] - cam[0], dz = c[i + 2] - cam[2];
         if (dx * dx + dz * dz > 260 * 260) continue;
-        for (let j = 0; j < 7; j++) data[n * 7 + j] = this.cars[i + j];
+        for (let j = 0; j < 8; j++) data[n * 8 + j] = c[i + j];
+        // each wheel: on its hub, rolled about the axle, the front pair steered
+        const q: Q = [c[i + 3], c[i + 4], c[i + 5], c[i + 6]];
+        const roll = qAxis(1, 0, 0, c[i + 8]), steer = qAxis(0, 1, 0, c[i + 9]);
+        for (const g of wheels) {
+          g.at.forEach((w, wi) => {
+            const o = qRot(q, w.pos);
+            const turned = qMul(roll, w.quat);
+            const wq = qMul(q, w.front ? qMul(steer, turned) : turned);
+            g.data.set([c[i] + o[0], c[i + 1] + o[1], c[i + 2] + o[2], wq[0], wq[1], wq[2], wq[3], c[i + 7]], (n * g.at.length + wi) * 8);
+          });
+        }
         n++;
       }
-      const inst = n ? this.instBuffer(`cars${kind}`, data.buffer as ArrayBuffer, n * 28) : null;
+      if (!n) continue;
+      const inst = this.instBuffer(`cars${kind}`, data.buffer as ArrayBuffer, n * 32);
       if (inst) carDraws.push({ m, inst, n });
+      wheels.forEach((g, gi) => {
+        const wi = this.instBuffer(`wheels${kind}_${gi}`, g.data.buffer as ArrayBuffer, n * g.at.length * 32);
+        if (wi) carDraws.push({ m: g.m, inst: wi, n: n * g.at.length });
+      });
     }
     const planeOn = !!(this.planeModel && this.planePose);
     if (planeOn) {
-      this.planeInst = this.instBuffer('plane', this.planePose!.buffer as ArrayBuffer, 28);
-      this.fanInst = this.instBuffer('fans', this.fanPose.buffer as ArrayBuffer, 56);
+      this.planeInst = this.instBuffer('plane', this.planePose!.buffer as ArrayBuffer, 32);
+      this.fanInst = this.instBuffer('fans', this.fanPose.buffer as ArrayBuffer, 64);
     }
     this.planePose = null;
     const enc = d.createCommandEncoder();

@@ -462,6 +462,8 @@ struct MIn {
   @location(3) uv: vec2f,
   @location(4) ipos: vec3f,
   @location(5) iquat: vec4f,
+  /** 1 = as painted, towards 0 = burnt out. */
+  @location(6) itint: f32,
 };
 `;
 
@@ -485,9 +487,11 @@ struct VOut {
   @location(1) n: vec3f,
   @location(2) t: vec4f,
   @location(3) uv: vec2f,
+  @location(4) tint: f32,
 };
 @vertex fn vs(v: MIn) -> VOut {
   var o: VOut;
+  o.tint = v.itint;
   let wp = v.ipos + qrot(v.iquat, v.pos);
   o.wp = wp;
   o.clip = F.viewProj * vec4f(wp, 1.0);
@@ -515,16 +519,19 @@ fn surface(i: VOut, front: bool) -> Surface {
     n = normalize(t * tn.x + b * tn.y + n * tn.z);
   }
   if (!front) { n = -n; }
-  s.albedo = base.rgb;
+  // a burnt-out wreck: sooty, dull paint
+  let burnt = 1.0 - smoothstep(0.3, 0.9, i.tint);
+  s.albedo = base.rgb * i.tint;
+  s.metal *= 1.0 - 0.8 * burnt;
   s.n = n;
-  s.rough = clamp(s.rough, 0.04, 1.0);
+  s.rough = clamp(mix(s.rough, 0.9, burnt), 0.04, 1.0);
   s.trans = 0.0;
   return s;
 }
 @fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   let s = surface(i, front);
   var c = shade(s, i.wp);
-  if (M.mr.z > 0.5) { c += textureSample(emisTex, samp, i.uv).rgb * M.emissive.rgb * 2.0; }
+  if (M.mr.z > 0.5) { c += textureSample(emisTex, samp, i.uv).rgb * M.emissive.rgb * 2.0 * step(0.5, i.tint); }
   c = applyFog(c, i.wp);
   return vec4f(c, 1.0);
 }
@@ -534,7 +541,8 @@ fn surface(i: VOut, front: bool) -> Surface {
   // glass: reflections stay bright where the surface is see-through
   let V = normalize(F.camPos.xyz - i.wp);
   let fres = 0.04 + 0.96 * pow(1.0 - max(dot(s.n, V), 0.0), 5.0);
-  let a = clamp(M.base.a + fres * 0.6, 0.0, 1.0);
+  // the glass of a wreck is blackened
+  let a = mix(0.96, clamp(M.base.a + fres * 0.6, 0.0, 1.0), step(0.5, i.tint));
   c = applyFog(c, i.wp);
   return vec4f(c, a);
 }

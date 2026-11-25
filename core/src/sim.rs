@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 9;
+pub const PROTO: u16 = 10;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -454,6 +454,9 @@ pub struct Match {
     /// where they are parked at the start of a match. Poses are in `w.cars`.
     pub car_driver: Vec<u8>,
     car_moved: Vec<u32>,
+    /// Bodywork left (0 = a burnt-out wreck) and who damaged it last.
+    pub car_hp: Vec<f32>,
+    car_hit_by: Vec<u8>,
     car0: Vec<[f32; 4]>,
 }
 
@@ -514,8 +517,11 @@ impl Match {
             alive_start: 0,
             car_driver: vec![255; ncar],
             car_moved: vec![0; ncar],
+            car_hp: Vec::new(),
+            car_hit_by: vec![255; ncar],
             car0,
         };
+        m.car_hp = (0..ncar).map(|k| m.car_max_hp(k)).collect();
         m.spawn_loot();
         m.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, nx: MAP * 0.5, nz: MAP * 0.5, nr: 780.0, timer: ZONES[0].wait, ..Default::default() };
         m
@@ -823,6 +829,8 @@ impl Match {
         for k in 0..self.car_driver.len() {
             self.car_driver[k] = 255;
             self.car_moved[k] = self.tick;
+            self.car_hp[k] = self.car_max_hp(k);
+            self.car_hit_by[k] = 255;
         }
         self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
         self.pick_next_zone();
@@ -945,9 +953,10 @@ impl Match {
         let mult = self.players[i].speed_mult();
         let w = &self.w;
         let p = &mut self.players[i];
+        let v0 = if mode == MODE_DRIVE { car_speed(&p.ms).abs() } else { 0.0 };
         let ev = step_move(w, &mut p.ms, &c, mult, DT);
         if mode == MODE_DRIVE {
-            self.car_moved_by(i);
+            self.car_moved_by(i, v0);
             return;
         }
         if ev & EV_LANDED != 0 && mode != MODE_GROUND {
@@ -1044,7 +1053,7 @@ impl Match {
         let pos = self.players[i].ms.pos;
         let mut best: Option<(usize, f32)> = None;
         for k in 0..self.w.cars.len() {
-            if self.car_driver[k] != 255 {
+            if self.car_driver[k] != 255 || self.car_hp[k] <= 0.0 {
                 continue;
             }
             let c = self.w.cars[k];
@@ -1076,6 +1085,74 @@ impl Match {
         p.heal_t = 0.0;
         p.firing_t = 0.0;
         true
+    }
+
+    pub fn car_max_hp(&self, k: usize) -> f32 {
+        if self.w.car_kind.get(k) == Some(&VK_TRUCK) { 1100.0 } else { 600.0 }
+    }
+
+    /// Damage the bodywork of car `k`; it blows up when nothing is left.
+    pub fn hurt_car(&mut self, k: usize, dmg: f32, by: u8) {
+        if k >= self.car_hp.len() || self.car_hp[k] <= 0.0 || dmg <= 0.0 || self.phase != PH_PLAY {
+            return;
+        }
+        self.car_hp[k] -= dmg;
+        self.car_hit_by[k] = by;
+        self.car_moved[k] = self.tick;
+        if self.car_hp[k] <= 0.0 {
+            self.explode_car(k);
+        }
+    }
+
+    /// Car `k` blows up: whoever is in it dies, people and cars nearby are
+    /// hurt, and a wreck is left that still blocks the way.
+    fn explode_car(&mut self, k: usize) {
+        let c = self.w.cars[k];
+        let by = self.car_hit_by[k];
+        self.car_hp[k] = 0.0;
+        self.car_moved[k] = self.tick;
+        let pos = V3::new(c[0], c[1] + 1.0, c[2]);
+        let dr = self.car_driver[k] as usize;
+        if dr < MAX_PLAYERS {
+            let who = if (by as usize) < MAX_PLAYERS { by } else { dr as u8 };
+            self.damage(dr, who, 1.0e6, false, WK_BOOM, pos);
+            if self.players[dr].alive {
+                self.exit_car(dr);
+            }
+        }
+        self.car_driver[k] = 255;
+        let start = self.ev_begin();
+        let mut w = Wr::new(&mut self.ev);
+        w.u8(E_BOOM);
+        w.f32(pos.x);
+        w.f32(pos.y);
+        w.f32(pos.z);
+        self.ev_end(start, 255, Some(pos));
+        let radius = 8.5;
+        for j in 0..MAX_PLAYERS {
+            let q = &self.players[j];
+            if !q.used || !q.alive || q.ms.mode == MODE_PLANE {
+                continue;
+            }
+            let at = q.ms.pos + V3::new(0.0, 0.9, 0.0);
+            let d = (at - pos).len();
+            // the wreck itself is no cover from its own blast
+            if d > radius || self.w.blocked_static(pos + V3::new(0.0, 0.8, 0.0), at) {
+                continue;
+            }
+            let dmg = 125.0 * (1.0 - d / radius).powf(1.3);
+            if dmg > 1.0 {
+                let who = if (by as usize) < MAX_PLAYERS { by } else { j as u8 };
+                self.damage(j, who, dmg, false, WK_BOOM, pos);
+            }
+        }
+        for o in 0..self.w.cars.len() {
+            let oc = self.w.cars[o];
+            let d = dist_xz(oc[0], oc[2], c[0], c[2]);
+            if o != k && d < radius {
+                self.hurt_car(o, 520.0 * (1.0 - d / radius), by);
+            }
+        }
     }
 
     /// The car `i` drives, if any.
@@ -1133,7 +1210,7 @@ impl Match {
     }
 
     /// After the driver's step: move the car with them and run people over.
-    fn car_moved_by(&mut self, i: usize) {
+    fn car_moved_by(&mut self, i: usize, v0: f32) {
         let Some(k) = self.car_of(i) else {
             self.exit_car(i);
             return;
@@ -1146,6 +1223,14 @@ impl Match {
             self.car_moved[k] = tick;
         }
         let v = car_speed(&ms);
+        // a crash: the speed lost in one step dents the car
+        let lost = v0 - v.abs();
+        if lost > 5.0 {
+            self.hurt_car(k, (lost - 5.0) * 14.0, i as u8);
+            if self.car_hp[k] <= 0.0 {
+                return;
+            }
+        }
         for j in 0..MAX_PLAYERS {
             let q = &self.players[j];
             if j == i || !q.used || !q.alive || q.ms.mode != MODE_GROUND {
@@ -1395,10 +1480,12 @@ impl Match {
                 // the bodywork takes some of a bullet that hits an occupied car
                 if let Some((_, _, k)) = self.w.ray_cars(o, d, tw + 0.05) {
                     let dr = self.car_driver[k] as usize;
+                    let fall = if tw <= def.f0 { 1.0 } else if tw >= def.f1 { def.fmin } else { lerpf(1.0, def.fmin, (tw - def.f0) / (def.f1 - def.f0)) };
                     if dr < MAX_PLAYERS && dr != i {
-                        let fall = if tw <= def.f0 { 1.0 } else if tw >= def.f1 { def.fmin } else { lerpf(1.0, def.fmin, (tw - def.f0) / (def.f1 - def.f0)) };
                         self.damage(dr, i as u8, def.dmg * fall * 0.55, false, wk, self.players[i].ms.pos);
                     }
+                    // and the car itself wears down until it blows up
+                    self.hurt_car(k, def.dmg * fall, i as u8);
                 }
             }
             if let Some((j, dist, head)) = victim {
@@ -1575,6 +1662,13 @@ impl Match {
             let dmg = 115.0 * k.powf(1.4) * if driving { 0.7 } else { 1.0 };
             if dmg > 1.0 {
                 self.damage(j, n.owner, dmg, false, 200, n.pos);
+            }
+        }
+        for k in 0..self.w.cars.len() {
+            let c = self.w.cars[k];
+            let d = (V3::new(c[0], c[1] + 0.7, c[2]) - n.pos).len();
+            if d < radius {
+                self.hurt_car(k, 460.0 * (1.0 - d / radius).powf(1.2), n.owner);
             }
         }
     }
@@ -2600,6 +2694,10 @@ impl Match {
             w.u16(q_yaw(c[3]));
             // a driver this viewer is not sent stays anonymous
             w.u8(if dr as usize == i { dr } else if (dr as usize) < MAX_PLAYERS && send[dr as usize] { dr } else if dr != 255 { 254 } else { 255 });
+            // bodywork left in 255ths (0 only for a wreck)
+            let hp = self.car_hp[k];
+            let full = if self.w.car_kind.get(k) == Some(&VK_TRUCK) { 1100.0 } else { 600.0 };
+            w.u8(if hp <= 0.0 { 0 } else { ((hp / full) * 255.0).ceil().clamp(1.0, 255.0) as u8 });
             ccount += 1;
         }
         self.out[cpos] = ccount;

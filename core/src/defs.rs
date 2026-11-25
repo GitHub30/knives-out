@@ -32,6 +32,8 @@ pub const B_MASK: u16 = 0x3FFF;
 pub const WK_NADE: u8 = 200;
 pub const WK_CAR: u8 = 201;
 pub const WK_TRUCK: u8 = 202;
+/// A vehicle blowing up.
+pub const WK_BOOM: u8 = 203;
 
 pub const W_FISTS: u8 = 0;
 pub const W_PISTOL: u8 = 1;

@@ -339,3 +339,91 @@ fn every_town_has_a_fire_truck_and_it_drives() {
     let to = V3::new(c[0] - side.x * 6.0, c[1] + 2.4, c[2] - side.z * 6.0);
     assert!(m.w.blocked(from, to), "the truck body does not block at 2.4 m");
 }
+
+#[test]
+fn cars_take_damage_and_blow_up() {
+    let (mut m, a, b, o) = stage(7);
+    let mut pad = Pad { seq: 0 };
+    assert_eq!(m.car_hp[0], m.car_max_hp(0));
+    // B sits in the car, A empties magazines into it from 10 m
+    place(&mut m, b, V3::new(o.x, o.y, o.z - 1.6));
+    let mut padb = Pad { seq: 0 };
+    padb.go(&mut m, b, 0, 0, 0.0, 0.0, 0);
+    padb.go(&mut m, b, 0, 0, 0.0, 0.0, B_USE);
+    assert_eq!(m.players[b as usize].ms.mode, MODE_DRIVE);
+    m.players[b as usize].health = 100000.0; // keep the driver alive until the car goes
+    place(&mut m, a, V3::new(o.x, o.y, o.z + 10.0));
+    let yaw = yaw_to(0.0, -1.0);
+    let mut fired = 0u32;
+    for _ in 0..400 {
+        {
+            let p = &mut m.players[a as usize];
+            if p.slots[0].1 == 0 {
+                p.slots[0] = (W_AR, 30);
+                p.reload_t = 0.0;
+            }
+            p.cur = 0;
+            p.switch_t = 0.0;
+        }
+        let before = m.players[a as usize].slots[0].1;
+        pad.go(&mut m, a, 0, 0, yaw, -0.05, B_FIRE | B_ADS);
+        fired += (before - m.players[a as usize].slots[0].1.min(before)) as u32;
+        if m.car_hp[0] <= 0.0 {
+            break;
+        }
+    }
+    assert!(m.car_hp[0] <= 0.0, "the car survived {fired} rounds with {} left", m.car_hp[0]);
+    assert!(fired > 15, "the car went up after only {fired} rounds");
+    assert!(!m.players[b as usize].alive, "the driver survived the explosion");
+    assert_eq!(m.players[b as usize].killer, a);
+    assert_eq!(m.car_driver[0], 255);
+    assert!(m.players[a as usize].alive && m.players[a as usize].health > 99.0, "the blast reached 10 m");
+    assert!(m.car_hp[0] <= 0.0);
+}
+
+#[test]
+fn a_wreck_stays_in_the_way_and_the_blast_hurts_bystanders() {
+    let (mut m, a, _b, o) = stage(7);
+    let mut pad = Pad { seq: 0 };
+    // someone standing 3 m from a car that goes up
+    place(&mut m, a, V3::new(o.x + 3.9, o.y, o.z));
+    m.hurt_car(0, 10_000.0, 255);
+    assert!(m.car_hp[0] <= 0.0);
+    let hp = m.players[a as usize].health;
+    assert!(hp < 70.0 && m.players[a as usize].alive, "3 m from an exploding car left {hp} health");
+    // a wreck cannot be driven but is still in the way
+    place(&mut m, a, V3::new(o.x, o.y, o.z + 1.6));
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, 0);
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, B_USE);
+    assert_eq!(m.players[a as usize].ms.mode, MODE_GROUND, "got into a wreck");
+    let mut q = V3::new(o.x, o.y, o.z);
+    assert!(m.w.push_car(0, &mut q, P_RADIUS));
+    // a second blast does nothing to it
+    m.hurt_car(0, 10_000.0, 255);
+    assert_eq!(m.car_hp[0], 0.0);
+}
+
+#[test]
+fn a_hard_crash_dents_the_car() {
+    let (mut m, a, _b, _o) = stage(7);
+    let mut pad = Pad { seq: 0 };
+    let bl = m.w.buildings[0];
+    let bz = (bl.z0 + bl.z1) * 0.5;
+    let (sx, sz) = (bl.x0 - 45.0, bz);
+    m.w.cars[0] = [sx, m.w.height(sx, sz), sz, std::f32::consts::FRAC_PI_2];
+    m.players[a as usize].ms = MoveState { pos: V3::new(sx, m.w.height(sx, sz + 1.6), sz + 1.6), mode: MODE_GROUND, on_ground: true, ..Default::default() };
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, 0);
+    pad.go(&mut m, a, 0, 0, 0.0, 0.0, B_USE);
+    assert_eq!(m.players[a as usize].ms.mode, MODE_DRIVE);
+    let full = m.car_hp[0];
+    let mut top = 0.0f32;
+    for _ in 0..240 {
+        pad.go(&mut m, a, 0, 127, 0.0, 0.0, 0);
+        top = top.max(car_speed(&m.players[a as usize].ms));
+    }
+    if top > 12.0 && dist_xz(m.w.cars[0][0], m.w.cars[0][2], sx, sz) < 60.0 {
+        // it reached speed and something stopped it
+        assert!(m.car_hp[0] < full, "hit something at {top} m/s without a scratch");
+    }
+    assert!(m.car_hp[0] > 0.0, "one crash destroyed the car");
+}

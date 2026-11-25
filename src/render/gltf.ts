@@ -27,6 +27,37 @@ export interface GltfModel {
   materials: GltfMaterial[];
   min: [number, number, number];
   max: [number, number, number];
+  /** Nodes split off by name (wheels): their mesh about its own origin and where it sits. */
+  wheels: GltfWheel[];
+}
+
+export interface GltfWheel {
+  /** Shared between the wheels that use the same mesh. */
+  model: GltfModel;
+  pos: [number, number, number];
+  quat: [number, number, number, number];
+}
+
+/** Rotation of a (scale-free) column-major matrix as a quaternion. */
+function quatOf(m: M4): [number, number, number, number] {
+  const m00 = m[0], m10 = m[1], m20 = m[2], m01 = m[4], m11 = m[5], m21 = m[6], m02 = m[8], m12 = m[9], m22 = m[10];
+  const tr = m00 + m11 + m22;
+  let q: [number, number, number, number];
+  if (tr > 0) {
+    const k = Math.sqrt(tr + 1) * 2;
+    q = [(m21 - m12) / k, (m02 - m20) / k, (m10 - m01) / k, k / 4];
+  } else if (m00 > m11 && m00 > m22) {
+    const k = Math.sqrt(1 + m00 - m11 - m22) * 2;
+    q = [k / 4, (m01 + m10) / k, (m02 + m20) / k, (m21 - m12) / k];
+  } else if (m11 > m22) {
+    const k = Math.sqrt(1 + m11 - m00 - m22) * 2;
+    q = [(m01 + m10) / k, k / 4, (m12 + m21) / k, (m02 - m20) / k];
+  } else {
+    const k = Math.sqrt(1 + m22 - m00 - m11) * 2;
+    q = [(m02 + m20) / k, (m12 + m21) / k, k / 4, (m10 - m01) / k];
+  }
+  const l = Math.hypot(...q) || 1;
+  return [q[0] / l, q[1] / l, q[2] / l, q[3] / l];
 }
 
 type M4 = number[];
@@ -51,7 +82,8 @@ function trs(n: { translation?: number[]; rotation?: number[]; scale?: number[];
 
 const COMPONENTS: Record<string, number> = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 };
 
-export async function loadGlb(url: string): Promise<GltfModel> {
+/** `split`: nodes whose name starts with it are returned as `wheels` instead of being baked in. */
+export async function loadGlb(url: string, split?: string): Promise<GltfModel> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`model ${url}: ${res.status}`);
   const buf = await res.arrayBuffer();
@@ -107,51 +139,76 @@ export async function loadGlb(url: string): Promise<GltfModel> {
     });
   }
 
-  const verts: number[] = [];
-  const byMat = new Map<number, number[]>();
-  const min: [number, number, number] = [1e9, 1e9, 1e9], max: [number, number, number] = [-1e9, -1e9, -1e9];
+  interface Acc {
+    verts: number[];
+    byMat: Map<number, number[]>;
+    min: [number, number, number];
+    max: [number, number, number];
+  }
+  const acc = (): Acc => ({ verts: [], byMat: new Map(), min: [1e9, 1e9, 1e9], max: [-1e9, -1e9, -1e9] });
+  const addMesh = (mi: number, m: M4, A: Acc) => {
+    for (const prim of json.meshes[mi].primitives) {
+      if ((prim.mode ?? 4) !== 4 || prim.indices === undefined) continue;
+      const pos = accessor(prim.attributes.POSITION).data;
+      const nor = prim.attributes.NORMAL !== undefined ? accessor(prim.attributes.NORMAL).data : null;
+      const tan = prim.attributes.TANGENT !== undefined ? accessor(prim.attributes.TANGENT).data : null;
+      const uv = prim.attributes.TEXCOORD_0 !== undefined ? accessor(prim.attributes.TEXCOORD_0).data : null;
+      const base = A.verts.length / 12;
+      const dir = (v: number[]) => {
+        const x = m[0] * v[0] + m[4] * v[1] + m[8] * v[2], y = m[1] * v[0] + m[5] * v[1] + m[9] * v[2], z = m[2] * v[0] + m[6] * v[1] + m[10] * v[2];
+        const l = Math.hypot(x, y, z) || 1;
+        return [x / l, y / l, z / l];
+      };
+      for (let k = 0; k < pos.length; k++) {
+        const p = pos[k];
+        const w = [m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]];
+        for (let c = 0; c < 3; c++) {
+          A.min[c] = Math.min(A.min[c], w[c]);
+          A.max[c] = Math.max(A.max[c], w[c]);
+        }
+        const n = nor ? dir(nor[k]) : [0, 1, 0];
+        const t = tan ? [...dir(tan[k]), tan[k][3]] : [1, 0, 0, 1];
+        const u = uv ? uv[k] : [0, 0];
+        A.verts.push(w[0], w[1], w[2], n[0], n[1], n[2], t[0], t[1], t[2], t[3], u[0], u[1]);
+      }
+      const list = A.byMat.get(prim.material ?? 0) ?? [];
+      for (const row of accessor(prim.indices).data) list.push(base + row[0]);
+      A.byMat.set(prim.material ?? 0, list);
+    }
+  };
+  const finish = (A: Acc, wheels: GltfWheel[]): GltfModel => {
+    const indices: number[] = [];
+    const parts: GltfPart[] = [];
+    for (const [material, list] of A.byMat) {
+      parts.push({ material, first: indices.length, count: list.length });
+      for (const i of list) indices.push(i);
+    }
+    return { verts: new Float32Array(A.verts), indices: new Uint32Array(indices), parts, materials, min: A.min, max: A.max, wheels };
+  };
+
+  const main = acc();
+  const split_: { mesh: number; m: M4 }[] = [];
   const visit = (ni: number, parent: M4) => {
     const node = json.nodes[ni];
     const m = mulM(parent, trs(node));
     if (node.mesh !== undefined) {
-      for (const prim of json.meshes[node.mesh].primitives) {
-        if ((prim.mode ?? 4) !== 4 || prim.indices === undefined) continue;
-        const pos = accessor(prim.attributes.POSITION).data;
-        const nor = prim.attributes.NORMAL !== undefined ? accessor(prim.attributes.NORMAL).data : null;
-        const tan = prim.attributes.TANGENT !== undefined ? accessor(prim.attributes.TANGENT).data : null;
-        const uv = prim.attributes.TEXCOORD_0 !== undefined ? accessor(prim.attributes.TEXCOORD_0).data : null;
-        const base = verts.length / 12;
-        const dir = (v: number[]) => {
-          const x = m[0] * v[0] + m[4] * v[1] + m[8] * v[2], y = m[1] * v[0] + m[5] * v[1] + m[9] * v[2], z = m[2] * v[0] + m[6] * v[1] + m[10] * v[2];
-          const l = Math.hypot(x, y, z) || 1;
-          return [x / l, y / l, z / l];
-        };
-        for (let k = 0; k < pos.length; k++) {
-          const p = pos[k];
-          const w = [m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]];
-          for (let c = 0; c < 3; c++) {
-            min[c] = Math.min(min[c], w[c]);
-            max[c] = Math.max(max[c], w[c]);
-          }
-          const n = nor ? dir(nor[k]) : [0, 1, 0];
-          const t = tan ? [...dir(tan[k]), tan[k][3]] : [1, 0, 0, 1];
-          const u = uv ? uv[k] : [0, 0];
-          verts.push(w[0], w[1], w[2], n[0], n[1], n[2], t[0], t[1], t[2], t[3], u[0], u[1]);
-        }
-        const list = byMat.get(prim.material ?? 0) ?? [];
-        for (const row of accessor(prim.indices).data) list.push(base + row[0]);
-        byMat.set(prim.material ?? 0, list);
-      }
+      if (split && typeof node.name === 'string' && node.name.startsWith(split)) split_.push({ mesh: node.mesh, m });
+      else addMesh(node.mesh, m, main);
     }
     for (const c of node.children ?? []) visit(c, m);
   };
   for (const root of json.scenes[json.scene ?? 0].nodes) visit(root, IDENT);
 
-  const indices: number[] = [];
-  const parts: GltfPart[] = [];
-  for (const [material, list] of byMat) {
-    parts.push({ material, first: indices.length, count: list.length });
-    for (const i of list) indices.push(i);
-  }
-  return { verts: new Float32Array(verts), indices: new Uint32Array(indices), parts, materials, min, max };
+  const wheelModels = new Map<number, GltfModel>();
+  const wheels: GltfWheel[] = split_.map(({ mesh, m }) => {
+    let model = wheelModels.get(mesh);
+    if (!model) {
+      const A = acc();
+      addMesh(mesh, IDENT, A);
+      model = finish(A, []);
+      wheelModels.set(mesh, model);
+    }
+    return { model, pos: [m[12], m[13], m[14]], quat: quatOf(m) };
+  });
+  return finish(main, wheels);
 }
