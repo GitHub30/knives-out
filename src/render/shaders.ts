@@ -635,16 +635,12 @@ fn qrot(q: vec4f, v: vec3f) -> vec3f {
 //   [200000, 265536)  far ring without the hole (when the near ring is off)
 export const GRASS_FAR = 256;
 export const GRASS_NEAR = 256;
-export const GRASS_WGSL = /* wgsl */ `
-${COMMON}
+// Everything about a blade that the scene pass and the shadow pass share:
+// where it grows, its shape and how the wind moves it, so a blade and its
+// shadow are always the same blade in the same pose.
+const GRASS_CORE = /* wgsl */ `
 @group(1) @binding(0) var heightTex: texture_2d<f32>;
 @group(1) @binding(1) var maskTex: texture_2d<f32>;
-struct VOut {
-  @builtin(position) clip: vec4f,
-  @location(0) wp: vec3f,
-  @location(1) n: vec3f,
-  @location(2) tv: vec3f,    // height along the blade, per-blade tint, dryness
-};
 // the terrain exactly as the simulation has it: 4 m cells split into two triangles
 fn groundH(p: vec2f) -> f32 {
   let f = clamp(p / 4.0, vec2f(0.0), vec2f(255.999));
@@ -665,18 +661,35 @@ fn grassAt(p: vec2f) -> f32 {
   let b = mix(textureLoad(maskTex, i + vec2i(0, 1), 0).r, textureLoad(maskTex, i + vec2i(1, 1), 0).r, t.x);
   return mix(a, b, t.y);
 }
-@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
-  var o: VOut;
-  o.clip = vec4f(2.0, 2.0, 2.0, 1.0);   // culled unless a blade grows here
+// Wind in two layers, as for the trees:
+//  1. gusts roll across the field and lean whole tufts over, slowly;
+//  2. each blade shivers quickly on its own, mostly at the tip.
+// Returns the sideways shift of a point at height t (0 root .. 1 tip).
+fn applyGrassWind(p: vec2f, t: f32, hgt: f32, phase: f32, time: f32) -> vec2f {
+  let gust = vnoise(p * 0.06 + vec2f(time * 0.33, time * 0.2));
+  let roll = sin(time * 1.5 + p.x * 0.33 + p.y * 0.27) * 0.5 + 0.5;
+  let lean = (0.25 + 1.15 * gust) * (0.35 + 0.65 * roll);
+  let shiver = sin(time * 5.3 + phase * 6.2831 + p.x * 2.1 - p.y * 1.7) * 0.5 + sin(time * 8.9 + phase * 17.0) * 0.25;
+  return (vec2f(0.86, 0.5) * lean * 0.5 * t * t + vec2f(-0.5, 0.86) * shiver * (0.03 + 0.09 * gust) * t * t * t) * hgt;
+}
+struct Blade {
+  wp: vec3f,
+  n: vec3f,
+  tv: vec3f,     // height along the blade, per-blade tint, dryness
+  grows: bool,
+};
+fn blade(vi: u32, ii: u32) -> Blade {
+  var o: Blade;
+  o.grows = false;
   // which ring
   var k = ii;
   var cell = 0.5;
   var n = ${GRASS_FAR}u;
   var hole = 17.5;
-  var hmul = 1.35;
-  var wmul = 2.6;
+  var hmul = 1.75;
+  var wmul = 3.0;
   if (ii >= 200000u) { k = ii - 200000u; hole = 0.0; }
-  else if (ii >= 65536u) { k = ii - 65536u; cell = 0.14; n = ${GRASS_NEAR}u; hole = -1.0; hmul = 1.0; wmul = 1.7; }
+  else if (ii >= 65536u) { k = ii - 65536u; cell = 0.14; n = ${GRASS_NEAR}u; hole = 0.0; hmul = 1.4; wmul = 2.0; }
   let reach = f32(n) * cell * 0.5;
   let c = floor(F.camPos.xz / cell) - f32(n / 2u) + vec2f(f32(k % n), f32(k / n));
   let r1 = hash2(c + cell * 13.7);
@@ -687,7 +700,6 @@ fn grassAt(p: vec2f) -> f32 {
   let dist = length(p - F.camPos.xz);
   var fade = 1.0 - smoothstep(reach * 0.78, reach * 0.98, dist);
   if (hole > 0.0) { fade *= smoothstep(hole * 0.82, hole, dist); }
-  if (hole < 0.0) { fade *= 1.0; }
   let mask = grassAt(p);
   // tufts and bare patches
   let clump = vnoise(p * 0.45);
@@ -711,11 +723,7 @@ fn grassAt(p: vec2f) -> f32 {
   let droop = (0.18 + 0.5 * r1) * hgt;
   var off = dir * droop * t * t + across * halfW;
   var y = hgt * t * (1.0 - 0.22 * t * t);
-  // wind: slow gusts rolling across the field, a quick shiver on top
-  let tm = F.camPos.w;
-  let gust = vnoise(p * 0.07 + vec2f(tm * 0.35, tm * 0.21));
-  let sway = (sin(tm * 1.9 + p.x * 0.37 + p.y * 0.29) * 0.5 + sin(tm * 3.7 + p.x * 0.91 - p.y * 0.73 + r1 * 6.0) * 0.18) * (0.35 + 1.1 * gust);
-  off += vec2f(0.86, 0.5) * sway * hgt * 0.42 * t * t;
+  off += applyGrassWind(p, t, hgt, r1, F.camPos.w);
   // pressed down around the player's feet
   if (F.focus.w > 0.5) {
     let d = p - F.focus.xz;
@@ -726,12 +734,33 @@ fn grassAt(p: vec2f) -> f32 {
       y *= 1.0 - 0.55 * near;
     }
   }
-  let wp = vec3f(p.x + off.x, groundH(p) + y - 0.02, p.y + off.y);
-  o.wp = wp;
-  o.clip = F.viewProj * vec4f(wp, 1.0);
+  o.wp = vec3f(p.x + off.x, groundH(p) + y - 0.02, p.y + off.y);
   // rounded shading: mostly up, a little along the lean and across the width
   o.n = normalize(vec3f(dir.x * 0.5 * t + across.x * side * 0.35, 1.0, dir.y * 0.5 * t + across.y * side * 0.35));
   o.tv = vec3f(t, r4, smoothstep(0.55, 0.85, vnoise(p * 0.05 + 9.0)) * (0.4 + 0.6 * r1));
+  o.grows = true;
+  return o;
+}
+`;
+
+export const GRASS_WGSL = /* wgsl */ `
+${COMMON}
+${GRASS_CORE}
+struct VOut {
+  @builtin(position) clip: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) n: vec3f,
+  @location(2) tv: vec3f,
+};
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+  var o: VOut;
+  o.clip = vec4f(2.0, 2.0, 2.0, 1.0);   // culled unless a blade grows here
+  let b = blade(vi, ii);
+  if (!b.grows) { return o; }
+  o.wp = b.wp;
+  o.clip = F.viewProj * vec4f(b.wp, 1.0);
+  o.n = b.n;
+  o.tv = b.tv;
   return o;
 }
 @fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
@@ -741,7 +770,6 @@ fn grassAt(p: vec2f) -> f32 {
   albedo = mix(albedo, albedo * vec3f(1.3, 1.1, 0.65), i.tv.y * 0.5);
   // dry straw-coloured stretches
   albedo = mix(albedo, vec3f(0.36, 0.31, 0.12) * (0.35 + 0.75 * t), i.tv.z * 0.75);
-  // a pale midrib
   var s: Surface;
   s.albedo = albedo;
   var n = normalize(i.n);
@@ -754,6 +782,19 @@ fn grassAt(p: vec2f) -> f32 {
   var c = shade(s, i.wp);
   c = applyFog(c, i.wp);
   return vec4f(c, 1.0);
+}
+`;
+
+// Depth only, into a shadow cascade: the same blades in the same wind.
+export const GRASS_SHADOW_WGSL = /* wgsl */ `
+${FRAME}
+@group(0) @binding(0) var<uniform> F: Frame;
+${NOISE}
+${GRASS_CORE}
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
+  let b = blade(vi, ii);
+  if (!b.grows) { return vec4f(2.0, 2.0, 2.0, 1.0); }
+  return F.lightVP0 * vec4f(b.wp, 1.0);
 }
 `;
 

@@ -2,7 +2,7 @@
 // models, sky, water, zone wall) lit by a sun with two shadow cascades, then
 // bloom + tonemap + FXAA into the swap chain.
 
-import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_SHADOW_WGSL, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
@@ -548,6 +548,12 @@ export class Renderer {
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: depthMain(true),
       }),
+      grassShadow: d.createRenderPipeline({
+        layout: d.createPipelineLayout({ bindGroupLayouts: [this.bglShadow, this.bglGrass] }),
+        vertex: { module: mod(GRASS_SHADOW_WGSL), entryPoint: 'vs' },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: shadowDepth,
+      }),
       glass: d.createRenderPipeline({
         layout: layoutMain,
         vertex: { module: box, entryPoint: 'vs', buffers: boxVB },
@@ -1018,6 +1024,12 @@ export class Renderer {
           sp.draw(mesh.count, v.boxes.lists[s].count);
         }
         this.trees?.drawShadow(sp, k);
+        // the fine grass around the camera throws shadows too (near cascade)
+        if (k === 0 && this.bgGrass && this.quality.grass >= 2 && cam[1] < 140) {
+          sp.setPipeline(this.pipes.grassShadow);
+          sp.setBindGroup(1, this.bgGrass);
+          sp.draw(15, GRASS_NEAR * GRASS_NEAR, 0, 65536);
+        }
         for (const c of carDraws) {
           sp.setPipeline(this.pipes.modelShadow);
           sp.setVertexBuffer(0, c.m.vb);
