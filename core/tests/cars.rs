@@ -431,3 +431,30 @@ fn a_hard_crash_dents_the_car() {
     }
     assert!(m.car_hp[0] > 0.0, "one crash destroyed the car");
 }
+
+#[test]
+fn a_burning_car_blows_up_a_few_seconds_later() {
+    let (mut m, a, _b, o) = stage(7);
+    place(&mut m, a, V3::new(o.x + 40.0, o.y, o.z));
+    let full = m.car_max_hp(0);
+    // damaged, but not yet alight: it just sits there
+    m.hurt_car(0, full * 0.6, 255);
+    assert_eq!(m.car_fire[0], 0);
+    for _ in 0..300 {
+        m.step();
+    }
+    assert!(m.car_hp[0] > 0.0, "a damaged car that was not burning blew up");
+    // one more hit takes it below the line: it catches fire and the fuse runs
+    m.hurt_car(0, full * 0.25, 255);
+    assert!(m.car_fire[0] != 0 && m.car_hp[0] > 0.0);
+    let mut went = None;
+    for t in 0..400u32 {
+        m.step();
+        if m.car_hp[0] <= 0.0 {
+            went = Some(t);
+            break;
+        }
+    }
+    let t = went.expect("the burning car never blew up");
+    assert!((CAR_FUSE_TICKS - 5..=CAR_FUSE_TICKS + 5).contains(&t), "it blew up after {t} ticks, not about {CAR_FUSE_TICKS}");
+}

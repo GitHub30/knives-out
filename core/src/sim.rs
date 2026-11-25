@@ -9,6 +9,10 @@ use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
 pub const PROTO: u16 = 12;
+/// A car catches fire below this share of its bodywork, and then explodes
+/// after the fuse (5 s) whatever happens.
+pub const CAR_FIRE_AT: f32 = 0.19;
+pub const CAR_FUSE_TICKS: u32 = 150;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;
@@ -457,6 +461,8 @@ pub struct Match {
     /// Bodywork left (0 = a burnt-out wreck) and who damaged it last.
     pub car_hp: Vec<f32>,
     car_hit_by: Vec<u8>,
+    /// Tick each car caught fire (0 = not burning): it blows up a few seconds later.
+    pub car_fire: Vec<u32>,
     car0: Vec<[f32; 4]>,
 }
 
@@ -519,6 +525,7 @@ impl Match {
             car_moved: vec![0; ncar],
             car_hp: Vec::new(),
             car_hit_by: vec![255; ncar],
+            car_fire: vec![0; ncar],
             car0,
         };
         m.car_hp = (0..ncar).map(|k| m.car_max_hp(k)).collect();
@@ -831,6 +838,7 @@ impl Match {
             self.car_moved[k] = self.tick;
             self.car_hp[k] = self.car_max_hp(k);
             self.car_hit_by[k] = 255;
+            self.car_fire[k] = 0;
         }
         self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
         self.pick_next_zone();
@@ -1101,6 +1109,19 @@ impl Match {
         self.car_moved[k] = self.tick;
         if self.car_hp[k] <= 0.0 {
             self.explode_car(k);
+        } else if self.car_hp[k] < self.car_max_hp(k) * CAR_FIRE_AT && self.car_fire[k] == 0 {
+            // the engine catches fire: nothing saves the car now
+            self.car_fire[k] = self.tick.max(1);
+        }
+    }
+
+    /// Burning cars blow up when their fuse runs out.
+    fn update_car_fires(&mut self) {
+        for k in 0..self.car_fire.len() {
+            let lit = self.car_fire[k];
+            if lit != 0 && self.car_hp[k] > 0.0 && self.tick.wrapping_sub(lit) >= CAR_FUSE_TICKS {
+                self.explode_car(k);
+            }
         }
     }
 
@@ -2352,6 +2373,7 @@ impl Match {
                 self.update_timers();
                 self.auto_pickups();
                 self.update_nades();
+                self.update_car_fires();
                 self.update_zone();
                 self.zone_damage();
                 self.record_hist();

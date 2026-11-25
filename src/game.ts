@@ -1485,6 +1485,7 @@ export class Game {
     const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
     hud.setPrompt(
       needLock ? 'クリックしてマウス操作を開始'
+        : driving && (this.cars[this.myCar]?.hp ?? 255) < 50 ? '🔥 炎上中 — まもなく爆発！' + (touch ? ' 降りて離れろ' : ' [F] で降りて離れろ')
         : driving ? `${kmh} km/h　車体 ${Math.ceil(((this.cars[this.myCar]?.hp ?? 255) / 255) * 100)}%` + (touch ? '' : '　[F] 降りる　[Space] ブレーキ')
         : touch ? null
         : item ? `[F] 拾う: ${item}`
