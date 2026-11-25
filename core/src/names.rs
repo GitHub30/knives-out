@@ -210,7 +210,7 @@ pub fn name_key(name: &str) -> String {
     k.replace("rn", "m").replace("vv", "w")
 }
 
-// ---- tables generated from Unicode 15.1.0 data (scratch gen_names4.py)
+// ---- tables generated from Unicode 15.1.0 data (scratch gen_names5.py)
 
 /// Precomposed letters (Latin, Greek, Cyrillic) to their base letter (NFD minus marks).
 fn strip_marks(c: u32) -> Option<char> {
@@ -919,10 +919,12 @@ fn look_alike(c: u32) -> Option<&'static str> {
         0x470..=0x471 => "ψ",
         0x472..=0x473 => "θ",
         0x474..=0x475 => "v",
+        0x48C..=0x48D => "ѣ",
         0x4AA..=0x4AB => "c",
         0x4AE..=0x4AF => "y",
         0x4BA..=0x4BB => "h",
         0x4C0 => "l",
+        0x4CB..=0x4CC => "ҷ",
         0x4CF => "l",
         0x4D4..=0x4D5 => "ae",
         0x4D8..=0x4D9 => "e",
@@ -944,8 +946,9 @@ fn look_alike(c: u32) -> Option<&'static str> {
         0x5D5 => "l",
         0x5DF => "l",
         0x627 => "l",
-        0x649..=0x64A => "ى",
+        0x649 => "ى",
         0x6CC => "ى",
+        0xCDD => "ౝ",
         0x1E9E => "ss",
         0x2010 => "-",
         0x2012..=0x2013 => "-",
@@ -957,9 +960,25 @@ fn look_alike(c: u32) -> Option<&'static str> {
         0x2212 => "-",
         0x2215 => "/",
         0x2219 => "·",
+        0x222B => "ʃ",
         0x2236 => ":",
         0x2500..=0x2501 => "ー",
+        0x25BA => "▶",
+        0x25BB => "▷",
+        0x25C4 => "◀",
+        0x25C5 => "◁",
         0x25CB => "o",
+        0x25FE => "◽",
+        0x2780 => "①",
+        0x2781 => "②",
+        0x2782 => "③",
+        0x2783 => "④",
+        0x2784 => "⑤",
+        0x2785 => "⑥",
+        0x2786 => "⑦",
+        0x2787 => "⑧",
+        0x2788 => "⑨",
+        0x2789 => "⑩",
         0x3007 => "o",
         0x3078 => "ヘ",
         0x308A => "リ",
@@ -986,6 +1005,7 @@ fn look_alike(c: u32) -> Option<&'static str> {
         0x5F50 => "ヨ",
         0x5F61 => "ミ",
         0x624D => "オ",
+        0xFE33 => "ー",
         _ => return None,
     })
 }
@@ -1211,7 +1231,6 @@ fn compat_fold(c: u32) -> Option<&'static str> {
         0xFE30 => "..",
         0xFE31 => "—",
         0xFE32 => "–",
-        0xFE33 => "_",
         0xFE34 => "_",
         0xFE35 => "(",
         0xFE36 => ")",

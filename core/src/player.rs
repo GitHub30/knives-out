@@ -372,6 +372,7 @@ pub struct Gear {
     pub healing: bool,
     pub reloading: bool,
     pub vest: bool,
+    pub helm: bool,
 }
 
 /// The client model's torso boxes in the torso frame: centre and full size
@@ -392,6 +393,18 @@ const GUN_BOXES: [&[[f32; 6]]; 7] = [
 ];
 
 impl BodyPose {
+    /// Ray vs the head: the 0.2 m sphere on the drawn head, and the drawn
+    /// head boxes themselves (face, hair or helmet: the helmet and the box's
+    /// corners reach beyond the sphere). The entry distance.
+    pub fn ray_head(&self, o: V3, d: V3, maxt: f32, helm: bool) -> Option<f32> {
+        let head = self.torso.child([0.0, 0.6, 0.0], rot_x(-self.pitch * 0.55 - self.lean * 0.6));
+        let top = if helm { ([0.0, 0.25, 0.0], [0.3, 0.13, 0.31]) } else { ([0.0, 0.27, -0.01], [0.26, 0.05, 0.27]) };
+        [ray_sphere(o, d, self.head, 0.2, maxt), head.ray_box(o, d, [0.0, 0.14, 0.01], [0.25, 0.27, 0.27], maxt), head.ray_box(o, d, top.0, top.1, maxt)]
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| a.total_cmp(b))
+    }
+
     /// Ray vs the drawn torso (shirt, vest, backpack): the entry distance.
     pub fn ray_torso(&self, o: V3, d: V3, maxt: f32, vest: bool) -> Option<f32> {
         [Some(SHIRT_BOX), vest.then_some(VEST_BOX), Some(PACK_BOX)]

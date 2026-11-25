@@ -761,3 +761,72 @@ fn players_coming_into_view_are_judged_where_drawn() {
     }
     assert_eq!(heads, 7, "only {heads} of 7 shots at B where it is drawn hit its head");
 }
+
+// ---------------------------------------------------------------------------
+// Sixth adversarial review
+
+/// The drawn head of the client's model (models.ts emitCharacter): the head
+/// frame, on top of the leaning torso.
+fn drawn_head(pos: V3, yaw: f32, pitch: f32, crouch: bool) -> Fr {
+    let pitch = pitch.clamp(-1.2, 1.2);
+    let lean = if crouch { 0.15 } else { 0.05 };
+    let torso = Fr(pos, mry(yaw)).child([0.0, if crouch { 0.5 } else { 0.95 }, 0.0], mry(0.0)).child([0.0, 0.02, 0.0], mrx(lean));
+    torso.child([0.0, 0.6, 0.0], mrx(-pitch * 0.55 - lean * 0.6))
+}
+
+/// A helmet is drawn larger than the head sphere (and the head box's corners
+/// stick out of it): shots that the client shows hitting the helmet or the
+/// face, with no other part of the model in front, are headshots.
+#[test]
+fn shots_at_a_drawn_helmet_are_headshots() {
+    let mut m = Match::new(42, 2, FLAG_OFFLINE, 3);
+    let a = m.add_human(b"A").unwrap() as usize;
+    let b = m.add_human(b"B").unwrap() as usize;
+    m.step();
+    m.players[a].bot = true; // live positions, no rewind
+    let t = V3::new(500.0, 200.0, 500.0);
+    let mut rng = Rng::new(17);
+    for (helm, pitch, crouch) in [(1u8, 0.0f32, false), (2, -1.2, false), (3, 1.2, false), (1, 0.0, true), (0, 0.0, false)] {
+        let (mut n, mut heads) = (0, 0);
+        for yaw in [0.0f32, 1.1, 2.3, -2.0] {
+            {
+                let q = &mut m.players[b];
+                q.ms = MoveState { pos: t, mode: MODE_GROUND, on_ground: true, crouch, ..Default::default() };
+                q.yaw = yaw;
+                q.pitch = pitch;
+                q.draw_speed = 0.0;
+                q.slots[0] = (W_AR, 10);
+                q.cur = 0;
+                q.ads = false;
+                q.helm = helm;
+                q.vest = 0;
+            }
+            let head = drawn_head(t, yaw, pitch, crouch);
+            let look = Look { mode: MODE_GROUND, crouch, weapon: W_AR, ads: false, healing: false };
+            for k in 0..12 {
+                let az = k as f32 * TAU / 12.0;
+                let back = V3::new(az.sin(), 0.0, az.cos());
+                for _ in 0..40 {
+                    // a random point of the drawn helmet (or hair) and face boxes
+                    let (c, s) = if rng.f() < 0.5 {
+                        if helm > 0 { ([0.0, 0.25, 0.0], [0.3, 0.13, 0.31]) } else { ([0.0, 0.27, -0.01], [0.26, 0.05, 0.27]) }
+                    } else {
+                        ([0.0, 0.14, 0.01], [0.25, 0.27, 0.27])
+                    };
+                    let p = head.at([c[0] + rng.range(-0.48, 0.48) * s[0], c[1] + rng.range(-0.48, 0.48) * s[1], c[2] + rng.range(-0.48, 0.48) * s[2]]);
+                    let o = p + back * 25.0;
+                    let d = (p - o).norm();
+                    // only shots the client draws reaching the head first
+                    if drawn_upper(t, yaw, pitch, look, o, d, 25.0) != 0 {
+                        continue;
+                    }
+                    n += 1;
+                    heads += matches!(m.ray_players(a, o, d, 40.0, 0), Some((j, _, true)) if j == b) as u32;
+                }
+            }
+        }
+        let frac = heads as f32 / n.max(1) as f32;
+        eprintln!("helmet {helm}, pitch {pitch}, crouch {crouch}: {n} shots at the drawn head, {:.1}% headshots", frac * 100.0);
+        assert!(frac >= 0.99, "helmet {helm}, pitch {pitch}: only {:.1}% of shots at the drawn head and helmet are headshots", frac * 100.0);
+    }
+}

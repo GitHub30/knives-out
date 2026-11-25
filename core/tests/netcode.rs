@@ -790,3 +790,198 @@ fn rewind_cannot_drop_from_floor_to_one_tick() {
     }
     assert!((last - 3.0).abs() < 0.01, "still rewound {last:.2} ticks after the drop");
 }
+
+// ---------------------------------------------------------------------------
+// Sixth adversarial review
+
+enum Up {
+    Cmds(Vec<u8>),
+    Ping(f64),
+}
+enum Down {
+    Snap(u32, u32, u8, MoveState, f32),
+    Pong(f64),
+}
+
+/// stall_run with the client's own path estimate (Game.onMessage S_PONG and
+/// Game.reconcile): pings every 2 s share the uplink with the commands and
+/// are echoed by the Room at once; the guard is late = now - (path + 100),
+/// path = the median of the last 3 samples, leaving out pings that were in
+/// flight when a snapshot reported a debt of 4 or more (`keep_stalled`
+/// keeps them, as 4cf0bb3 did). Returns (hard snaps, worst correction).
+fn stall_run_pings(mode: u8, holds: &[(f64, f64)], ping0: f64, keep_stalled: bool) -> (u32, f32) {
+    let mut m = Match::new(42, 2, 0, 99);
+    let a = m.add_human(b"A").unwrap();
+    let _b = m.add_human(b"B").unwrap();
+    m.step();
+    let g = open_run(&m);
+    m.players[a as usize].ms = match mode {
+        MODE_FALL => MoveState { pos: g + V3::new(0.0, 700.0, 0.0), vel: V3::new(0.0, -5.0, 0.0), mode: MODE_FALL, ..Default::default() },
+        MODE_PARA => MoveState { pos: g + V3::new(0.0, 125.0, 0.0), vel: V3::new(0.0, -6.0, 0.0), mode: MODE_PARA, ..Default::default() },
+        _ => MoveState { pos: g, mode: MODE_GROUND, on_ground: true, ..Default::default() },
+    };
+    let yaw = q_yaw(yaw_to(1.0, 0.0));
+    let mut rng = Rng::new(1000 + mode as u64);
+    let (base, jit) = (25.0f64, 10.0f64);
+    let (tick_ms, frame_ms) = (1000.0 / 30.0, 1000.0 / 60.0);
+    let (mut next_tick, mut next_frame) = (tick_ms, 0.0f64);
+    let mut up_q: VecDeque<(f64, Up)> = VecDeque::new();
+    let mut down_q: VecDeque<(f64, Down)> = VecDeque::new();
+    let (mut last_up, mut last_down) = (0.0f64, 0.0f64);
+    let mut seq = m.players[a as usize].last_seq;
+    let mut pending: VecDeque<(u32, Q, f64)> = VecDeque::new();
+    let mut outbox: Vec<Q> = Vec::new();
+    let mut pred: Option<MoveState> = None;
+    let mut mult = 1.0f32;
+    let (mut cmd_acc, mut last_frame, mut latest_tick) = (0.0f64, 0.0f64, 0u32);
+    let (mut ping_sent, mut rtt_s) = (ping0 - 2000.0, 0.0f64);
+    let mut samples: VecDeque<f64> = VecDeque::new();
+    let mut stall_seen = -1.0f64;
+    let end = holds.last().map_or(0.0, |&(h, d)| h + d) + 1500.0;
+    let (mut hard, mut worst) = (0u32, 0.0f32);
+    let held = |t: f64, at: f64| holds.iter().fold(at, |at, &(h, d)| if t >= h && t < h + d { at.max(h + d) } else { at });
+    loop {
+        let t;
+        if next_tick <= next_frame {
+            t = next_tick;
+            next_tick += tick_ms;
+            while up_q.front().map_or(false, |(at, _)| *at <= t) {
+                match up_q.pop_front().unwrap().1 {
+                    Up::Cmds(b) => m.on_message(a, &b),
+                    Up::Ping(sent) => {
+                        let at = (t + base + rng.f() as f64 * jit).max(last_down);
+                        last_down = at;
+                        down_q.push_back((at, Down::Pong(sent)));
+                    }
+                }
+            }
+            if m.step() & 1 != 0 {
+                let buf = m.snapshot(a).to_vec();
+                let ack = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                let debt = buf[17 + 81];
+                let p = &m.players[a as usize];
+                let at = (t + base + rng.f() as f64 * jit).max(last_down);
+                last_down = at;
+                down_q.push_back((at, Down::Snap(m.tick, ack, debt, p.ms, p.speed_mult())));
+            }
+        } else {
+            t = next_frame;
+            next_frame += frame_ms;
+            while down_q.front().map_or(false, |(at, _)| *at <= t) {
+                let (tick, ack, debt, ms, sm) = match down_q.pop_front().unwrap().1 {
+                    Down::Pong(sent) => {
+                        let sample = t - sent;
+                        rtt_s = if rtt_s == 0.0 { sample } else { rtt_s + (sample - rtt_s) * 0.3 };
+                        if keep_stalled || stall_seen < sent {
+                            samples.push_back(sample);
+                            if samples.len() > 3 {
+                                samples.pop_front();
+                            }
+                        }
+                        continue;
+                    }
+                    Down::Snap(tick, ack, debt, ms, sm) => (tick, ack, debt, ms, sm),
+                };
+                if debt >= 4 {
+                    stall_seen = t;
+                }
+                if tick <= latest_tick {
+                    continue;
+                }
+                latest_tick = tick;
+                while pending.front().map_or(false, |q| q.0 <= ack) {
+                    pending.pop_front();
+                }
+                let old = pred.map(|p| p.pos);
+                let mut s = ms;
+                mult = sm;
+                let path = if samples.is_empty() {
+                    rtt_s
+                } else {
+                    let mut v: Vec<f64> = samples.iter().cloned().collect();
+                    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    v[(v.len() - 1) / 2]
+                };
+                let late = t - (path + 100.0);
+                let mut skip = 0;
+                while skip < debt as usize && skip < pending.len() && pending[skip].2 < late {
+                    skip += 1;
+                }
+                for (_, q, _) in pending.iter().skip(skip) {
+                    step_move(&m.w, &mut s, &Cmd::from_quant(0, 0, q.2, q.3, q.4, q.5, q.6), mult, DT);
+                }
+                if let (Some(o), true) = (old, ms.mode == mode) {
+                    let d = (o - s.pos).len();
+                    hard += (d >= 3.0) as u32;
+                    worst = worst.max(d);
+                }
+                pred = Some(s);
+            }
+            cmd_acc += t - last_frame;
+            last_frame = t;
+            let mut n = 0;
+            while cmd_acc >= tick_ms && n < 4 {
+                cmd_acc -= tick_ms;
+                n += 1;
+                seq += 1;
+                let q: Q = (seq, latest_tick.saturating_sub(4) * 256, 0, 127, yaw, 0, 0);
+                pending.push_back((seq, q, t));
+                if pending.len() > 90 {
+                    pending.pop_front();
+                }
+                outbox.push(q);
+                if let Some(p) = pred.as_mut() {
+                    step_move(&m.w, p, &Cmd::from_quant(0, 0, q.2, q.3, q.4, q.5, q.6), mult, DT);
+                }
+            }
+            if outbox.len() >= 2 {
+                let at = held(t, t + base + rng.f() as f64 * jit).max(last_up);
+                last_up = at;
+                up_q.push_back((at, Up::Cmds(cmd_bytes(&outbox))));
+                outbox.clear();
+            }
+            if t - ping_sent > 2000.0 {
+                ping_sent = t;
+                let at = held(t, t + base + rng.f() as f64 * jit).max(last_up);
+                last_up = at;
+                up_q.push_back((at, Up::Ping(t)));
+            }
+        }
+        if t > end || (m.players[a as usize].ms.mode != mode && t > 1000.0) {
+            break;
+        }
+    }
+    (hard, worst)
+}
+
+/// Clustered uplink stalls (TCP retransmit backoff, radio handovers): pings
+/// held by one stall must not carry the path estimate into the next, or the
+/// client replays the commands the server's idle steps covered.
+#[test]
+fn clustered_stalls_keep_the_debt_guard() {
+    let sched = |holds: &[f64]| {
+        let mut v = vec![];
+        let mut t = 2500.0;
+        for &h in holds {
+            v.push((t, h));
+            t += h + 300.0;
+        }
+        v
+    };
+    let mut fails = vec![];
+    let mut old_fails = 0;
+    for holds in [sched(&[4500.0, 2000.0]), sched(&[4500.0, 600.0]), sched(&[2200.0, 2200.0, 2200.0])] {
+        for (mode, name, limit) in [(MODE_FALL, "freefall", 3.0f32), (MODE_PARA, "parachute", 1.2), (MODE_GROUND, "ground", 0.8)] {
+            for ph in [0.0, 500.0, 1000.0, 1500.0] {
+                let (hard, worst) = stall_run_pings(mode, &holds, ph, false);
+                if hard > 0 || worst >= limit {
+                    fails.push(format!("{:?} {name} ping phase {ph}: {hard} hard, {worst:.2} m", holds.iter().map(|h| h.1).collect::<Vec<_>>()));
+                }
+                let (hard, _) = stall_run_pings(mode, &holds, ph, true);
+                old_fails += (hard > 0) as u32;
+            }
+        }
+    }
+    eprintln!("with stalled pings kept (4cf0bb3): {old_fails} of 36 runs snap");
+    assert!(fails.is_empty(), "{} failing runs:\n{}", fails.len(), fails.join("\n"));
+}

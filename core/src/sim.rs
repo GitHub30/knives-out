@@ -150,8 +150,8 @@ pub struct HistE {
     pub pitch: f32,
     pub sprint: bool,
     pub mode: u8,
-    /// The held weapon and the snapshot flags that move the drawn arms:
-    /// bit 0 ADS, 1 firing, 2 healing, 3 reloading, 4 vest.
+    /// The held weapon and the snapshot flags that shape the drawn model:
+    /// bit 0 ADS, 1 firing, 2 healing, 3 reloading, 4 vest, 5 helmet.
     pub weapon: u8,
     pub gear: u8,
 }
@@ -167,12 +167,12 @@ impl HistE {
             sprint: p.draw_speed > SPRINT_DRAW_SPEED,
             mode: p.ms.mode,
             weapon: p.weapon(),
-            gear: (p.ads as u8) | (((p.firing_t > 0.0) as u8) << 1) | (((p.heal_t > 0.0) as u8) << 2) | (((p.reload_t > 0.0) as u8) << 3) | (((p.vest > 0) as u8) << 4),
+            gear: (p.ads as u8) | (((p.firing_t > 0.0) as u8) << 1) | (((p.heal_t > 0.0) as u8) << 2) | (((p.reload_t > 0.0) as u8) << 3) | (((p.vest > 0) as u8) << 4) | (((p.helm > 0) as u8) << 5),
         }
     }
     fn gear(&self) -> Gear {
         let g = self.gear;
-        Gear { weapon: self.weapon, ads: g & 1 != 0, firing: g & 2 != 0, healing: g & 4 != 0, reloading: g & 8 != 0, vest: g & 16 != 0 }
+        Gear { weapon: self.weapon, ads: g & 1 != 0, firing: g & 2 != 0, healing: g & 4 != 0, reloading: g & 8 != 0, vest: g & 16 != 0, helm: g & 32 != 0 }
     }
 }
 
@@ -1147,16 +1147,16 @@ impl Match {
             if perp2 > 4.0 {
                 continue;
             }
-            // head sphere on the rendered head; the body capsule reaches the
-            // shoulders. A ray that reaches both is a body hit only if it
+            // head: a sphere on the rendered head plus the drawn head boxes
+            // (helmet included); the body capsule reaches the shoulders. A ray that reaches both is a body hit only if it
             // enters the capsule at the legs (below the hip along the body
             // axis, which is tilted in free fall) or passes a drawn part of
             // the upper body (torso, arms, weapon, medkit) before the head:
             // the capsule is fatter than the drawn body, and a ray that rises
             // past the chest to the chin is drawn hitting the head.
             let pose = body_pose(p, h.yaw, h.pitch, h.crouch, h.sprint, h.mode);
-            let head_c = pose.head;
-            let th = ray_sphere(o, d, head_c, 0.2, lim);
+            let gear = h.gear();
+            let th = pose.ray_head(o, d, lim, gear.helm);
             let upright = h.mode != MODE_FALL;
             let tb = if upright { ray_capsule(o, d, p.x, p.z, pose.a.y, pose.b.y, 0.33, lim) } else { ray_capsule_seg(o, d, pose.a, pose.b, 0.33, lim) };
             let legs = |tb: f32| {
@@ -1165,7 +1165,7 @@ impl Match {
             };
             let hit = match (th, tb) {
                 (Some(th), Some(tb)) if tb < th && legs(tb) => Some((tb, false)),
-                (Some(th), tb) if pose.ray_upper(o, d, th, h.gear()) => Some((tb.map_or(th, |tb| tb.min(th)), false)),
+                (Some(th), tb) if pose.ray_upper(o, d, th, gear) => Some((tb.map_or(th, |tb| tb.min(th)), false)),
                 (Some(th), _) => Some((th, true)),
                 (None, Some(tb)) => Some((tb, false)),
                 (None, None) => None,
@@ -2146,7 +2146,10 @@ impl Match {
             w.u8(nb.len() as u8);
             w.bytes(nb);
         }
-        let alive: Vec<usize> = (0..self.items.len()).filter(|&k| self.items[k].alive).collect();
+        // listed by wire id: in internal (creation) order, the position of
+        // an item in the list would date it
+        let mut alive: Vec<usize> = (0..self.items.len()).filter(|&k| self.items[k].alive).collect();
+        alive.sort_by_key(|&k| item_wire(self.salt, k as u16));
         w.u16(alive.len() as u16);
         for &k in &alive {
             let it = &self.items[k];
@@ -2446,7 +2449,9 @@ impl Match {
                     let unseen = b[27] == 3 && {
                         let dv = endp - ceye;
                         let l = dv.len();
-                        l > 0.5 && self.w.raycast(ceye, dv * (1.0 / l), (l - 0.3).max(0.0)).is_some()
+                        // (stopping just short of the end: walls are 0.3 m
+                        // thick, and an impact on the far face is unseen)
+                        l > 0.5 && self.w.raycast(ceye, dv * (1.0 / l), (l - 0.05).max(0.0)).is_some()
                     };
                     if b[27] == 0 || near_wall || unseen {
                         let dir = if e.dir.len() > 0.5 { e.dir } else { (get_v3(&b, 15) - m).norm() };
@@ -2583,9 +2588,11 @@ impl Match {
             }
             todo.sort_by(|a, b| a.0.total_cmp(&b.0));
             for &(_, c) in todo.iter().take(4) {
-                let ids: Vec<usize> = (0..self.items.len())
+                let mut ids: Vec<usize> = (0..self.items.len())
                     .filter(|&k| self.items[k].alive && item_chunk(self.items[k].pos.x, self.items[k].pos.z) == c)
                     .collect();
+                // by wire id, not in creation order (which would date them)
+                ids.sort_by_key(|&k| item_wire(salt, k as u16));
                 let mut w = Wr::new(&mut self.out);
                 w.u8(E_ICHUNK);
                 w.u8(c as u8);

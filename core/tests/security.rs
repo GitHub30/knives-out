@@ -540,3 +540,37 @@ fn names_round5() {
         assert_eq!(add(b), b, "{b:?} got a suffix next to {a:?}");
     }
 }
+
+/// Sixth review: symbol and rare-letter twins drawn alike.
+#[test]
+fn names_round6() {
+    for (a, b) in [
+        ("Player\u{2460}", "Player\u{2780}"), // ① / ➀
+        ("Player\u{2468}", "Player\u{2788}"), // ⑨ / ➈
+        ("\u{25b6}Kaze", "\u{25ba}Kaze"),     // ▶ / ►
+        ("Kaze\u{25c0}", "Kaze\u{25c4}"),     // ◀ / ◄
+        ("Ma\u{283}a", "Ma\u{222b}a"),        // ʃ / ∫
+        ("\u{462}RA", "\u{48c}RA"),           // Ѣ / Ҍ
+        ("\u{4b6}\u{41e}\u{41d}", "\u{4cb}\u{41e}\u{41d}"), // Ҷ / Ӌ
+        ("A\u{c5d}", "A\u{cdd}"),             // ౝ / ೝ
+        ("A\u{fe31}B", "A\u{fe33}B"),         // ︱ / ︳
+    ] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        let na = add(a);
+        let nb = add(b);
+        assert_eq!(na, a, "{a:?} was changed to {na:?}");
+        assert!(nb.contains('#'), "{b:?} ({nb:?}) is accepted next to {a:?}");
+    }
+    // Ali (Arabic yeh, dotted) is not the same name as على
+    let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+    let mut add = |s: &str| {
+        let id = m.add_human(s.as_bytes()).unwrap();
+        m.players[id as usize].name.clone()
+    };
+    add("\u{639}\u{644}\u{64a}");
+    assert_eq!(add("\u{639}\u{644}\u{649}"), "\u{639}\u{644}\u{649}");
+}

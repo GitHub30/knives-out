@@ -63,8 +63,9 @@ const ERR_PRIV_NET = 6;
 const ERR_RATE = 7;
 const TICK_MS = 1000 / 30;
 const MAX_MSG = 256;
-/** Token bucket burst (messages). */
+/** Token bucket burst (messages), and its size right after a long silence. */
 const BURST = 130;
+const MAX_BURST = 2000;
 const MAX_ROOM_MS = 25 * 60 * 1000;
 const MAX_PER_IP_ROOM = 3;
 const MAX_PER_NET = 4;
@@ -121,21 +122,22 @@ function refuse(code: number, reason: string): Response {
   return new Response(null, { status: 101, webSocket: pair[0] });
 }
 
-/** Too many join attempts: say so in-band a few times a minute per network
- * (and per IPv6 /48, so rotating /64s does not multiply them), then answer
- * plain 429s, which the runtime closes by itself (an in-band refusal is an
- * accepted socket that lingers until the client closes it). */
-async function refuseRate(env: Env, net: string): Promise<Response> {
+/** Refuse a join, whatever the reason: in-band (so the player sees why) a
+ * few times a minute per network and per IPv6 /48 (so rotating /64s does not
+ * multiply them), then with a plain HTTP status, which the runtime closes by
+ * itself (an in-band refusal is an accepted socket that lingers until the
+ * client answers its close frame). */
+async function refuseJoin(env: Env, net: string, code: number, reason: string, status = 429): Promise<Response> {
   if (env.REFUSE_LIMIT) {
     const { success } = await env.REFUSE_LIMIT.limit({ key: net });
-    if (!success) return plain('Too many join attempts', 429);
+    if (!success) return plain(reason, status);
   }
   const g48 = net48(net);
   if (env.REFUSE_LIMIT48 && g48 !== net) {
     const { success } = await env.REFUSE_LIMIT48.limit({ key: g48 });
-    if (!success) return plain('Too many join attempts', 429);
+    if (!success) return plain(reason, status);
   }
-  return refuse(ERR_RATE, 'too many join attempts');
+  return refuse(code, reason);
 }
 
 function plain(text: string, status: number): Response {
@@ -162,7 +164,7 @@ export default {
       if (env.JOIN_LIMIT) {
         // per address (IPv4, or IPv6 /64)
         const { success } = await env.JOIN_LIMIT.limit({ key: net });
-        if (!success) return refuseRate(env, net);
+        if (!success) return refuseJoin(env, net, ERR_RATE, 'too many join attempts');
       }
       const g48 = net48(net);
       if (env.JOIN_LIMIT48 && g48 !== net) {
@@ -170,7 +172,7 @@ export default {
         // own, larger budget, checked after the /64 key: a single /64 can
         // spend at most its own allowance of it, not lock its /48 out.
         const { success } = await env.JOIN_LIMIT48.limit({ key: g48 });
-        if (!success) return refuseRate(env, net);
+        if (!success) return refuseJoin(env, net, ERR_RATE, 'too many join attempts');
       }
       const name = (url.searchParams.get('name') ?? '').slice(0, 32);
       const code = url.searchParams.get('room');
@@ -180,9 +182,9 @@ export default {
       const r = await lobbyStub(env).fetch('https://lobby/join', { method: 'POST', body: JSON.stringify({ net, code }) });
       if (!r.ok) {
         const err = ((await r.json().catch(() => ({}))) as { error?: string }).error;
-        if (err === 'privnet') return refuse(ERR_PRIV_NET, 'too many private rooms');
-        if (r.status === 429) return refuse(ERR_TOO_MANY, 'too many connections');
-        return refuse(ERR_BUSY, 'server busy');
+        if (err === 'privnet') return refuseJoin(env, net, ERR_PRIV_NET, 'too many private rooms');
+        if (r.status === 429) return refuseJoin(env, net, ERR_TOO_MANY, 'too many connections');
+        return refuseJoin(env, net, ERR_BUSY, 'server busy', 503);
       }
       const { room } = (await r.json()) as { room: string };
       const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
@@ -330,6 +332,8 @@ interface Conn {
   ip: string;
   net: string;
   tokens: number;
+  /** Token bucket size: BURST, or more right after a silence (see onMessage). */
+  cap: number;
   lastRefill: number;
   strikes: number;
   strikeWindow: number;
@@ -383,20 +387,10 @@ export class Room {
     if (!this.ex || (this.ended && this.conns.size === 0)) this.init(isPrivate);
     const ex = this.ex!;
 
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
-    server.accept();
     const reject = (code: number, reason: string) => {
       // The Lobby already counted this socket.
       this.notifyLobby('/leave', { net, room: this.roomName });
-      try {
-        server.send(new Uint8Array([S_ERROR, code]));
-        server.close(4000 + code, reason);
-      } catch {
-        /* ignore */
-      }
-      return new Response(null, { status: 101, webSocket: client });
+      return refuseJoin(this.env, net, code, reason);
     };
     if (this.ended || ex.srv_phase() !== 0) return reject(ERR_STARTED, 'match already started');
     const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown';
@@ -408,8 +402,12 @@ export class Room {
     new Uint8Array(ex.memory.buffer, ex.in_ptr(), name.length).set(name);
     const pid = ex.srv_add(name.length);
     if (pid < 0) return reject(ERR_FULL, 'room full');
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
     const now = Date.now();
-    const conn: Conn = { pid, ip, net, tokens: BURST, lastRefill: now, strikes: 0, strikeWindow: now, lastMsg: now };
+    const conn: Conn = { pid, ip, net, tokens: BURST, cap: BURST, lastRefill: now, strikes: 0, strikeWindow: now, lastMsg: now };
     this.conns.set(server, conn);
     this.sendOut(server, ex.srv_welcome(pid));
 
@@ -443,13 +441,21 @@ export class Room {
       this.strike(ws, c);
       return;
     }
-    // token bucket: 45 msgs/s sustained; the burst holds what an uplink
-    // stall of up to ~8 s queues (15 command messages a second plus pings),
-    // so the commands after a stall reach the core, whose lag accounting
-    // drops the ones idle steps already covered (keeping their taps)
+    // token bucket: 45 msgs/s sustained, burst BURST. The first message after
+    // a silence (an uplink stall: everything queued arrives at once) opens
+    // the bucket to what the stall queued, ~16 messages a second, so the
+    // commands reach the core, whose lag accounting drops the ones its idle
+    // steps covered (keeping their taps). CMDQ_CAP still bounds the queue.
     const now = Date.now();
+    const silent = now - c.lastMsg;
     c.lastMsg = now;
-    c.tokens = Math.min(BURST, c.tokens + ((now - c.lastRefill) / 1000) * 45);
+    if (silent > 2000) {
+      c.cap = Math.min(MAX_BURST, Math.max(BURST, (silent / 1000) * 16));
+      c.tokens = c.cap;
+    } else if (c.tokens < BURST) {
+      c.cap = BURST;
+    }
+    c.tokens = Math.min(c.cap, c.tokens + ((now - c.lastRefill) / 1000) * 45);
     c.lastRefill = now;
     if (c.tokens < 1) {
       this.strike(ws, c);

@@ -1176,9 +1176,11 @@ fn hidden_shooters_unseen_impacts_are_coarse() {
                     exact += 1;
                     let g = [8.0f32, 16.0, 32.0].into_iter().find(|&g| ((from.x / g) - 0.5).fract().abs() < 1e-4 && ((from.z / g) - 0.5).fract().abs() < 1e-4).unwrap_or(8.0);
                     assert!((*end - *from).len() >= g + 8.0, "seed {seed}: an exact wall hit {:.2} m from the cell centre", (*end - *from).len());
+                    // (to just short of the end: walls are 0.3 m thick, and
+                    // an impact on a wall's far face is out of sight too)
                     let dv = *end - eye;
                     let l = dv.len();
-                    assert!(l <= 0.5 || m.w.raycast(eye, dv * (1.0 / l), (l - 0.3).max(0.0)).is_none(), "seed {seed}: an exact wall hit the viewer cannot see, {l:.1} m away");
+                    assert!(l <= 0.5 || m.w.raycast(eye, dv * (1.0 / l), (l - 0.02).max(0.0)).is_none(), "seed {seed}: an exact wall hit the viewer cannot see, {l:.1} m away");
                 }
             }
         }
@@ -1233,4 +1235,56 @@ fn item_ids_on_the_wire_do_not_count_creations() {
     let up = wire.windows(2).filter(|p| p[1] > p[0]).count() as f32 / (wire.len() - 1) as f32;
     eprintln!("{} drops, wire ids ascending between consecutive drops {:.0}% of the time", wire.len(), up * 100.0);
     assert!((0.2..=0.8).contains(&up), "wire ids follow the creation order ({:.0}% ascending)", up * 100.0);
+}
+
+// ---------------------------------------------------------------------------
+// Sixth adversarial review
+
+/// The welcome and chunk resyncs list items by their wire id: in creation
+/// (internal id) order, an item's position in the list would date it.
+#[test]
+fn item_lists_do_not_follow_creation_order() {
+    let (mut m, ids) = setup(42, 2);
+    let v = ids[0];
+    // the welcome: ids as they are on the wire (raw bytes, see sim.rs welcome)
+    let buf = m.welcome(v).to_vec();
+    let mut r = 1 + 2 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 4;
+    let np = buf[r] as usize;
+    r += 1;
+    for _ in 0..np {
+        r += 3;
+        let nl = buf[r] as usize;
+        r += 1 + nl;
+    }
+    let n = u16::from_le_bytes([buf[r], buf[r + 1]]) as usize;
+    r += 2;
+    // id u16, kind u8, amount u16, position 3 x f32
+    let wire: Vec<u16> = (0..n).map(|k| u16::from_le_bytes([buf[r + k * 17], buf[r + k * 17 + 1]])).collect();
+    assert!(n > 100);
+    assert!(wire.windows(2).all(|p| p[0] < p[1]), "welcome items not listed by wire id");
+    let internal: Vec<u16> = wire.iter().map(|&w| m.item_from_wire(w)).collect();
+    let ordered = internal.windows(2).filter(|p| p[0] < p[1]).count() as f32 / (n - 1) as f32;
+    assert!((0.3..=0.7).contains(&ordered), "welcome order follows creation ({:.0}% ascending)", ordered * 100.0);
+    // a chunk resync (raw snapshot bytes, before the id mapping in snap())
+    let c = item_chunk(m.items[0].pos.x, m.items[0].pos.z);
+    let cw = MAP / ICH as f32;
+    let spot = V3::new((c % ICH) as f32 * cw + cw * 0.5, 0.0, (c / ICH) as f32 * cw + cw * 0.5);
+    let gy = m.w.ground_below(spot.x, spot.z, 300.0, P_RADIUS);
+    place(&mut m, v, V3::new(spot.x, gy, spot.z));
+    m.players[v as usize].item_ver.iter_mut().for_each(|x| *x = x.wrapping_sub(1));
+    let mut checked = 0;
+    for _ in 0..4 {
+        m.step();
+        let s = parse(&m.snapshot(v).to_vec());
+        m.flush();
+        for e in &s.events {
+            if let Ev::Chunk { ids, .. } = e {
+                if ids.len() >= 2 {
+                    assert!(ids.windows(2).all(|p| p[0] < p[1]), "chunk resync not listed by wire id");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 0, "no chunk resync seen");
 }

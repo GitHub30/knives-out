@@ -141,10 +141,13 @@ export class Game {
   private lastFrame = 0;
   private pingSent = 0;
   private rtt = 0;
-  /** Recent ping samples: a ping that waited out an uplink stall inflates the
-   * smoothed rtt, so the path's rtt is their median (one stalled sample is
-   * ignored, and a real change of route is taken within two pings). */
+  /** Recent ping samples for the path's rtt (their median: a real change of
+   * route is taken within two pings). A ping that was in flight during an
+   * uplink stall measured the stall, not the path, and is left out. */
   private rttSamples: number[] = [];
+  /** When a snapshot last reported a debt of 4 ticks or more (an uplink
+   * stall; a route change or jitter leaves a tick or three). */
+  private stallSeenAt = -1;
   private fps = 60;
   private lastHealth = 100;
   private myFoot = 0;
@@ -229,8 +232,10 @@ export class Game {
       const now = performance.now() >>> 0;
       const sample = (now - sent) >>> 0;
       this.rtt = lerp(this.rtt || sample, sample, 0.3);
-      this.rttSamples.push(sample);
-      if (this.rttSamples.length > 3) this.rttSamples.shift();
+      if (this.stallSeenAt < 0 || (((this.stallSeenAt >>> 0) - sent) | 0) < 0) {
+        this.rttSamples.push(sample);
+        if (this.rttSamples.length > 3) this.rttSamples.shift();
+      }
     } else if (type === P.S_ERROR) {
       const code = new Uint8Array(buf)[1];
       const msg =
@@ -546,6 +551,7 @@ export class Game {
 
   private reconcile(s: P.Snapshot) {
     const me = s.self;
+    if (me.debt >= 4) this.stallSeenAt = performance.now();
     this.pending = this.pending.filter((p) => p.cmd.seq > s.ack);
     const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND);
     if (!predictable) {
