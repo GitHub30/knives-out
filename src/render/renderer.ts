@@ -168,6 +168,9 @@ export class Renderer {
   private cars: Float32Array = new Float32Array(0);
   private carInst: GPUBuffer | null = null;
   private carData = new Float32Array(0);
+  private planeModel: ModelGpu | null = null;
+  private planePose: Float32Array | null = null;
+  private planeInst: GPUBuffer | null = null;
   // dynamic resolution
   private dyn = 1;
   private lastT = 0;
@@ -590,6 +593,22 @@ export class Renderer {
     this.cars = poses;
   }
 
+  /** Load the airliner (the transport everyone jumps from). */
+  async loadPlaneModel(url: string): Promise<void> {
+    const m = await loadGlb(url);
+    if (this.lost) return;
+    this.planeModel = this.uploadModel(m);
+  }
+  get hasPlaneModel() {
+    return !!this.planeModel;
+  }
+  /** Draw the airliner in the next frame: nose along fwd(yaw), banked by `roll`. */
+  setPlane(p: ArrayLike<number>, yaw: number, roll = 0) {
+    const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2), cr = Math.cos(roll / 2), sr = Math.sin(roll / 2);
+    // yaw about Y, then roll about the plane's own Z
+    this.planePose = new Float32Array([p[0], p[1], p[2], sy * sr, sy * cr, cy * sr, cy * cr]);
+  }
+
   async loadCarModel(url: string): Promise<void> {
     const m = await loadGlb(url);
     if (this.lost) return;
@@ -774,6 +793,9 @@ export class Renderer {
       }
       if (carCount) this.carInst = this.instBuffer('cars', this.carData.buffer as ArrayBuffer, carCount * 28);
     }
+    const planeOn = !!(this.planeModel && this.planePose);
+    if (planeOn) this.planeInst = this.instBuffer('plane', this.planePose!.buffer as ArrayBuffer, 28);
+    this.planePose = null;
     const enc = d.createCommandEncoder();
 
     // ---------------- shadow passes (near and far cascade)
@@ -849,16 +871,19 @@ export class Renderer {
       }
     }
     const car = carCount && this.carModel && this.carInst ? this.carModel : null;
-    if (car) {
+    const models: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
+    if (car) models.push({ m: car, inst: this.carInst!, n: carCount });
+    if (planeOn && this.planeInst) models.push({ m: this.planeModel!, inst: this.planeInst, n: 1 });
+    for (const { m, inst, n } of models) {
       pass.setPipeline(this.pipes.model);
-      pass.setVertexBuffer(0, car.vb);
-      pass.setVertexBuffer(1, this.carInst!);
-      pass.setIndexBuffer(car.ib, 'uint32');
-      for (const p of car.parts) {
+      pass.setVertexBuffer(0, m.vb);
+      pass.setVertexBuffer(1, inst);
+      pass.setIndexBuffer(m.ib, 'uint32');
+      for (const p of m.parts) {
         if (p.blend) continue;
         pass.setBindGroup(1, p.bg);
-        pass.drawIndexed(p.count, carCount, p.first);
-        tris += (p.count / 3) * carCount;
+        pass.drawIndexed(p.count, n, p.first);
+        tris += (p.count / 3) * n;
         draws++;
       }
     }

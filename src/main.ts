@@ -2,11 +2,12 @@ import './style.css';
 import { Core, coreModule } from './core';
 import { Renderer, QUALITY_PRESETS, type Quality } from './render/renderer';
 import carModelUrl from './assets/police_crown_osaka_game.glb?url';
+import planeModelUrl from './assets/b777_300er.glb?url';
 import g1Url from './assets/unitree_g1.bin?url';
 import { setG1Shapes } from './render/models';
 import { add, dirFrom, invert, lookAt, mul, perspectiveRZ, type V3 } from './render/math';
 import { Instances } from './render/instances';
-import { emitPlane } from './render/models';
+import { drawPlane } from './render/models';
 import { Input } from './input';
 import { TouchControls } from './touch';
 import { Hud } from './hud';
@@ -138,7 +139,10 @@ function startBackdrop() {
     }
     backdropInst.boxes.reset();
     const pa = t * 0.12;
-    emitPlane(backdropInst.boxes, [512 + Math.cos(pa) * 300, 260, 512 + Math.sin(pa) * 300], pa + Math.PI, t);
+    // circling left, banked into the turn
+    const dbgPlane = (window as unknown as { __zfPlane?: number[] }).__zfPlane;
+    if (dbgPlane) drawPlane(renderer, backdropInst.boxes, [dbgPlane[0], dbgPlane[1], dbgPlane[2]], dbgPlane[3], t, dbgPlane[4] ?? 0);
+    else drawPlane(renderer, backdropInst.boxes, [512 + Math.cos(pa) * 300, 260, 512 + Math.sin(pa) * 300], pa + Math.PI, t, -0.2);
     renderer.render({
       viewProj: vp,
       invViewProj: invert(vp),
@@ -382,6 +386,7 @@ async function boot() {
       .catch((e) => console.warn('G1 model:', e));
     // the parked cars appear once their model has loaded
     renderer.loadCarModel(new URL(carModelUrl, document.baseURI).href).catch((e) => console.warn('car model:', e));
+    renderer.loadPlaneModel(new URL(planeModelUrl, document.baseURI).href).catch((e) => console.warn('plane model:', e));
   } catch (e) {
     show('nogpu', true);
     show('menu', false);

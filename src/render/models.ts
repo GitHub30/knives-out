@@ -350,6 +350,12 @@ export function emitItem(I: Instances, glow: Instances, kind: number, x: number,
   if (kind === 6 || kind === 32 || kind === 35) glow.push([x, y + 1.5, z], qIdent(), [0.05, 3, 0.05], rgba(glowCol, 60));
 }
 
+/** The transport: the airliner model once it has loaded, simple shapes until then. */
+export function drawPlane(r: { hasPlaneModel: boolean; setPlane(p: ArrayLike<number>, yaw: number, roll?: number): void }, I: Instances, p: V3, yaw: number, t: number, roll = 0) {
+  if (r.hasPlaneModel) r.setPlane(p, yaw, roll);
+  else emitPlane(I, p, yaw, t);
+}
+
 export function emitPlane(I: Instances, p: V3, yaw: number, t: number) {
   const T0: T = { p, q: qY(yaw) };
   const body = rgba(0x9aa3ab), dark = rgba(0x3b434a), stripe = rgba(0xd86a2a);

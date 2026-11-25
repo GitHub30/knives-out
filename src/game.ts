@@ -5,7 +5,7 @@
 import type { Core } from './core';
 import type { Renderer } from './render/renderer';
 import { Instances, rgba } from './render/instances';
-import { emitCharacter, emitItem, emitPlane, line } from './render/models';
+import { drawPlane, emitCharacter, emitItem, line } from './render/models';
 import {
   add, clamp, dirFrom, invert, lerp, lerpAngle, lookAt, mul, norm, perspectiveRZ, qAxis, qIdent, qMul, qY, rightOf, scale, sub, transformPoint, wrapAngle, type M4, type Q, type V3,
 } from './render/math';
@@ -1214,8 +1214,9 @@ export class Game {
     }
     if (s.self.alive && s.self.mode === P.MODE_PLANE && s.plane.active) {
       const t = this.planeT();
-      const pivot: V3 = [s.plane.sx + s.plane.dx * t, 332, s.plane.sz + s.plane.dz * t];
-      return { eye: sub(pivot, scale(d, 34)), dir: d, vfov: base, scoped: false, pivot };
+      // far enough back to take in a 74 m airliner
+      const pivot: V3 = [s.plane.sx + s.plane.dx * t, 336, s.plane.sz + s.plane.dz * t];
+      return { eye: sub(pivot, scale(d, this.d.renderer.hasPlaneModel ? 78 : 34)), dir: d, vfov: base, scoped: false, pivot };
     }
     // spectating / dead
     const target = s.self.spect !== 255 ? this.interpPlayer(s.self.spect) : null;
@@ -1289,7 +1290,7 @@ export class Game {
     // ---- plane
     if (s.plane.active || (br && br.a.plane.active)) {
       const t = this.planeT();
-      emitPlane(this.boxes, [s.plane.sx + s.plane.dx * t, 330, s.plane.sz + s.plane.dz * t], Math.atan2(s.plane.dx, s.plane.dz), tsec);
+      drawPlane(this.d.renderer, this.boxes, [s.plane.sx + s.plane.dx * t, 330, s.plane.sz + s.plane.dz * t], Math.atan2(s.plane.dx, s.plane.dz), tsec);
     }
     this.updateFx(dt);
     this.drawCars(eye);
