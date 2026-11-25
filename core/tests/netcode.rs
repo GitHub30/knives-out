@@ -985,3 +985,171 @@ fn clustered_stalls_keep_the_debt_guard() {
     eprintln!("with stalled pings kept (4cf0bb3): {old_fails} of 36 runs snap");
     assert!(fails.is_empty(), "{} failing runs:\n{}", fails.len(), fails.join("\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Seventh adversarial review
+
+/// A hidden tab (no frames, so no commands, while messages and the 9 s
+/// keep-alive still run) during which the route gets slower. The server's
+/// debt then comes from the client itself, so it must not mark the pongs of
+/// the new route as stalled (`active_only`, as Game.reconcile does), or the
+/// path estimate stays at the old RTT and the client skips its fresh, still
+/// in-flight commands on return. Returns the worst correction after return.
+fn hidden_tab_run(route_extra: f64, active_only: bool) -> f32 {
+    let mut m = Match::new(42, 2, 0, 99);
+    let a = m.add_human(b"A").unwrap();
+    let _b = m.add_human(b"B").unwrap();
+    m.step();
+    let g = open_run(&m);
+    m.players[a as usize].ms = MoveState { pos: g, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+    let yaw = q_yaw(yaw_to(1.0, 0.0));
+    let mut rng = Rng::new(77);
+    let (base, jit) = (25.0f64, 10.0f64);
+    let (hide0, hide1, route_at) = (3000.0, 35000.0, 4500.0);
+    let delay = |t: f64, rng: &mut Rng| base + if t >= route_at { route_extra } else { 0.0 } + rng.f() as f64 * jit;
+    let (tick_ms, frame_ms) = (1000.0 / 30.0, 1000.0 / 60.0);
+    let (mut next_tick, mut next_frame) = (tick_ms, 0.0f64);
+    let mut up_q: VecDeque<(f64, Up)> = VecDeque::new();
+    let mut down_q: VecDeque<(f64, Down)> = VecDeque::new();
+    let (mut last_up, mut last_down) = (0.0f64, 0.0f64);
+    let mut seq = m.players[a as usize].last_seq;
+    let mut pending: VecDeque<(u32, Q, f64)> = VecDeque::new();
+    let mut outbox: Vec<Q> = Vec::new();
+    let mut pred: Option<MoveState> = None;
+    let mut mult = 1.0f32;
+    let (mut cmd_acc, mut last_frame, mut latest_tick) = (0.0f64, 0.0f64, 0u32);
+    let (mut ping_sent, mut rtt_s) = (-2000.0f64, 0.0f64);
+    let mut samples: VecDeque<f64> = VecDeque::new();
+    let (mut stall_seen, mut gap_end) = (-1.0f64, -1e9f64);
+    let mut worst = 0.0f32;
+    loop {
+        let t;
+        if next_tick <= next_frame {
+            t = next_tick;
+            next_tick += tick_ms;
+            while up_q.front().map_or(false, |(at, _)| *at <= t) {
+                match up_q.pop_front().unwrap().1 {
+                    Up::Cmds(b) => m.on_message(a, &b),
+                    Up::Ping(sent) => {
+                        let at = (t + delay(t, &mut rng)).max(last_down);
+                        last_down = at;
+                        down_q.push_back((at, Down::Pong(sent)));
+                    }
+                }
+            }
+            if m.step() & 1 != 0 {
+                let buf = m.snapshot(a).to_vec();
+                let ack = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                let debt = buf[17 + 81];
+                let p = &m.players[a as usize];
+                let at = (t + delay(t, &mut rng)).max(last_down);
+                last_down = at;
+                down_q.push_back((at, Down::Snap(m.tick, ack, debt, p.ms, p.speed_mult())));
+            }
+        } else {
+            t = next_frame;
+            next_frame += frame_ms;
+            let hidden = t >= hide0 && t < hide1;
+            // messages are handled in a hidden tab too; frames are not
+            while down_q.front().map_or(false, |(at, _)| *at <= t) {
+                let (tick, ack, debt, ms, sm) = match down_q.pop_front().unwrap().1 {
+                    Down::Pong(sent) => {
+                        let sample = t - sent;
+                        rtt_s = if rtt_s == 0.0 { sample } else { rtt_s + (sample - rtt_s) * 0.3 };
+                        if stall_seen < sent {
+                            samples.push_back(sample);
+                            if samples.len() > 3 {
+                                samples.pop_front();
+                            }
+                        }
+                        continue;
+                    }
+                    Down::Snap(tick, ack, debt, ms, sm) => (tick, ack, debt, ms, sm),
+                };
+                let path = if samples.is_empty() {
+                    rtt_s
+                } else {
+                    let mut v: Vec<f64> = samples.iter().cloned().collect();
+                    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    v[(v.len() - 1) / 2]
+                };
+                let active = !hidden && t - last_frame < 150.0 && t - gap_end > path + 600.0;
+                if debt >= 4 && (active || !active_only) {
+                    stall_seen = t;
+                }
+                if tick <= latest_tick {
+                    continue;
+                }
+                latest_tick = tick;
+                while pending.front().map_or(false, |q| q.0 <= ack) {
+                    pending.pop_front();
+                }
+                let old = pred.map(|p| p.pos);
+                let mut s = ms;
+                mult = sm;
+                let late = t - (path + 100.0);
+                let mut skip = 0;
+                while skip < debt as usize && skip < pending.len() && pending[skip].2 < late {
+                    skip += 1;
+                }
+                for (_, q, _) in pending.iter().skip(skip) {
+                    step_move(&m.w, &mut s, &Cmd::from_quant(0, 0, q.2, q.3, q.4, q.5, q.6), mult, DT);
+                }
+                if let (Some(o), true) = (old, t > hide1) {
+                    worst = worst.max((o - s.pos).len());
+                }
+                pred = Some(s);
+            }
+            if t - ping_sent > if hidden { 9000.0 } else { 2000.0 } {
+                ping_sent = t;
+                let at = (t + delay(t, &mut rng)).max(last_up);
+                last_up = at;
+                up_q.push_back((at, Up::Ping(t)));
+            }
+            if hidden {
+                continue;
+            }
+            if t - last_frame > 100.0 {
+                gap_end = t;
+            }
+            // Game.frame clamps dt to 0.1 s: no burst of commands after a gap
+            cmd_acc += (t - last_frame).min(100.0);
+            last_frame = t;
+            let mut n = 0;
+            while cmd_acc >= tick_ms && n < 4 {
+                cmd_acc -= tick_ms;
+                n += 1;
+                seq += 1;
+                let q: Q = (seq, latest_tick.saturating_sub(4) * 256, 0, 127, yaw, 0, B_SPRINT);
+                pending.push_back((seq, q, t));
+                if pending.len() > 90 {
+                    pending.pop_front();
+                }
+                outbox.push(q);
+                if let Some(p) = pred.as_mut() {
+                    step_move(&m.w, p, &Cmd::from_quant(0, 0, q.2, q.3, q.4, q.5, q.6), mult, DT);
+                }
+            }
+            if outbox.len() >= 2 {
+                let at = (t + delay(t, &mut rng)).max(last_up);
+                last_up = at;
+                up_q.push_back((at, Up::Cmds(cmd_bytes(&outbox))));
+                outbox.clear();
+            }
+        }
+        if t > hide1 + 4000.0 {
+            break;
+        }
+    }
+    worst
+}
+
+#[test]
+fn hidden_tab_debt_is_not_an_uplink_stall() {
+    for extra in [150.0f64, 250.0] {
+        let fixed = hidden_tab_run(extra, true);
+        let old = hidden_tab_run(extra, false);
+        eprintln!("route +{} ms during a hidden tab: worst correction after return {fixed:.2} m (marking every debt: {old:.2} m)", 2.0 * extra);
+        assert!(fixed < 1.0, "route +{} ms during a hidden tab: {fixed:.2} m correction after return", 2.0 * extra);
+    }
+}

@@ -484,13 +484,36 @@ export class Room {
       c.strikes = 0;
     }
     c.strikes++;
-    if (c.strikes > 300) {
-      try {
-        ws.close(1008, 'rate limit');
-      } catch {
-        /* ignore */
-      }
-      this.onClose(ws);
+    if (c.strikes > 300) this.serverClose(ws, 1008, 'rate limit');
+  }
+
+  /** A close the Room starts itself (strike limit, idle): the player leaves the
+   * match at once, but its network keeps the Lobby slot until the client
+   * answers the close frame (or 60 s), so a socket the client never lets go
+   * of cannot be traded for a new one straight away. */
+  private serverClose(ws: WebSocket, code: number, reason: string) {
+    const c = this.conns.get(ws);
+    if (!c) return;
+    try {
+      ws.close(code, reason);
+    } catch {
+      /* ignore */
+    }
+    this.conns.delete(ws);
+    this.ex?.srv_remove(c.pid);
+    let done = false;
+    const release = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      this.notifyLobby('/leave', { net: c.net, room: this.roomName });
+    };
+    const timer = setTimeout(release, 60_000);
+    ws.addEventListener('close', release);
+    ws.addEventListener('error', release);
+    if (this.conns.size === 0) {
+      this.emptySince = Date.now();
+      if (this.isPrivate && !this.ended) this.stop('empty');
     }
   }
 
@@ -538,14 +561,7 @@ export class Room {
     if (now - this.createdAt > MAX_ROOM_MS) return this.stop('time limit');
     // dead connections (clients keep a 10 s keep-alive even in background tabs)
     for (const [ws, c] of this.conns) {
-      if (now - c.lastMsg > SILENT_MS) {
-        try {
-          ws.close(1001, 'idle');
-        } catch {
-          /* ignore */
-        }
-        this.onClose(ws);
-      }
+      if (now - c.lastMsg > SILENT_MS) this.serverClose(ws, 1001, 'idle');
     }
     let steps = 0;
     try {

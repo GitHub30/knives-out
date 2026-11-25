@@ -145,9 +145,14 @@ export class Game {
    * route is taken within two pings). A ping that was in flight during an
    * uplink stall measured the stall, not the path, and is left out. */
   private rttSamples: number[] = [];
-  /** When a snapshot last reported a debt of 4 ticks or more (an uplink
-   * stall; a route change or jitter leaves a tick or three). */
+  /** When a snapshot last reported a debt of 4 ticks or more while this
+   * client was producing commands (an uplink stall; a route change or jitter
+   * leaves a tick or three, and a hidden tab or a long task leaves a debt
+   * of the client's own making). */
   private stallSeenAt = -1;
+  /** End of the last gap between frames of more than 100 ms (no commands were
+   * made during it). */
+  private lastGapEnd = -1e9;
   private fps = 60;
   private lastHealth = 100;
   private myFoot = 0;
@@ -551,7 +556,12 @@ export class Game {
 
   private reconcile(s: P.Snapshot) {
     const me = s.self;
-    if (me.debt >= 4) this.stallSeenAt = performance.now();
+    const sorted = [...this.rttSamples].sort((x, y) => x - y);
+    const pathRtt = sorted.length ? sorted[(sorted.length - 1) >> 1] : this.rtt;
+    const tnow = performance.now();
+    // An uplink stall, unless the client itself made no commands for a while
+    // (its debt then says nothing about the network)
+    if (me.debt >= 4 && !document.hidden && tnow - this.lastFrame < 150 && tnow - this.lastGapEnd > pathRtt + 600) this.stallSeenAt = tnow;
     this.pending = this.pending.filter((p) => p.cmd.seq > s.ack);
     const predictable = me.alive && (me.mode === P.MODE_FALL || me.mode === P.MODE_PARA || me.mode === P.MODE_GROUND);
     if (!predictable) {
@@ -565,9 +575,7 @@ export class Game {
     // the oldest when they arrive, so they must not be replayed. Only commands old
     // enough to be late count: a client that skipped time (frame hitch, hidden tab)
     // has a debt on the server but no late commands.
-    const sorted = [...this.rttSamples].sort((x, y) => x - y);
-    const pathRtt = sorted.length ? sorted[(sorted.length - 1) >> 1] : this.rtt;
-    const late = performance.now() - (pathRtt + 100);
+    const late = tnow - (pathRtt + 100);
     let skip = 0;
     while (skip < me.debt && skip < this.pending.length && this.pending[skip].at < late) skip++;
     for (let k = skip; k < this.pending.length; k++) this.step(this.pending[k].cmd, mult, false);
@@ -952,6 +960,7 @@ export class Game {
   private frame(now: number) {
     if (!this.running) return;
     this.raf = requestAnimationFrame((t) => this.frame(t));
+    if (now - this.lastFrame > 100) this.lastGapEnd = now;
     const dt = Math.min(0.1, Math.max(0, (now - this.lastFrame) / 1000));
     this.lastFrame = now;
     this.fps = lerp(this.fps, 1 / Math.max(dt, 1e-3), 0.05);

@@ -2517,7 +2517,14 @@ impl Match {
                 }
                 let a = e.actor as usize;
                 let near = dist_xz(e.it.pos.x, e.it.pos.z, center.x, center.z) < ALWAYS_SEND_R;
-                if a == i || near || (a < MAX_PLAYERS && send[a]) {
+                // made by a player this viewer could see at the time (not
+                // one that comes into view later: that would release its
+                // hidden loot route, oldest first, the moment it is seen)
+                let seen = a < MAX_PLAYERS && send[a] && {
+                    let from = self.players[i].sent_from[a];
+                    from != 0 && from <= e.tick
+                };
+                if a == i || near || seen {
                     now.push(k);
                     covered[cw] |= cb;
                     self.players[i].ilog_sent[k / 64] |= bit;

@@ -1288,3 +1288,50 @@ fn item_lists_do_not_follow_creation_order() {
     }
     assert!(checked > 0, "no chunk resync seen");
 }
+
+// ---------------------------------------------------------------------------
+// Seventh adversarial review
+
+/// A player that loots out of sight and then comes into view: its earlier,
+/// withheld changes are not released the moment it is seen (they would give
+/// its loot route and times, oldest first); they follow the usual rules
+/// (near the viewer, or the quiet-period resync).
+#[test]
+fn coming_into_view_does_not_release_hidden_looting() {
+    let mut cases = 0;
+    for seed in [3u32, 11, 42, 77, 123] {
+        let (mut m, ids) = setup(seed, 2);
+        let (a, b) = (ids[0], ids[1]);
+        let Some((id, loot, va)) = indoor_case(&m, 60.0) else { continue };
+        let chunk = item_chunk(m.items[id as usize].pos.x, m.items[id as usize].pos.z) as u8;
+        place(&mut m, a, va);
+        place(&mut m, b, loot);
+        let mut taken = false;
+        for _ in 0..60 {
+            let s = tick(&mut m, &[a]);
+            assert!(!s[0].players.contains(&b));
+            if !m.items[id as usize].alive {
+                taken = true;
+                break;
+            }
+        }
+        if !taken {
+            continue;
+        }
+        for _ in 0..30 {
+            tick(&mut m, &[a]);
+        }
+        // B steps out right in front of A (always sent within 40 m)
+        let near = V3::new(va.x + 6.0, m.w.ground_below(va.x + 6.0, va.z, va.y + 6.0, P_RADIUS), va.z);
+        place(&mut m, b, near);
+        for k in 0..40 {
+            let s = tick(&mut m, &[a]);
+            if k > 2 {
+                assert!(s[0].players.contains(&b), "seed {seed}: B is not sent next to A");
+            }
+            assert!(!mentions_item(&s[0], id, chunk), "seed {seed}: B's hidden pickup was released when B came into view");
+        }
+        cases += 1;
+    }
+    assert!(cases >= 3, "only {cases} cases");
+}

@@ -168,7 +168,18 @@ pub fn name_key(name: &str) -> String {
         k.push(c);
     };
     let mut buf = [0u8; 4];
-    for ch0 in name.chars() {
+    let chars: Vec<char> = name.chars().collect();
+    for (idx, &ch0) in chars.iter().enumerate() {
+        // Farsi yeh and keheh look like Arabic yeh and kaf where they join the
+        // next letter (initial / medial forms) and like alef maksura / apart
+        // at the end of a word
+        let joined = chars[idx + 1..].iter().map(|&c| c as u32).find(|&c| name_char_class(c) != 2).map_or(false, arabic_joins);
+        let ch0 = match (ch0 as u32, joined) {
+            (0x6CC, true) => '\u{64a}',
+            (0x6CC, false) => '\u{649}',
+            (0x6A9, true) => '\u{643}',
+            _ => ch0,
+        };
         let seq: &str = match compat_fold(ch0 as u32) {
             Some(s) => s,
             None => ch0.encode_utf8(&mut buf),
@@ -208,6 +219,12 @@ pub fn name_key(name: &str) -> String {
         }
     }
     k.replace("rn", "m").replace("vv", "w")
+}
+
+/// An Arabic letter that joins the letter before it (so that one takes its
+/// initial or medial form): every Arabic letter but the hamza.
+fn arabic_joins(c: u32) -> bool {
+    matches!(c, 0x620 | 0x622..=0x64A | 0x66E..=0x6D3 | 0x6D5 | 0x6EE..=0x6EF | 0x6FA..=0x6FC | 0x6FF)
 }
 
 // ---- tables generated from Unicode 15.1.0 data (scratch gen_names5.py)

@@ -574,3 +574,38 @@ fn names_round6() {
     add("\u{639}\u{644}\u{64a}");
     assert_eq!(add("\u{639}\u{644}\u{649}"), "\u{639}\u{644}\u{649}");
 }
+
+/// Seventh review: Farsi and Arabic yeh (and keheh and kaf) are drawn alike
+/// where they join the next letter, and apart at the end of a word.
+#[test]
+fn names_round7() {
+    for (a, b) in [
+        ("\u{633}\u{6cc}\u{62f}", "\u{633}\u{64a}\u{62f}"),             // سید / سيد
+        ("\u{62d}\u{6cc}\u{62f}\u{631}", "\u{62d}\u{64a}\u{62f}\u{631}"), // حیدر / حيدر
+        ("\u{6cc}\u{627}\u{633}\u{631}", "\u{64a}\u{627}\u{633}\u{631}"), // یاسر / ياسر
+        ("\u{645}\u{631}\u{6cc}\u{645}", "\u{645}\u{631}\u{64a}\u{645}"), // مریم / مريم
+        ("\u{6cc}\u{648}\u{633}\u{641}", "\u{64a}\u{648}\u{633}\u{641}"), // یوسف / يوسف
+        ("\u{643}\u{631}\u{64a}\u{645}", "\u{6a9}\u{631}\u{64a}\u{645}"), // كريم / کريم
+        ("\u{639}\u{644}\u{6cc}", "\u{639}\u{644}\u{649}"),             // علی / على (final)
+    ] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        let na = add(a);
+        let nb = add(b);
+        assert_eq!(na, a, "{a:?} was changed to {na:?}");
+        assert!(nb.contains('#'), "{b:?} ({nb:?}) is accepted next to {a:?}");
+    }
+    // drawn differently at the end of a word: kept apart
+    for (a, b) in [("\u{639}\u{644}\u{64a}", "\u{639}\u{644}\u{6cc}"), ("\u{645}\u{644}\u{643}", "\u{645}\u{644}\u{6a9}")] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        add(a);
+        assert_eq!(add(b), b, "{b:?} got a suffix next to {a:?}");
+    }
+}
