@@ -42,6 +42,7 @@ struct ClientState {
     grass: Vec<u8>,
     trees: Vec<f32>,
     props: Vec<f32>,
+    doors: Vec<f32>,
     /// The cars as the server last told: pose (x y z yaw), speed (x z) and
     /// spin. The world's own copy runs ahead of it while the player drives
     /// (the prediction shoves cars about) and is put back from this before
@@ -256,11 +257,15 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
         let b = world.boxes[i as usize];
         props.extend_from_slice(&[b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z, (b.kind == world::BK_CRATE) as u8 as f32, b.col as f32]);
     }
+    let mut doors = Vec::with_capacity(world.doors.len() * 8);
+    for d in &world.doors {
+        doors.extend_from_slice(&[d.hinge.x, d.hinge.y, d.hinge.z, d.w, d.h, d.shut, d.open, d.col as f32]);
+    }
     let checksum = world.checksum;
     let car_auth: Vec<[f32; 7]> = world.cars.iter().map(|c| [c[0], c[1], c[2], c[3], 0.0, 0.0, 0.0]).collect();
     let cars = CarsPred { spin: vec![0.0; world.cars.len()], free: vec![true; world.cars.len()] };
     unsafe {
-        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass, trees, props, car_auth, cars }));
+        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass, trees, props, doors, car_auth, cars }));
     }
     checksum
 }
@@ -269,6 +274,7 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
 ///       3 prop verts(u32) 4 prop chunks(f32) 5 minimap rgba(u8) 6 weapon defs(f32) 7 towns(f32) 8 cars(f32 x4: x y z yaw) 9 car kinds(u8: 0 police car, 1 fire truck)
 ///       10 window panes(f32 x6: min xyz, max xyz) 11 grass mask(u8, 1024 x 1024, one per m2)
 ///       13 loose props(f32 x8: min xyz, max xyz, crate?, colour)
+///       15 doors(f32 x8: hinge xyz, width, height, heading shut, heading open, colour)
 ///       12 trees(f32 x8: x y z height radius kind(0 conifer) seed -)
 ///       14 helicopters(f32 x4: x y z yaw)
 #[no_mangle]
@@ -290,6 +296,7 @@ pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
         12 => c.trees.as_ptr() as *const u8,
         13 => c.props.as_ptr() as *const u8,
         14 => c.world.helis.as_ptr() as *const u8,
+        15 => c.doors.as_ptr() as *const u8,
         _ => std::ptr::null(),
     }
 }
@@ -314,6 +321,7 @@ pub extern "C" fn cli_mesh_len(kind: u32) -> u32 {
         12 => c.trees.len() * 4,
         13 => c.props.len() * 4,
         14 => c.world.helis.len() * 16,
+        15 => c.doors.len() * 4,
         _ => 0,
     }) as u32
 }
@@ -429,6 +437,13 @@ pub extern "C" fn cli_set_heli(k: u32, x: f32, y: f32, z: f32, yaw: f32) {
             *h = [x, y, z, yaw];
         }
     }
+}
+
+/// Whether door `k` stands open.
+#[no_mangle]
+pub extern "C" fn cli_set_door(k: u32, open: u32) {
+    let Some(c) = client() else { return };
+    c.world.set_door(k as usize, open != 0);
 }
 
 /// Where loose prop `k` is now (the middle of its underside).

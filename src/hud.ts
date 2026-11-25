@@ -39,6 +39,10 @@ export interface MapMarker {
   t: number;
 }
 
+export type NoiseKind = 'step' | 'shot' | 'boom' | 'car' | 'heli' | 'door';
+const NOISE_LABEL: Record<NoiseKind, string> = { step: '足音', shot: '銃声', boom: '爆発', car: '車両', heli: 'ヘリ', door: 'ドア' };
+const NOISE_FAR: Record<NoiseKind, number> = { step: 30, shot: 260, boom: 220, car: 110, heli: 260, door: 30 };
+
 export class Hud {
   root: HTMLDivElement;
   private alive: HTMLSpanElement;
@@ -79,6 +83,8 @@ export class Hud {
   private bannerT = 0;
   private toastT = 0;
   private hitT = 0;
+  private noiseRing!: HTMLDivElement;
+  private noiseEls: HTMLDivElement[] = [];
   mapOpen = false;
   onSlot: (s: number) => void = () => {};
   onHeal: (k: number) => void = () => {};
@@ -118,6 +124,7 @@ export class Hud {
     this.feed = el('div', 'killfeed', root);
     this.cross = el('div', 'crosshair', root);
     for (const c of ['t', 'b', 'l', 'r', 'd']) el('i', `ch-${c}`, this.cross);
+    this.noiseRing = el('div', 'noise-ring', root);
     this.hitm = el('div', 'hitmarker', root);
     for (let i = 0; i < 4; i++) el('i', '', this.hitm);
     this.dmgLayer = el('div', 'dmg-layer', root);
@@ -345,6 +352,36 @@ export class Hud {
     this.banner.textContent = text;
     this.banner.className = `banner show ${cls}`;
     this.bannerT = secs;
+  }
+
+  /** Sounds heard, shown around the crosshair: `ang` is clockwise from straight ahead. */
+  setNoises(list: { kind: NoiseKind; ang: number; alpha: number; dist: number }[]) {
+    const n = Math.min(list.length, 12);
+    while (this.noiseEls.length < n) {
+      const w = el('div', 'noise', this.noiseRing);
+      el('i', '', w);
+      el('b', '', w);
+      this.noiseEls.push(w);
+    }
+    for (let k = 0; k < this.noiseEls.length; k++) {
+      const w = this.noiseEls[k];
+      if (k >= n) {
+        if (w.style.display !== 'none') w.style.display = 'none';
+        continue;
+      }
+      const s = list[list.length - n + k];
+      const deg = (s.ang * 180) / Math.PI;
+      w.style.display = '';
+      if (w.dataset.kind !== s.kind) {
+        w.dataset.kind = s.kind;
+        (w.lastChild as HTMLElement).textContent = NOISE_LABEL[s.kind];
+      }
+      w.style.opacity = s.alpha.toFixed(2);
+      w.style.transform = `rotate(${deg.toFixed(1)}deg)`;
+      // nearer sounds draw a longer arc; the label stays upright
+      w.style.setProperty('--near', (1 - Math.min(1, s.dist / NOISE_FAR[s.kind])).toFixed(2));
+      (w.lastChild as HTMLElement).style.transform = `translateX(-50%) rotate(${(-deg).toFixed(1)}deg)`;
+    }
   }
 
   setPrompt(text: string | null) {

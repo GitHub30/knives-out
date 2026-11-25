@@ -8,13 +8,17 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 15;
+pub const PROTO: u16 = 16;
 /// A car catches fire below this share of its bodywork, and then explodes
 /// after the fuse (5 s) whatever happens.
 pub const CAR_FIRE_AT: f32 = 0.19;
 pub const CAR_FUSE_TICKS: u32 = 150;
 /// Helicopters: hull strength, missiles carried, seconds between launches,
 /// missile speed (m/s) and life (ticks).
+/// Doors: how near one must stand to work it, and how far away an open one
+/// is told to a client (the rest it takes for shut).
+pub const DOOR_REACH: f32 = 2.2;
+pub const DOOR_SEND_R: f32 = 150.0;
 pub const HELI_HP: f32 = 1500.0;
 /// Vehicles shoving each other: how close counts as touching, the closing
 /// speed above which a knock dents (and bodywork lost per m/s above it).
@@ -968,6 +972,9 @@ impl Match {
             *h = Heli::parked();
         }
         self.missiles.clear();
+        for k in 0..self.w.doors.len() {
+            self.w.set_door(k, false);
+        }
         self.zone = Zone { cx: MAP * 0.5, cz: MAP * 0.5, r: 780.0, timer: ZONES[0].wait, ..Default::default() };
         self.pick_next_zone();
         let ppos = self.plane.pos();
@@ -1154,6 +1161,17 @@ impl Match {
         if use_ && (self.enter_car(i) || self.enter_heli(i)) {
             return;
         }
+        if use_ {
+            self.use_door(i);
+        } else if !human && (tick as usize + i) % 4 == 0 {
+            // bots push doors open as they walk up to them
+            let pos = self.players[i].ms.pos;
+            for k in 0..self.w.doors.len() {
+                if !self.w.door_open[k] && self.door_dist(k, pos) < 1.3 {
+                    self.w.set_door(k, true);
+                }
+            }
+        }
         // leaning on a crate slides it along
         if c.mx != 0.0 || c.mz != 0.0 {
             let ms = self.players[i].ms;
@@ -1217,6 +1235,52 @@ impl Match {
     // Cars
     // ------------------------------------------------------------------
     /// Get into the nearest free car within reach.
+    /// Distance on the ground from `pos` to the middle of doorway `k`
+    /// (huge when it is on another storey).
+    fn door_dist(&self, k: usize, pos: V3) -> f32 {
+        let d = self.w.doors[k];
+        if (pos.y - d.hinge.y).abs() > 1.5 {
+            return f32::MAX;
+        }
+        let m = d.hinge + fwd(d.shut) * (d.w * 0.5);
+        dist_xz(pos.x, pos.z, m.x, m.z)
+    }
+
+    /// Open or shut the nearest door within reach. A door is not shut on
+    /// somebody standing in the doorway.
+    fn use_door(&mut self, i: usize) -> bool {
+        let pos = self.players[i].ms.pos;
+        let mut best: Option<(usize, f32)> = None;
+        for k in 0..self.w.doors.len() {
+            let d = self.door_dist(k, pos);
+            if d < DOOR_REACH && best.map_or(true, |b| d < b.1) {
+                best = Some((k, d));
+            }
+        }
+        let Some((k, _)) = best else { return false };
+        if self.w.door_open[k] {
+            let b = self.w.boxes[self.w.doors[k].bx as usize];
+            for q in self.players.iter() {
+                if !q.used || !q.alive || q.ms.mode == MODE_PLANE || q.ms.mode == MODE_DRIVE || q.ms.mode == MODE_FLY {
+                    continue;
+                }
+                let (dx, dz) = (clampf(q.ms.pos.x, b.min.x, b.max.x) - q.ms.pos.x, clampf(q.ms.pos.z, b.min.z, b.max.z) - q.ms.pos.z);
+                if dx * dx + dz * dz < (P_RADIUS + 0.06) * (P_RADIUS + 0.06) && q.ms.pos.y < b.max.y && q.ms.pos.y + 1.8 > b.min.y {
+                    return false;
+                }
+            }
+            // nor on a vehicle parked across it
+            let m = (b.min + b.max) * 0.5;
+            let mut probe = m;
+            if self.w.push_cars(&mut probe, 0.3, usize::MAX) {
+                return false;
+            }
+        }
+        let open = !self.w.door_open[k];
+        self.w.set_door(k, open);
+        true
+    }
+
     fn enter_car(&mut self, i: usize) -> bool {
         let pos = self.players[i].ms.pos;
         let mut best: Option<(usize, f32)> = None;
@@ -4023,6 +4087,22 @@ impl Match {
             mcount += 1;
         }
         self.out[mpos] = mcount;
+        let mut w = Wr::new(&mut self.out);
+        // ---- doors standing open near the viewer (every other one is shut)
+        let dpos = w.len();
+        w.u8(0);
+        let mut dcount = 0u8;
+        for k in 0..self.w.doors.len() {
+            if dcount == 255 {
+                break;
+            }
+            let h = self.w.doors[k].hinge;
+            if self.w.door_open[k] && dist_xz(h.x, h.z, center.x, center.z) < DOOR_SEND_R {
+                w.u16(k as u16);
+                dcount += 1;
+            }
+        }
+        self.out[dpos] = dcount;
         let mut w = Wr::new(&mut self.out);
         // ---- events
         let cpos = w.len();

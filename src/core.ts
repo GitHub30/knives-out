@@ -39,6 +39,7 @@ interface CoreExports {
   cli_building_at(x: number, z: number): number;
   cli_set_car(k: number, x: number, y: number, z: number, yaw: number): void;
   cli_set_heli(k: number, x: number, y: number, z: number, yaw: number): void;
+  cli_set_door(k: number, open: number): void;
   cli_set_prop(k: number, x: number, y: number, z: number): void;
   cli_set_car_motion(k: number, vx: number, vz: number, spin: number, free: number): void;
   cli_pred_reset(): void;
@@ -154,6 +155,11 @@ export class Core {
   /** Parked helicopters as generated (x, ground y, z, yaw each). */
   helis(): Float32Array {
     return this.f32(14);
+  }
+
+  /** Whether door `k` stands open (a shut door is solid). */
+  setDoor(k: number, open: boolean) {
+    this.ex.cli_set_door(k, open ? 1 : 0);
   }
 
   /** Where loose prop `k` is now (the middle of its underside). */

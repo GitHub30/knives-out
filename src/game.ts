@@ -12,7 +12,7 @@ import {
 } from './render/math';
 import * as P from './protocol';
 import type { Transport } from './net';
-import { Hud, itemName, TOWN_NAMES, WEAPON_SHORT } from './hud';
+import { Hud, itemName, TOWN_NAMES, WEAPON_SHORT, type NoiseKind } from './hud';
 import type { Input, Edges } from './input';
 import type { TouchControls } from './touch';
 import type { Sound } from './audio';
@@ -273,6 +273,12 @@ export class Game {
   private myHeli = -1;
   /** Free helicopter within reach (-1 = none). */
   private nearHeli = -1;
+  private nearDoor = -1;
+  /** Doors as generated, whether each stands open and how far it has swung (0 shut .. 1 open). */
+  private doors: { x: number; y: number; z: number; w: number; h: number; shut: number; open: number; col: number; isOpen: boolean; a: number }[] = [];
+  /** Things heard lately, for the direction ring. */
+  private noises: { kind: NoiseKind; x: number; z: number; t: number; life: number }[] = [];
+  private vehNoiseT = 0;
   private heliPoses = new Float32Array(0);
   /** Missiles already heard leaving (by id), and when a smoke puff was last left behind them. */
   private missilesSeen = new Set<number>();
@@ -474,6 +480,11 @@ export class Game {
     });
     this.d.hud.setMap(core.bytes(5), 512);
     this.glassPanes = core.f32(10);
+    const dr = core.f32(15);
+    this.doors = [];
+    this.noises = [];
+    for (let i = 0; i + 8 <= dr.length; i += 8) this.doors.push({ x: dr[i], y: dr[i + 1], z: dr[i + 2], w: dr[i + 3], h: dr[i + 4], shut: dr[i + 5], open: dr[i + 6], col: dr[i + 7], isOpen: false, a: 0 });
+    for (let k = 0; k < this.doors.length; k++) core.setDoor(k, false);
     const pr = core.f32(13);
     this.props = [];
     for (let i = 0; i + 8 <= pr.length; i += 8) {
@@ -542,6 +553,7 @@ export class Game {
     this.onCars(s);
     this.onHelis(s);
     this.onProps(s);
+    this.onDoors(s);
     this.reconcile(s);
     if (this.slotReq < 0 || performance.now() - this.slotReqAt > 1200 || s.self.cur === this.slotReq) {
       this.displayCur = s.self.cur;
@@ -630,6 +642,7 @@ export class Game {
           const d = Math.hypot(e.from[0] - this.camEye[0], e.from[1] - this.camEye[1], e.from[2] - this.camEye[2]);
           snd.shot(e.weapon, d, this.panOf(e.from));
           if (d < 260) this.markers.push({ x: e.from[0], z: e.from[2], t: this.time });
+          if (d < 260) this.heard('shot', e.from[0], e.from[2], 1.8);
           if (this.markers.length > 30) this.markers.shift();
         }
         if (e.hit === 3 || e.hit === 0) this.spawnImpact(e.to, 0x9a8b70);
@@ -680,6 +693,7 @@ export class Game {
         this.spawnExplosion(p);
         const d = Math.hypot(p[0] - this.camEye[0], p[1] - this.camEye[1], p[2] - this.camEye[2]);
         snd.explosion(d, this.panOf(p));
+        if (d < 220 && d > 3) this.heard('boom', p[0], p[2], 2.2);
         this.shake = Math.max(this.shake, clamp(1.2 - d / 40, 0, 1));
         break;
       }
@@ -916,6 +930,81 @@ export class Game {
     const reach = 380;
     const t = this.d.core.ray(mid, d, reach);
     return add(mid, scale(d, Math.max(30, t >= 0 ? t : reach)));
+  }
+
+  /** Doors: the ones listed stand open, every other one is shut (also in the core, where a shut door is solid). */
+  private onDoors(s: P.Snapshot) {
+    const open = new Set(s.doors);
+    for (let k = 0; k < this.doors.length; k++) {
+      const d = this.doors[k];
+      const o = open.has(k);
+      if (o === d.isOpen) continue;
+      d.isOpen = o;
+      this.d.core.setDoor(k, o);
+      const at: V3 = [d.x + Math.sin(d.shut) * d.w * 0.5, d.y + 1, d.z + Math.cos(d.shut) * d.w * 0.5];
+      const dist = Math.hypot(at[0] - this.camEye[0], at[1] - this.camEye[1], at[2] - this.camEye[2]);
+      this.d.sound.door(dist, this.panOf(at), o);
+      if (dist < 30) this.heard('door', at[0], at[2], 1.2);
+    }
+  }
+
+  /** The nearest door within reach (as the server measures it), or -1. */
+  private doorInReach(me: V3): number {
+    let best = -1;
+    let bd = 2.2;
+    for (let k = 0; k < this.doors.length; k++) {
+      const d = this.doors[k];
+      if (Math.abs(me[1] - d.y) > 1.5) continue;
+      const dd = Math.hypot(me[0] - (d.x + Math.sin(d.shut) * d.w * 0.5), me[2] - (d.z + Math.cos(d.shut) * d.w * 0.5));
+      if (dd < bd) {
+        bd = dd;
+        best = k;
+      }
+    }
+    return best;
+  }
+
+  /** Door leaves, swinging on their hinges. */
+  private drawDoors(eye: V3, dt: number) {
+    let cube = cubeShapes.get(this.d.renderer);
+    if (cube === undefined) {
+      cube = this.d.renderer.addShapes([unitCube()]);
+      cubeShapes.set(this.d.renderer, cube);
+    }
+    const wood = surf(0.7, 0), metal = surf(0.35, 0.9);
+    for (const d of this.doors) {
+      const t = d.isOpen ? 1 : 0;
+      if (d.a !== t) d.a = Math.abs(t - d.a) < 0.01 ? t : d.a + (t - d.a) * Math.min(1, dt * 9);
+      if ((d.x - eye[0]) ** 2 + (d.z - eye[2]) ** 2 > 220 * 220) continue;
+      let sw = d.open - d.shut;
+      sw = Math.atan2(Math.sin(sw), Math.cos(sw));
+      const e = d.a * d.a * (3 - 2 * d.a);
+      const ang = d.shut + sw * e;
+      const sn = Math.sin(ang), cs = Math.cos(ang);
+      const q = qY(ang);
+      const c: V3 = [d.x + sn * d.w * 0.5, d.y + d.h * 0.5, d.z + cs * d.w * 0.5];
+      this.boxes.push(c, q, [0.07, d.h - 0.04, d.w - 0.04], rgba(d.col), cube, wood);
+      // rails, a panel line and the handles
+      const dark = rgba(tintHex(d.col, 0.72));
+      for (const yy of [-d.h * 0.5 + 0.12, 0.05, d.h * 0.5 - 0.12]) this.boxes.push([c[0], c[1] + yy, c[2]], q, [0.09, 0.1, d.w - 0.04], dark, cube, wood);
+      const hx = d.x + sn * (d.w - 0.16), hz = d.z + cs * (d.w - 0.16);
+      this.boxes.push([hx, d.y + 1.02, hz], q, [0.2, 0.05, 0.12], rgba(0xb9b4a6), cube, metal);
+    }
+  }
+
+  /** Remember a sound for the direction ring (a repeat from the same place refreshes it). */
+  private heard(kind: NoiseKind, x: number, z: number, life: number) {
+    for (const n of this.noises) {
+      if (n.kind === kind && Math.hypot(n.x - x, n.z - z) < 6) {
+        n.x = x;
+        n.z = z;
+        n.t = this.time;
+        n.life = life;
+        return;
+      }
+    }
+    this.noises.push({ kind, x, z, t: this.time, life });
+    if (this.noises.length > 24) this.noises.shift();
   }
 
   /** Crates and containers that were knocked about: for drawing, and solid in the core where they are now. */
@@ -1202,7 +1291,7 @@ export class Game {
       }
       if (e.reload) b |= P.B_RELOAD;
       // one key: leave the car, get into one, or pick up what lies here
-      if (e.pickup) b |= driving || flying || ((this.nearCar >= 0 || this.nearHeli >= 0) && !this.nearItem) ? P.B_USE : P.B_PICKUP;
+      if (e.pickup) b |= driving || flying || ((this.nearCar >= 0 || this.nearHeli >= 0 || this.nearDoor >= 0) && !this.nearItem) ? P.B_USE : P.B_PICKUP;
       if (e.spect) b |= P.B_SPECT;
       if (e.nade) b |= P.B_NADE;
       let heal = e.heal;
@@ -1785,6 +1874,7 @@ export class Game {
     this.drawHelis(eye, dt);
     this.drawMissiles(br, dt);
     this.drawProps(eye, dt);
+    this.drawDoors(eye, dt);
     // window glass near the camera
     this.glass.reset();
     const gp = this.glassPanes;
@@ -1872,6 +1962,8 @@ export class Game {
     this.nearItem = !!item;
     this.nearCar = ground && me ? this.carInReach(me) : -1;
     this.nearHeli = ground && me && this.nearCar < 0 ? this.heliInReach(me) : -1;
+    this.nearDoor = ground && me && this.nearCar < 0 && this.nearHeli < 0 ? this.doorInReach(me) : -1;
+    const doorText = this.nearDoor >= 0 ? (this.doors[this.nearDoor].isOpen ? 'ドアを閉める' : 'ドアを開ける') : null;
     const landed = flying && !!this.pred?.onGround && Math.hypot(...this.pred.vel) < 1.5;
     let flyText = '';
     if (flying && this.pred && heli) {
@@ -1892,7 +1984,7 @@ export class Game {
     }
     const kmh = driving && this.pred ? Math.round(Math.hypot(this.pred.vel[0], this.pred.vel[2]) * 3.6) : 0;
     const carName = CAR_KINDS[this.cars[driving ? this.myCar : this.nearCar]?.kind ?? 0].name;
-    const pickup = driving ? '降りる' : flying ? (landed ? '降りる' : null) : item ?? (this.nearCar >= 0 ? `${carName}に乗る` : this.nearHeli >= 0 ? 'CH-47Jに乗る' : null);
+    const pickup = driving ? '降りる' : flying ? (landed ? '降りる' : null) : item ?? (this.nearCar >= 0 ? `${carName}に乗る` : this.nearHeli >= 0 ? 'CH-47Jに乗る' : doorText);
     const touch = matchMedia('(pointer: coarse)').matches;
     const needLock = !touch && !this.d.input.pointerLocked && !hud.mapOpen && !this.paused && s.phase !== P.PH_LOBBY;
     hud.setPrompt(
@@ -1903,8 +1995,33 @@ export class Game {
         : touch ? null
         : item ? `[F] 拾う: ${item}`
         : this.nearCar >= 0 ? `[F] ${carName}に乗る`
-        : this.nearHeli >= 0 ? '[F] CH-47Jに乗る' : null,
+        : this.nearHeli >= 0 ? '[F] CH-47Jに乗る'
+        : doorText ? `[F] ${doorText}` : null,
     );
+    // engines and rotors that are not ours
+    this.vehNoiseT -= dt;
+    if (this.vehNoiseT <= 0 && me) {
+      this.vehNoiseT = 0.4;
+      for (let k = 0; k < this.cars.length; k++) {
+        const c = this.cars[k];
+        if (c.driver === 255 || k === this.myCar || c.hp === 0) continue;
+        if (Math.hypot(c.b.x - me[0], c.b.z - me[2]) < 110) this.heard('car', c.b.x, c.b.z, 0.9);
+      }
+      for (let k = 0; k < this.helis.length; k++) {
+        const h = this.helis[k];
+        if (k === this.myHeli || h.rotor < 0.3 || h.hp === 0) continue;
+        if (Math.hypot(h.b.x - me[0], h.b.z - me[2]) < 260) this.heard('heli', h.b.x, h.b.z, 0.9);
+      }
+    }
+    this.noises = this.noises.filter((n) => this.time - n.t < n.life);
+    {
+      const r = rightOf(this.camYaw);
+      const fx = Math.sin(this.camYaw), fz = Math.cos(this.camYaw);
+      hud.setNoises(s.phase === P.PH_PLAY ? this.noises.map((n) => {
+        const dx = n.x - this.camEye[0], dz = n.z - this.camEye[2];
+        return { kind: n.kind, ang: Math.atan2(dx * r[0] + dz * r[2], dx * fx + dz * fz), alpha: Math.min(1, (1 - (this.time - n.t) / n.life) * 2.2), dist: Math.hypot(dx, dz) };
+      }) : []);
+    }
     this.d.sound.loop('engine', driving ? 1 : 0, kmh / (CAR_KINDS[this.cars[this.myCar]?.kind ?? 0].vmax * 3.6));
     const spectating = !alive && s.phase === P.PH_PLAY;
     hud.setSpectate(spectating ? (s.self.spect !== 255 ? this.nameOf(s.self.spect) : '—') : null);
@@ -2201,6 +2318,7 @@ export class Game {
       if (a.foot > (a.speed > 6 ? 2.1 : 1.6)) {
         a.foot = 0;
         if (dist < 40) this.d.sound.footstep(dist, this.panOf([x, 0, z]), false);
+        if (dist < 30) this.heard('step', x, z, 1.1);
       }
     }
     return a;

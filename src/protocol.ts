@@ -1,6 +1,6 @@
 // Binary wire protocol. Must mirror core/src/sim.rs exactly.
 
-export const PROTO = 15;
+export const PROTO = 16;
 export const C_INPUT = 2;
 export const C_PING = 3;
 export const C_START = 4;
@@ -257,6 +257,8 @@ export interface Snapshot {
   helis: { id: number; x: number; y: number; z: number; yaw: number; pitch: number; roll: number; rotor: number; pilot: number; hp: number; ammo: number; flags: number; airborne: boolean }[];
   /** Missiles in flight, with the direction they fly in. */
   missiles: { id: number; x: number; y: number; z: number; yaw: number; pitch: number }[];
+  /** Doors standing open within range (every other door is shut). */
+  doors: number[];
   events: GameEvent[];
 }
 
@@ -431,6 +433,9 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
   const missiles: Snapshot['missiles'] = [];
   const nMissiles = r.u8();
   for (let i = 0; i < nMissiles && !r.bad; i++) missiles.push({ id: r.u16(), x: r.f32(), y: r.f32(), z: r.f32(), yaw: (r.u16() * TAU) / 65536, pitch: (r.i16() * 1.5) / 32767 });
+  const doors: number[] = [];
+  const nDoors = r.u8();
+  for (let i = 0; i < nDoors && !r.bad; i++) doors.push(r.u16());
   const events: GameEvent[] = [];
   const ne = r.u16();
   for (let i = 0; i < ne && !r.bad; i++) {
@@ -500,7 +505,7 @@ export function decodeSnapshot(buf: ArrayBuffer): Snapshot | null {
     }
   }
   if (r.bad) return null;
-  return { tick, ack, phase, phaseT, alive, total, winner, self, zone, plane, players, nades, cars, props, helis, missiles, events };
+  return { tick, ack, phase, phaseT, alive, total, winner, self, zone, plane, players, nades, cars, props, helis, missiles, doors, events };
 }
 
 export interface CmdQ {

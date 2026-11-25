@@ -162,6 +162,15 @@ export class Sound {
     this.burst(dest, t, 0.1, 'lowpass', 700, 0.5, 0.5);
   }
 
+  /** A door swinging open or pulled shut. */
+  door(dist: number, pan: number, open: boolean) {
+    if (!this.ready() || dist > 40) return;
+    const t = this.ctx!.currentTime;
+    const dest = this.out(pan, 0.5 / (1 + dist / 5));
+    this.tone(dest, t, 0.18, open ? 520 : 300, open ? 380 : 220, 0.12);
+    this.burst(dest, t + (open ? 0 : 0.16), 0.06, 'lowpass', open ? 900 : 500, 0.8, open ? 0.35 : 0.9);
+  }
+
   footstep(dist: number, pan: number, water: boolean) {
     if (!this.ready() || dist > 45) return;
     const t = this.ctx!.currentTime;

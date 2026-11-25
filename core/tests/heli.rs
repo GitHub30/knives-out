@@ -678,7 +678,7 @@ fn a_pilot_who_disconnects_bails_out_and_the_helicopter_comes_down() {
 
 #[test]
 fn snapshot_carries_helicopters() {
-    assert_eq!(PROTO, 15);
+    assert_eq!(PROTO, 16);
     let (mut m, ids, o) = stage(42, 3);
     let (a, b) = (ids[0], ids[1]);
     // b watches from the far end of the open run, the third from the far corner

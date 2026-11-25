@@ -33,6 +33,8 @@ pub const BK_BRICK: u8 = 11;
 pub const BK_STUCCO: u8 = 12;
 /// The hull of a helicopter (ray hits only: it is not a box of the world).
 pub const BK_HELI: u8 = 13;
+/// A door leaf: solid while shut, drawn by the client (it swings).
+pub const BK_DOOR: u8 = 14;
 
 /// A pitched roof as it is drawn (it is solid as a stack of `BK_HIDDEN` steps).
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +87,21 @@ pub struct Bx {
     pub min: V3,
     pub max: V3,
     pub kind: u8,
+    pub col: u32,
+}
+
+/// A hinged door in a doorway. Shut, its box is part of the world; open, the
+/// box is taken out of the grid and the leaf stands along `open` (not solid).
+#[derive(Clone, Copy, Debug)]
+pub struct Door {
+    pub bx: u32,
+    /// hinge (x, floor y, z), leaf width and height
+    pub hinge: V3,
+    pub w: f32,
+    pub h: f32,
+    /// heading of the leaf from the hinge when shut and when open
+    pub shut: f32,
+    pub open: f32,
     pub col: u32,
 }
 
@@ -173,6 +190,9 @@ pub struct World {
     /// Loose props (crates and containers): indices into `boxes`. They can be
     /// knocked about; `move_box` keeps the collision grid in step.
     pub props: Vec<u32>,
+    /// Doors, and which of them stand open (all shut as generated).
+    pub doors: Vec<Door>,
+    pub door_open: Vec<bool>,
     pub deco: Vec<Bx>,
     /// Window panes (min, max): drawn as glass, not solid.
     pub glass: Vec<[f32; 6]>,
@@ -249,6 +269,8 @@ impl World {
             gbox: Vec::new(),
             gcyl: Vec::new(),
             props: Vec::new(),
+            doors: Vec::new(),
+            door_open: Vec::new(),
             deco: Vec::new(),
             glass: Vec::new(),
             roofs: Vec::new(),
@@ -613,6 +635,7 @@ impl World {
         });
         w.maxh = w.h.iter().cloned().fold(f32::MIN, f32::max);
         w.build_grid();
+        w.door_open = vec![false; w.doors.len()];
         w.props = (0..w.boxes.len()).filter(|&i| w.boxes[i].kind == BK_CRATE || w.boxes[i].kind == BK_CONTAINER).map(|i| i as u32).collect();
         w.checksum = w.compute_checksum();
         w
@@ -797,6 +820,26 @@ impl World {
                 opens.push((c - 0.65, c + 0.65, 1.0, 2.1));
             }
             self.wall(along_x, a0, a1, p0, p1, y, hgt, &mut opens, wall_col, wall_kind);
+            if s == side && kind != 1 {
+                // the door leaf: hinged at the low end of the opening, swinging outwards
+                let (d0, d1, top) = (door_c - 0.8, door_c + 0.8, 2.3);
+                let pc = (p0 + p1) * 0.5;
+                let (mn, mx, hinge) = if along_x {
+                    (V3::new(d0, y, pc - 0.04), V3::new(d1, y + top, pc + 0.04), V3::new(d0, y, pc))
+                } else {
+                    (V3::new(pc - 0.04, y, d0), V3::new(pc + 0.04, y + top, d1), V3::new(pc, y, d0))
+                };
+                let shut = if along_x { core::f32::consts::FRAC_PI_2 } else { 0.0 };
+                let open = match s {
+                    0 => core::f32::consts::PI,
+                    2 => 0.0,
+                    1 => core::f32::consts::FRAC_PI_2,
+                    _ => -core::f32::consts::FRAC_PI_2,
+                };
+                let col = [0x6B4A2E, 0x7A3B2A, 0x2F4F5E, 0xD8D2C4][(door_c * 3.7) as usize % 4];
+                self.doors.push(Door { bx: self.boxes.len() as u32, hinge, w: d1 - d0, h: top, shut, open, col });
+                self.boxes.push(Bx { min: mn, max: mx, kind: BK_DOOR, col });
+            }
             for &(s0, s1, bot, top) in opens.iter() {
                 self.frame(along_x, s0, s1, y + bot, y + top, p0, p1, bot <= 0.0, trim_col);
             }
@@ -1415,6 +1458,19 @@ impl World {
             for cx in x0..=x1 {
                 self.gbox[cz as usize * GN + cx as usize].push(i as u16);
             }
+        }
+    }
+    /// Open or shut door `k` (a shut door is solid, an open one is not).
+    pub fn set_door(&mut self, k: usize, open: bool) {
+        if k >= self.doors.len() || self.door_open[k] == open {
+            return;
+        }
+        self.door_open[k] = open;
+        let i = self.doors[k].bx as usize;
+        if open {
+            self.unlink_box(i);
+        } else {
+            self.link_box(i);
         }
     }
     /// Move box `i` so that the middle of its underside is at `pos`.

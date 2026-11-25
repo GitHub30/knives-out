@@ -106,6 +106,9 @@ fn parse(buf: &[u8]) -> Snap {
     // missiles: id, position, direction
     let nm = r.u8() as usize;
     r.skip(nm * 18);
+    // open doors: ids
+    let nd = r.u8() as usize;
+    r.skip(nd * 2);
     let ne = r.u16() as usize;
     let mut events = vec![];
     for _ in 0..ne {
