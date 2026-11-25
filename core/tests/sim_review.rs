@@ -394,36 +394,108 @@ fn net_yaw(y: f32) -> u16 {
     zonefall_core::net::q_yaw(y)
 }
 
-/// The client model's torso frame (models.ts emitCharacter), composed the way
-/// the client composes its rotations: qY(yaw) (times qX(1.25) about the hips
-/// in free fall), the hips, then the torso turned by qX(lean).
-fn drawn_torso(pos: V3, yaw: f32, crouch: bool, sprint: bool, mode: u8) -> (V3, [V3; 3]) {
-    let ry = |v: V3| V3::new(v.x * yaw.cos() + v.z * yaw.sin(), v.y, -v.x * yaw.sin() + v.z * yaw.cos());
-    let rx = |a: f32, v: V3| V3::new(v.x, v.y * a.cos() - v.z * a.sin(), v.y * a.sin() + v.z * a.cos());
-    let ground = mode == MODE_GROUND;
-    let crouch = crouch && ground;
-    let hip_h = if crouch { 0.5 } else { 0.95 };
-    let lean = if !ground { 0.0 } else if crouch { 0.15 } else if sprint { 0.22 } else { 0.05 };
-    let fall = mode == MODE_FALL;
-    let r0 = |v: V3| if fall { ry(rx(1.25, v)) } else { ry(v) };
-    let p0 = if fall { pos + V3::new(0.0, 0.95, 0.0) + r0(V3::new(0.0, -0.95, 0.0)) } else { pos };
-    let origin = p0 + r0(V3::new(0.0, hip_h + 0.02, 0.0));
-    let rt = |v: V3| r0(rx(lean, v));
-    (origin, [rt(V3::new(1.0, 0.0, 0.0)), rt(V3::new(0.0, 1.0, 0.0)), rt(V3::new(0.0, 0.0, 1.0))])
+/// A frame of the client's model: origin and the world images of the local
+/// axes, composed the way models.ts composes its quaternions.
+#[derive(Clone, Copy)]
+struct Fr(V3, [V3; 3]);
+fn mrx(a: f32) -> [V3; 3] {
+    [V3::new(1.0, 0.0, 0.0), V3::new(0.0, a.cos(), a.sin()), V3::new(0.0, -a.sin(), a.cos())]
+}
+fn mry(a: f32) -> [V3; 3] {
+    [V3::new(a.cos(), 0.0, -a.sin()), V3::new(0.0, 1.0, 0.0), V3::new(a.sin(), 0.0, a.cos())]
+}
+fn mrz(a: f32) -> [V3; 3] {
+    [V3::new(a.cos(), a.sin(), 0.0), V3::new(-a.sin(), a.cos(), 0.0), V3::new(0.0, 0.0, 1.0)]
+}
+fn mmul(a: [V3; 3], b: [V3; 3]) -> [V3; 3] {
+    let f = |v: V3| a[0] * v.x + a[1] * v.y + a[2] * v.z;
+    [f(b[0]), f(b[1]), f(b[2])]
+}
+impl Fr {
+    fn at(&self, v: [f32; 3]) -> V3 {
+        self.0 + self.1[0] * v[0] + self.1[1] * v[1] + self.1[2] * v[2]
+    }
+    fn child(&self, pivot: [f32; 3], q: [V3; 3]) -> Fr {
+        Fr(self.at(pivot), mmul(self.1, q))
+    }
+    fn hit(&self, o: V3, d: V3, c: [f32; 3], s: [f32; 3], maxt: f32) -> bool {
+        ray_obb(o, d, self.at(c), self.1, [s[0] / 2.0, s[1] / 2.0, s[2] / 2.0], maxt).is_some()
+    }
 }
 
-/// Does the ray pass through the drawn shirt, vest or backpack before `maxt`?
-fn through_drawn_torso(o: V3, d: V3, frame: (V3, [V3; 3]), maxt: f32) -> bool {
-    let (org, ax) = frame;
-    [([0.0, 0.3, 0.0], [0.23, 0.28, 0.13]), ([0.0, 0.27, 0.0], [0.25, 0.21, 0.155]), ([0.0, 0.32, -0.2], [0.17, 0.21, 0.07])]
-        .iter()
-        .any(|(c, h)| ray_obb(o, d, org + ax[0] * c[0] + ax[1] * c[1] + ax[2] * c[2], ax, *h, maxt).is_some())
+#[derive(Clone, Copy)]
+struct Look {
+    mode: u8,
+    crouch: bool,
+    weapon: u8,
+    ads: bool,
+    healing: bool,
 }
 
-/// Shots at the drawn head that pass no part of the drawn torso are
+/// Where a ray first meets the drawn upper body of the client's model
+/// (models.ts emitCharacter, re-derived here): 0 nothing, 1 torso, 2 arms,
+/// weapon or medkit.
+fn drawn_upper(pos: V3, yaw: f32, pitch: f32, l: Look, o: V3, d: V3, maxt: f32) -> u8 {
+    let pitch = pitch.clamp(-1.2, 1.2);
+    let ground = l.mode == MODE_GROUND;
+    let crouch = l.crouch && ground;
+    let lean = if !ground { 0.0 } else if crouch { 0.15 } else { 0.05 };
+    let (fall, para) = (l.mode == MODE_FALL, l.mode == MODE_PARA);
+    let root = if fall {
+        let q = mmul(mry(yaw), mrx(1.25));
+        let hip = pos + V3::new(0.0, 0.95, 0.0);
+        Fr(hip + q[1] * -0.95, q)
+    } else {
+        Fr(pos, mry(yaw))
+    };
+    let hips = root.child([0.0, if crouch { 0.5 } else { 0.95 }, 0.0], mry(0.0));
+    let torso = hips.child([0.0, 0.02, 0.0], mrx(lean));
+    if torso.hit(o, d, [0.0, 0.3, 0.0], [0.46, 0.56, 0.26], maxt) || torso.hit(o, d, [0.0, 0.32, -0.2], [0.34, 0.42, 0.14], maxt) {
+        return 1;
+    }
+    let gun = l.weapon > 0;
+    let arm_pitch = -std::f32::consts::FRAC_PI_2 - pitch * 0.85 - lean;
+    for s in [1.0f32, -1.0] {
+        let (q, elbow) = if fall {
+            (mmul(mrz(s * 1.25), mrx(-0.3)), -0.2)
+        } else if para {
+            (mmul(mrz(s * 0.25), mrx(-std::f32::consts::PI + 0.25)), -0.3)
+        } else if l.healing {
+            (mmul(mry(s * -0.4), mrx(-1.1)), -0.9)
+        } else if gun {
+            if s > 0.0 { (mmul(mry(-0.55), mrx(arm_pitch + 0.05)), -0.35) } else { (mmul(mry(-0.1), mrx(arm_pitch + 0.25)), -0.75) }
+        } else {
+            (mrz(s * 0.08), -0.35)
+        };
+        let arm = torso.child([0.29 * s, 0.5, 0.0], q);
+        let fore = arm.child([0.0, -0.3, 0.0], mrx(elbow));
+        if arm.hit(o, d, [0.0, -0.15, 0.0], [0.13, 0.32, 0.13], maxt) || fore.hit(o, d, [0.0, -0.14, 0.0], [0.12, 0.3, 0.12], maxt) || fore.hit(o, d, [0.0, -0.31, 0.0], [0.1, 0.1, 0.1], maxt) {
+            return 2;
+        }
+    }
+    if gun && !fall && !para {
+        let g = torso.child(if l.ads { [-0.06, 0.52, 0.34] } else { [-0.13, 0.42, 0.36] }, if l.healing { mmul(mrx(0.65), mrz(0.3)) } else { mrx(-pitch - lean) });
+        // models.ts GUNS[W_AR] and GUNS[W_SNIPER]
+        let boxes: &[[f32; 6]] = if l.weapon == W_SNIPER {
+            &[[0.0, 0.04, 0.2, 0.06, 0.1, 0.8], [0.0, 0.14, 0.12, 0.06, 0.06, 0.32], [0.0, 0.14, 0.29, 0.07, 0.07, 0.03], [0.0, -0.07, 0.12, 0.04, 0.1, 0.06], [0.0, 0.01, -0.27, 0.06, 0.13, 0.3], [0.0, 0.06, 0.74, 0.035, 0.035, 0.36]]
+        } else {
+            &[[0.0, 0.04, 0.12, 0.06, 0.1, 0.5], [0.0, -0.1, 0.17, 0.045, 0.18, 0.07], [0.0, 0.02, -0.22, 0.05, 0.11, 0.25], [0.0, 0.06, 0.48, 0.03, 0.03, 0.24], [0.0, 0.04, 0.3, 0.07, 0.08, 0.16]]
+        };
+        if boxes.iter().any(|b| g.hit(o, d, [b[0], b[1], b[2]], [b[3], b[4], b[5]], maxt)) {
+            return 2;
+        }
+    }
+    if l.healing && torso.hit(o, d, [0.0, 0.25, 0.42], [0.16, 0.1, 0.1], maxt) {
+        return 2;
+    }
+    0
+}
+
+/// Shots at the drawn head that pass no drawn part of the upper body are
 /// headshots: from below (the fat body capsule used to shadow the chin) and
 /// at a free-falling body (whose tilted capsule wrapped the back of the
-/// head). Shots through the drawn torso first stay body hits.
+/// head). Shots through the drawn torso, arms, gun or medkit first are body
+/// hits.
 #[test]
 fn unobstructed_shots_at_the_drawn_head_are_headshots() {
     let mut m = Match::new(42, 2, FLAG_OFFLINE, 3);
@@ -433,19 +505,34 @@ fn unobstructed_shots_at_the_drawn_head_are_headshots() {
     m.players[a].bot = true; // live positions, no rewind
     let t = V3::new(500.0, 200.0, 500.0);
     let mut rng = Rng::new(9);
-    for (mode, crouch, name) in [(MODE_GROUND, false, "standing"), (MODE_GROUND, true, "crouched"), (MODE_PARA, false, "parachute"), (MODE_FALL, false, "free fall")] {
-        let (mut free, mut free_head, mut blocked, mut blocked_body) = (0, 0, 0, 0);
+    let looks = [
+        ("standing, unarmed", Look { mode: MODE_GROUND, crouch: false, weapon: 0, ads: false, healing: false }),
+        ("crouched, unarmed", Look { mode: MODE_GROUND, crouch: true, weapon: 0, ads: false, healing: false }),
+        ("standing, rifle", Look { mode: MODE_GROUND, crouch: false, weapon: W_AR, ads: false, healing: false }),
+        ("crouched, scoped sniper", Look { mode: MODE_GROUND, crouch: true, weapon: W_SNIPER, ads: true, healing: false }),
+        ("standing, healing", Look { mode: MODE_GROUND, crouch: false, weapon: W_AR, ads: false, healing: true }),
+        ("parachute", Look { mode: MODE_PARA, crouch: false, weapon: W_AR, ads: false, healing: false }),
+        ("free fall", Look { mode: MODE_FALL, crouch: false, weapon: W_AR, ads: false, healing: false }),
+    ];
+    for (name, l) in looks {
+        let (mut free, mut free_head, mut torso, mut torso_body, mut arms, mut arms_body) = (0, 0, 0, 0, 0, 0);
         for yaw in [0.0f32, 1.3, 2.6, -1.9] {
             for pitch in [-0.5f32, 0.0, 0.6] {
                 {
                     let q = &mut m.players[b];
-                    q.ms = MoveState { pos: t, mode, on_ground: mode == MODE_GROUND, crouch, ..Default::default() };
+                    q.ms = MoveState { pos: t, mode: l.mode, on_ground: l.mode == MODE_GROUND, crouch: l.crouch, ..Default::default() };
                     q.yaw = yaw;
                     q.pitch = pitch;
                     q.draw_speed = 0.0;
+                    q.slots[0] = (l.weapon, 10);
+                    q.cur = 0;
+                    q.ads = l.ads;
+                    q.heal_t = if l.healing { 2.0 } else { 0.0 };
+                    q.reload_t = 0.0;
+                    q.firing_t = 0.0;
+                    q.vest = 0;
                 }
-                let pose = body_pose(t, yaw, pitch, crouch, false, mode);
-                let frame = drawn_torso(t, yaw, crouch, false, mode);
+                let pose = body_pose(t, yaw, pitch, l.crouch, false, l.mode);
                 // shooters all around, level up to 60 degrees below the target
                 for k in 0..12 {
                     let az = k as f32 * TAU / 12.0;
@@ -456,24 +543,35 @@ fn unobstructed_shots_at_the_drawn_head_are_headshots() {
                             let o = aim + back * 20.0;
                             let d = (aim - o).norm();
                             let r = m.ray_players(a, o, d, 40.0, 0);
-                            if through_drawn_torso(o, d, frame, 20.0) {
-                                blocked += 1;
-                                blocked_body += matches!(r, Some((j, _, false)) if j == b) as u32;
-                            } else {
-                                free += 1;
-                                free_head += matches!(r, Some((j, _, true)) if j == b) as u32;
+                            // parts beyond where the ray reaches the head do not matter
+                            let th = ray_sphere(o, d, pose.head, 0.2, 40.0).unwrap_or(20.0);
+                            match drawn_upper(t, yaw, pitch, l, o, d, th) {
+                                0 => {
+                                    free += 1;
+                                    free_head += matches!(r, Some((j, _, true)) if j == b) as u32;
+                                }
+                                1 => {
+                                    torso += 1;
+                                    torso_body += matches!(r, Some((j, _, false)) if j == b) as u32;
+                                }
+                                _ => {
+                                    arms += 1;
+                                    arms_body += matches!(r, Some((j, _, false)) if j == b) as u32;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        let fh = free_head as f32 / free.max(1) as f32;
-        let bb = blocked_body as f32 / blocked.max(1) as f32;
-        eprintln!("{name}: {free} clear shots at the head, {:.1}% headshots; {blocked} through the torso, {:.1}% body", fh * 100.0, bb * 100.0);
-        assert!(fh >= 0.99, "{name}: only {:.1}% of clear shots at the drawn head are headshots", fh * 100.0);
-        if blocked >= 20 {
-            assert!(bb >= 0.9, "{name}: only {:.1}% of shots through the drawn torso are body hits", bb * 100.0);
+        let pc = |x: u32, n: u32| 100.0 * x as f32 / n.max(1) as f32;
+        eprintln!("{name}: {free} clear shots at the head {:.1}% headshots; {torso} through the torso {:.1}% body; {arms} through arms / weapon {:.1}% body", pc(free_head, free), pc(torso_body, torso), pc(arms_body, arms));
+        assert!(pc(free_head, free) >= 99.0, "{name}: only {:.1}% of clear shots at the drawn head are headshots", pc(free_head, free));
+        if torso >= 20 {
+            assert!(pc(torso_body, torso) >= 90.0, "{name}: only {:.1}% of shots through the drawn torso are body hits", pc(torso_body, torso));
+        }
+        if arms >= 20 {
+            assert!(pc(arms_body, arms) >= 90.0, "{name}: only {:.1}% of shots through the drawn arms / weapon are body hits", pc(arms_body, arms));
         }
     }
 }
@@ -524,4 +622,142 @@ fn running_into_a_wall_is_not_judged_as_sprinting() {
     }
     let frac = heads as f32 / n as f32;
     assert!(frac >= 0.97, "only {:.1}% of side shots at the drawn head are headshots", frac * 100.0);
+}
+
+// ---------------------------------------------------------------------------
+// Fifth adversarial review
+
+/// The client's yaw interpolation (src/protocol.ts decode, lerpAngle in
+/// src/render/math.ts), in f64 as JavaScript computes it.
+fn client_yaw(qa: u16, qb: u16, f: f64) -> f64 {
+    let tau = std::f64::consts::PI * 2.0;
+    let (a, b) = (qa as f64 * tau / 65536.0, qb as f64 * tau / 65536.0);
+    let mut d = (b - a) % tau;
+    if d > std::f64::consts::PI {
+        d -= tau;
+    } else if d <= -std::f64::consts::PI {
+        d += tau;
+    }
+    a + d * f
+}
+
+/// A target that turns exactly half round at every snapshot: client and
+/// server must interpolate the turn the same way, or the drawn head (ahead of
+/// the axis when crouched and looking down) is judged on the other side.
+#[test]
+fn half_turns_between_snapshots_are_judged_as_drawn() {
+    for (ya, yb) in [(32730u16, 65498u16), (65498, 32730), (32766, 65534), (0, 32768)] {
+        let mut m = Match::new(42, 2, 0, 99);
+        let a = m.add_human(b"A").unwrap() as usize;
+        let b = m.add_human(b"B").unwrap() as usize;
+        m.step();
+        assert_eq!(m.snap_every, 2);
+        let g = open_ground(&m);
+        let gb = V3::new(g.x, m.w.ground_below(g.x, g.z + 25.0, g.y + 6.0, P_RADIUS), g.z + 25.0);
+        m.players[a].ms = MoveState { pos: g, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+        m.players[b].ms = MoveState { pos: gb, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+        // what B's snapshots carry, per tick
+        let mut hist = vec![(V3::ZERO, false, 0u16, 0i16, 0u8); 1000];
+        let (mut sa, mut sb) = (m.players[a].last_seq, m.players[b].last_seq);
+        let mut rng = Rng::new(7);
+        let (mut n, mut heads) = (0, 0);
+        let down = zonefall_core::net::q_pitch(-1.2);
+        for _ in 0..400 {
+            let next = m.tick + 1;
+            let yaw = if (next / 2) % 2 == 0 { ya } else { yb };
+            sb += 1;
+            m.on_message(b as u8, &cmd_bytes(&[(sb, m.tick.saturating_sub(5) * 256, 0, 0, yaw, down, B_CROUCH)]));
+            sa += 1;
+            m.on_message(a as u8, &cmd_bytes(&[(sa, m.tick.saturating_sub(5) * 256, 0, 0, 0, 0, 0)]));
+            m.step();
+            let q = &m.players[b];
+            hist[m.tick as usize] = (q.ms.pos, q.ms.crouch, net_yaw(q.yaw), zonefall_core::net::q_pitch(q.pitch), q.ms.mode);
+            if m.tick < 60 {
+                continue;
+            }
+            let eye = m.players[a].ms.pos + V3::new(0.0, eye_h(false), 0.0);
+            for _ in 0..6 {
+                let rt = m.tick as f64 - rng.range(4.0, 10.0) as f64;
+                let t0 = (rt / 2.0).floor() as usize * 2;
+                let (x, y) = (hist[t0], hist[t0 + 2]);
+                let f = (rt - t0 as f64) / 2.0;
+                let yaw = client_yaw(x.2, y.2, f) as f32;
+                let pa = x.3 as f64 * 1.5 / 32767.0;
+                let pitch = (pa + (y.3 as f64 * 1.5 / 32767.0 - pa) * f) as f32;
+                let head = body_pose(x.0.lerp(y.0, f as f32), yaw, pitch, y.1, false, y.4).head;
+                n += 1;
+                if let Some((j, _, true)) = m.ray_players(a, eye, (head - eye).norm(), 60.0, (rt * 256.0) as u32) {
+                    if j == b {
+                        heads += 1;
+                    }
+                }
+            }
+        }
+        let frac = heads as f32 / n as f32;
+        eprintln!("half turns {ya} <-> {yb}: {:.1}% of shots at the drawn head are headshots", frac * 100.0);
+        assert!(frac >= 0.97, "half turns {ya} <-> {yb}: only {:.1}% headshots at the drawn head", frac * 100.0);
+    }
+}
+
+/// A player missing from the older of the two snapshots around the render
+/// time (it just came into view) is drawn at the newer one, without
+/// interpolation: shots at it there must hit.
+#[test]
+fn players_coming_into_view_are_judged_where_drawn() {
+    let mut m = Match::new(42, 2, 0, 99);
+    let a = m.add_human(b"A").unwrap() as usize;
+    let b = m.add_human(b"B").unwrap() as usize;
+    m.step();
+    let g = open_ground(&m);
+    let gb = V3::new(g.x, m.w.ground_below(g.x, g.z + 25.0, g.y + 6.0, P_RADIUS), g.z + 25.0);
+    m.players[a].ms = MoveState { pos: g, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+    // far beyond the interest radius: not sent
+    let far = V3::new(if g.x < MAP * 0.5 { MAP - 20.0 } else { 20.0 }, 150.0, if g.z < MAP * 0.5 { MAP - 20.0 } else { 20.0 });
+    m.players[b].ms = MoveState { pos: far, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+    // the server builds A's snapshot on every snapshot tick
+    let sent = |m: &mut Match| -> bool {
+        let _ = m.snapshot(a as u8).len();
+        m.flush();
+        m.players[a].sent_from[b] != 0
+    };
+    let mut seq = m.players[a].last_seq;
+    let mut step = |m: &mut Match| {
+        seq += 1;
+        m.on_message(a as u8, &cmd_bytes(&[(seq, m.tick.saturating_sub(5) * 256, 0, 0, 0, 0, 0)]));
+        if m.step() & 1 != 0 {
+            return Some(sent(m));
+        }
+        None
+    };
+    for _ in 0..40 {
+        m.players[b].ms.pos = far;
+        step(&mut m);
+    }
+    // B steps into the open 25 m in front of A between two snapshots
+    while m.tick % 2 != 0 {
+        step(&mut m);
+    }
+    let sa = m.tick;
+    assert_eq!(m.players[a].sent_from[b], 0, "B was sent while far away");
+    m.players[b].ms = MoveState { pos: gb, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+    let mut sb = 0;
+    for _ in 0..4 {
+        if step(&mut m) == Some(true) && sb == 0 {
+            sb = m.tick;
+        }
+    }
+    assert_eq!(sb, sa + 2, "B did not appear in the next snapshot");
+    // the client draws B at the newer snapshot for render times in (sa, sb)
+    let head = body_pose(gb, 0.0, 0.0, false, false, MODE_GROUND).head;
+    let eye = m.players[a].ms.pos + V3::new(0.0, eye_h(false), 0.0);
+    let mut heads = 0;
+    for k in 1..8 {
+        let rt = sa as f32 + k as f32 * 0.25;
+        if let Some((j, _, true)) = m.ray_players(a, eye, (head - eye).norm(), 60.0, (rt * 256.0) as u32) {
+            if j == b {
+                heads += 1;
+            }
+        }
+    }
+    assert_eq!(heads, 7, "only {heads} of 7 shots at B where it is drawn hit its head");
 }

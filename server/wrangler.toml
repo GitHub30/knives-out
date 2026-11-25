@@ -37,6 +37,12 @@ name = "REFUSE_LIMIT"
 namespace_id = "7303"
 simple = { limit = 3, period = 60 }
 
+# ... and per IPv6 /48 (four /64s' worth)
+[[ratelimits]]
+name = "REFUSE_LIMIT48"
+namespace_id = "7304"
+simple = { limit = 12, period = 60 }
+
 [vars]
 ALLOWED_ORIGINS = "https://github30.github.io,http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
 

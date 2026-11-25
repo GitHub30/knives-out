@@ -31,6 +31,8 @@ export interface Env {
   JOIN_LIMIT48?: RateLimit;
   /** In-band "too many attempts" refusals per network (the rest get plain 429s). */
   REFUSE_LIMIT?: RateLimit;
+  /** ... and per IPv6 /48 (four /64s' worth). */
+  REFUSE_LIMIT48?: RateLimit;
 }
 
 interface SrvExports {
@@ -41,7 +43,8 @@ interface SrvExports {
   srv_add(len: number): number;
   srv_remove(pid: number): void;
   srv_msg(pid: number, len: number): void;
-  srv_step(): number;
+  /** behind = 1 when this step catches up on ticks the Room fell behind. */
+  srv_step(behind: number): number;
   srv_welcome(pid: number): number;
   srv_snap(pid: number): number;
   srv_out(): number;
@@ -58,9 +61,10 @@ const ERR_TOO_MANY = 4;
 const ERR_BUSY = 5;
 const ERR_PRIV_NET = 6;
 const ERR_RATE = 7;
-const ERR_BAD_CODE = 8;
 const TICK_MS = 1000 / 30;
 const MAX_MSG = 256;
+/** Token bucket burst (messages). */
+const BURST = 130;
 const MAX_ROOM_MS = 25 * 60 * 1000;
 const MAX_PER_IP_ROOM = 3;
 const MAX_PER_NET = 4;
@@ -117,12 +121,18 @@ function refuse(code: number, reason: string): Response {
   return new Response(null, { status: 101, webSocket: pair[0] });
 }
 
-/** Too many join attempts: say so in-band a few times a minute per network,
- * then answer plain 429s, which the runtime closes by itself (an in-band
- * refusal is an accepted socket that lingers until the client closes it). */
+/** Too many join attempts: say so in-band a few times a minute per network
+ * (and per IPv6 /48, so rotating /64s does not multiply them), then answer
+ * plain 429s, which the runtime closes by itself (an in-band refusal is an
+ * accepted socket that lingers until the client closes it). */
 async function refuseRate(env: Env, net: string): Promise<Response> {
   if (env.REFUSE_LIMIT) {
     const { success } = await env.REFUSE_LIMIT.limit({ key: net });
+    if (!success) return plain('Too many join attempts', 429);
+  }
+  const g48 = net48(net);
+  if (env.REFUSE_LIMIT48 && g48 !== net) {
+    const { success } = await env.REFUSE_LIMIT48.limit({ key: g48 });
     if (!success) return plain('Too many join attempts', 429);
   }
   return refuse(ERR_RATE, 'too many join attempts');
@@ -164,7 +174,9 @@ export default {
       }
       const name = (url.searchParams.get('name') ?? '').slice(0, 32);
       const code = url.searchParams.get('room');
-      if (code !== null && !ROOM_CODE.test(code)) return refuse(ERR_BAD_CODE, 'bad room code');
+      // The client checks codes before connecting, so a malformed one is no
+      // player's mistake: a plain 400 (no lingering in-band refusal).
+      if (code !== null && !ROOM_CODE.test(code)) return plain('Bad room code', 400);
       const r = await lobbyStub(env).fetch('https://lobby/join', { method: 'POST', body: JSON.stringify({ net, code }) });
       if (!r.ok) {
         const err = ((await r.json().catch(() => ({}))) as { error?: string }).error;
@@ -397,7 +409,7 @@ export class Room {
     const pid = ex.srv_add(name.length);
     if (pid < 0) return reject(ERR_FULL, 'room full');
     const now = Date.now();
-    const conn: Conn = { pid, ip, net, tokens: 60, lastRefill: now, strikes: 0, strikeWindow: now, lastMsg: now };
+    const conn: Conn = { pid, ip, net, tokens: BURST, lastRefill: now, strikes: 0, strikeWindow: now, lastMsg: now };
     this.conns.set(server, conn);
     this.sendOut(server, ex.srv_welcome(pid));
 
@@ -431,10 +443,13 @@ export class Room {
       this.strike(ws, c);
       return;
     }
-    // token bucket: 45 msgs/s sustained, burst 60 (clients send ~15-30/s)
+    // token bucket: 45 msgs/s sustained; the burst holds what an uplink
+    // stall of up to ~8 s queues (15 command messages a second plus pings),
+    // so the commands after a stall reach the core, whose lag accounting
+    // drops the ones idle steps already covered (keeping their taps)
     const now = Date.now();
     c.lastMsg = now;
-    c.tokens = Math.min(60, c.tokens + ((now - c.lastRefill) / 1000) * 45);
+    c.tokens = Math.min(BURST, c.tokens + ((now - c.lastRefill) / 1000) * 45);
     c.lastRefill = now;
     if (c.tokens < 1) {
       this.strike(ws, c);
@@ -529,7 +544,8 @@ export class Room {
     let steps = 0;
     try {
       while (this.nextTick <= now && steps < 5) {
-        const r = ex.srv_step();
+        // a catch-up step: at least one more tick is already due after it
+        const r = ex.srv_step(now - this.nextTick >= TICK_MS ? 1 : 0);
         if (r & 1) {
           for (const [ws, c] of this.conns) this.sendOut(ws, ex.srv_snap(c.pid));
           ex.srv_flush();

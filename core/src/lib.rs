@@ -119,8 +119,12 @@ pub extern "C" fn srv_msg(pid: u32, len: u32) {
 }
 
 #[no_mangle]
-pub extern "C" fn srv_step() -> u32 {
-    server().map_or(0, |s| s.step())
+pub extern "C" fn srv_step(behind: u32) -> u32 {
+    server().map_or(0, |s| {
+        // set by the host when this step catches up on ticks it fell behind
+        s.catch_up = behind != 0;
+        s.step()
+    })
 }
 
 #[no_mangle]

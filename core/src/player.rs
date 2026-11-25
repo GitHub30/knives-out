@@ -312,28 +312,142 @@ pub struct BodyPose {
     pub b: V3,
     /// The hip pivot (on the axis): legs below it, the torso above.
     pub hip: V3,
-    /// The drawn torso's frame: origin (its base) and axes (right, up,
-    /// forward). See `TORSO_BOXES`.
-    pub torso_o: V3,
-    pub torso_ax: [V3; 3],
+    /// The drawn torso's frame (models.ts `torso`): its base, leaning.
+    pub torso: Frame,
+    lean: f32,
+    pitch: f32,
+    mode: u8,
 }
 
-/// The client model's torso boxes (shirt, vest, backpack) in the torso frame:
-/// centre and half extents (models.ts emitCharacter).
-pub const TORSO_BOXES: [([f32; 3], [f32; 3]); 3] = [
-    ([0.0, 0.3, 0.0], [0.23, 0.28, 0.13]),
-    ([0.0, 0.27, 0.0], [0.25, 0.21, 0.155]),
-    ([0.0, 0.32, -0.2], [0.17, 0.21, 0.07]),
+/// A rigid frame of the client's model (models.ts `T`): origin and the world
+/// images of the local x, y and z axes (its quaternion as a matrix).
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub p: V3,
+    pub m: [V3; 3],
+}
+
+/// Rotations as the client's qX / qY / qZ (right-handed; qX turns +y towards
+/// +z, the model's forward).
+fn rot_x(a: f32) -> [V3; 3] {
+    let (s, c) = a.sin_cos();
+    [V3::new(1.0, 0.0, 0.0), V3::new(0.0, c, s), V3::new(0.0, -s, c)]
+}
+fn rot_y(a: f32) -> [V3; 3] {
+    let (s, c) = a.sin_cos();
+    [V3::new(c, 0.0, -s), V3::new(0.0, 1.0, 0.0), V3::new(s, 0.0, c)]
+}
+fn rot_z(a: f32) -> [V3; 3] {
+    let (s, c) = a.sin_cos();
+    [V3::new(c, s, 0.0), V3::new(-s, c, 0.0), V3::new(0.0, 0.0, 1.0)]
+}
+/// qMul(a, b): b first, then a.
+fn rot_mul(a: [V3; 3], b: [V3; 3]) -> [V3; 3] {
+    let f = |v: V3| a[0] * v.x + a[1] * v.y + a[2] * v.z;
+    [f(b[0]), f(b[1]), f(b[2])]
+}
+
+impl Frame {
+    pub fn at(&self, v: [f32; 3]) -> V3 {
+        self.p + self.m[0] * v[0] + self.m[1] * v[1] + self.m[2] * v[2]
+    }
+    /// models.ts `child`: a pivot in this frame, then a local rotation.
+    fn child(&self, pivot: [f32; 3], q: [V3; 3]) -> Frame {
+        Frame { p: self.at(pivot), m: rot_mul(self.m, q) }
+    }
+    /// Ray vs a box of the model (centre and full size in this frame, as
+    /// models.ts `box`): the entry distance.
+    pub fn ray_box(&self, o: V3, d: V3, c: [f32; 3], size: [f32; 3], maxt: f32) -> Option<f32> {
+        ray_obb(o, d, self.at(c), self.m, [size[0] * 0.5, size[1] * 0.5, size[2] * 0.5], maxt)
+    }
+}
+
+/// What the client draws besides the pose: the held weapon and the snapshot
+/// flags that move the arms (models.ts emitCharacter).
+#[derive(Clone, Copy, Default)]
+pub struct Gear {
+    pub weapon: u8,
+    pub ads: bool,
+    pub firing: bool,
+    pub healing: bool,
+    pub reloading: bool,
+    pub vest: bool,
+}
+
+/// The client model's torso boxes in the torso frame: centre and full size
+/// (models.ts emitCharacter: shirt, vest (when worn), backpack).
+pub const SHIRT_BOX: ([f32; 3], [f32; 3]) = ([0.0, 0.3, 0.0], [0.46, 0.56, 0.26]);
+pub const VEST_BOX: ([f32; 3], [f32; 3]) = ([0.0, 0.27, 0.0], [0.5, 0.42, 0.31]);
+pub const PACK_BOX: ([f32; 3], [f32; 3]) = ([0.0, 0.32, -0.2], [0.34, 0.42, 0.14]);
+
+/// The client's gun models (models.ts GUNS): centre and full size per box.
+const GUN_BOXES: [&[[f32; 6]]; 7] = [
+    &[],
+    &[[0.0, 0.05, 0.07, 0.05, 0.075, 0.2], [0.0, -0.04, -0.01, 0.045, 0.12, 0.06]],
+    &[[0.0, 0.04, 0.1, 0.06, 0.1, 0.34], [0.0, -0.09, 0.13, 0.04, 0.17, 0.05], [0.0, 0.03, -0.15, 0.04, 0.07, 0.17], [0.0, 0.05, 0.32, 0.03, 0.03, 0.12]],
+    &[[0.0, 0.04, 0.12, 0.06, 0.1, 0.5], [0.0, -0.1, 0.17, 0.045, 0.18, 0.07], [0.0, 0.02, -0.22, 0.05, 0.11, 0.25], [0.0, 0.06, 0.48, 0.03, 0.03, 0.24], [0.0, 0.04, 0.3, 0.07, 0.08, 0.16]],
+    &[[0.0, 0.03, 0.17, 0.06, 0.09, 0.62], [0.0, -0.03, 0.33, 0.07, 0.06, 0.18], [0.0, 0.0, -0.2, 0.05, 0.12, 0.28]],
+    &[[0.0, 0.04, 0.15, 0.06, 0.1, 0.6], [0.0, 0.13, 0.1, 0.05, 0.05, 0.22], [0.0, -0.08, 0.14, 0.04, 0.13, 0.06], [0.0, 0.02, -0.22, 0.05, 0.11, 0.24], [0.0, 0.06, 0.55, 0.03, 0.03, 0.22]],
+    &[[0.0, 0.04, 0.2, 0.06, 0.1, 0.8], [0.0, 0.14, 0.12, 0.06, 0.06, 0.32], [0.0, 0.14, 0.29, 0.07, 0.07, 0.03], [0.0, -0.07, 0.12, 0.04, 0.1, 0.06], [0.0, 0.01, -0.27, 0.06, 0.13, 0.3], [0.0, 0.06, 0.74, 0.035, 0.035, 0.36]],
 ];
 
 impl BodyPose {
-    /// Ray vs the drawn torso: the entry distance.
-    pub fn ray_torso(&self, o: V3, d: V3, maxt: f32) -> Option<f32> {
-        let ax = self.torso_ax;
-        TORSO_BOXES
+    /// Ray vs the drawn torso (shirt, vest, backpack): the entry distance.
+    pub fn ray_torso(&self, o: V3, d: V3, maxt: f32, vest: bool) -> Option<f32> {
+        [Some(SHIRT_BOX), vest.then_some(VEST_BOX), Some(PACK_BOX)]
             .iter()
-            .filter_map(|(c, h)| ray_obb(o, d, self.torso_o + ax[0] * c[0] + ax[1] * c[1] + ax[2] * c[2], ax, *h, maxt))
+            .flatten()
+            .filter_map(|(c, s)| self.torso.ray_box(o, d, *c, *s, maxt))
             .min_by(|a, b| a.total_cmp(b))
+    }
+
+    /// Does the ray pass through a drawn part of the upper body before
+    /// `maxt`: the torso, the arms and hands, the held weapon or the medkit
+    /// (models.ts emitCharacter; the walking arm swing of an unarmed player
+    /// is not known here and taken at rest)?
+    pub fn ray_upper(&self, o: V3, d: V3, maxt: f32, g: Gear) -> bool {
+        if self.ray_torso(o, d, maxt, g.vest).is_some() {
+            return true;
+        }
+        let (fall, para) = (self.mode == MODE_FALL, self.mode == MODE_PARA);
+        let gun = (g.weapon as usize) < GUN_BOXES.len() && g.weapon > 0;
+        let arm_pitch = -std::f32::consts::FRAC_PI_2 - self.pitch * 0.85 - self.lean;
+        for s in [1.0f32, -1.0] {
+            let (q, elbow) = if fall {
+                (rot_mul(rot_z(s * 1.25), rot_x(-0.3)), -0.2)
+            } else if para {
+                (rot_mul(rot_z(s * 0.25), rot_x(-std::f32::consts::PI + 0.25)), -0.3)
+            } else if g.healing {
+                (rot_mul(rot_y(s * -0.4), rot_x(-1.1)), -0.9)
+            } else if gun {
+                if s > 0.0 {
+                    (rot_mul(rot_y(-0.55), rot_x(arm_pitch + if g.reloading { 0.7 } else { 0.05 })), if g.reloading { -0.9 } else { -0.35 })
+                } else {
+                    (rot_mul(rot_y(-0.1), rot_x(arm_pitch + 0.25)), -0.75)
+                }
+            } else if g.firing && s < 0.0 {
+                (rot_x(arm_pitch), 0.0)
+            } else {
+                (rot_z(s * 0.08), -0.35)
+            };
+            let arm = self.torso.child([0.29 * s, 0.5, 0.0], q);
+            if arm.ray_box(o, d, [0.0, -0.15, 0.0], [0.13, 0.32, 0.13], maxt).is_some() {
+                return true;
+            }
+            let fore = arm.child([0.0, -0.3, 0.0], rot_x(elbow));
+            if fore.ray_box(o, d, [0.0, -0.14, 0.0], [0.12, 0.3, 0.12], maxt).is_some() || fore.ray_box(o, d, [0.0, -0.31, 0.0], [0.1, 0.1, 0.1], maxt).is_some() {
+                return true;
+            }
+        }
+        if gun && !fall && !para {
+            let gp = if g.ads { [-0.06, 0.52, 0.34] } else { [-0.13, 0.42, 0.36] };
+            let gq = if g.reloading || g.healing { rot_mul(rot_x(0.65), rot_z(0.3)) } else { rot_x(-self.pitch - self.lean) };
+            let gf = self.torso.child(gp, gq);
+            if GUN_BOXES[g.weapon as usize].iter().any(|b| gf.ray_box(o, d, [b[0], b[1], b[2]], [b[3], b[4], b[5]], maxt).is_some()) {
+                return true;
+            }
+        }
+        g.healing && self.torso.ray_box(o, d, [0.0, 0.25, 0.42], [0.16, 0.1, 0.1], maxt).is_some()
     }
 }
 
@@ -373,29 +487,24 @@ pub fn body_pose(pos: V3, yaw: f32, pitch: f32, crouch: bool, sprint: bool, mode
         let p = tilt(p);
         V3::new(pos.x + f.x * p.1, pos.y + p.0, pos.z + f.z * p.1)
     };
-    // The torso turns by the lean about its base (hip + 0.02). In free fall
-    // the whole model turns about the hip.
-    let (sl, cl) = lean.sin_cos();
-    let (up2, fw2) = ((cl, sl), (-sl, cl));
-    let turn = |v: (f32, f32)| {
-        if mode == MODE_FALL {
-            let (sn, cs) = 1.25f32.sin_cos();
-            (v.0 * cs - v.1 * sn, v.0 * sn + v.1 * cs)
-        } else {
-            v
-        }
-    };
-    let dir = |v: (f32, f32)| {
-        let v = turn(v);
-        V3::new(f.x * v.1, v.0, f.z * v.1)
+    // The model's frames as the client composes them: qY(yaw) (times qX(1.25)
+    // about the hips in free fall), the hips, then the torso turned by the
+    // lean about its base (hip + 0.02).
+    let root = if mode == MODE_FALL {
+        let q = rot_mul(rot_y(yaw), rot_x(1.25));
+        Frame { p: pos + V3::new(0.0, 0.95, 0.0) + q[1] * -0.95, m: q }
+    } else {
+        Frame { p: pos, m: rot_y(yaw) }
     };
     BodyPose {
         head: world(head),
         a: world(lo),
         b: world(hi),
         hip: world((hip, 0.0)),
-        torso_o: world((hip + 0.02, 0.0)),
-        torso_ax: [right(yaw), dir(up2), dir(fw2)],
+        torso: root.child([0.0, hip + 0.02, 0.0], rot_x(lean)),
+        lean,
+        pitch: pitch.clamp(-1.2, 1.2),
+        mode,
     }
 }
 

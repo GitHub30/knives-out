@@ -8,7 +8,7 @@ interface SrvExports {
   srv_init(seed: number, slots: number, flags: number, s0: number, s1: number, s2: number, s3: number): void;
   srv_add(len: number): number;
   srv_msg(pid: number, len: number): void;
-  srv_step(): number;
+  srv_step(behind: number): number;
   srv_welcome(pid: number): number;
   srv_snap(pid: number): number;
   srv_out(): number;
@@ -29,9 +29,9 @@ function out(len: number) {
   ctx.postMessage(copy.buffer, [copy.buffer]);
 }
 
-function tick() {
+function tick(behind: boolean) {
   if (!ex) return;
-  const r = ex.srv_step();
+  const r = ex.srv_step(behind ? 1 : 0);
   if (r & 1) {
     out(ex.srv_snap(pid));
     ex.srv_flush();
@@ -50,7 +50,8 @@ function loop() {
   } else {
     let n = 0;
     while (now >= next && n < 6) {
-      tick();
+      // catching up: at least one more tick is already due after this one
+      tick(now - next >= TICK_MS);
       next += TICK_MS;
       n++;
     }

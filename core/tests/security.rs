@@ -447,7 +447,7 @@ fn names_round4() {
         ("a/b", "a\u{2215}b"),                  // division slash
         ("??", "\u{2047}"),                     // double question mark
         ("25\u{b0}C", "25\u{2103}"),            // degree Celsius
-        ("\u{3a3}IGMA", "\u{3f9}IGMA"),         // lunate sigma
+        ("CIGMA", "\u{3f9}IGMA"),               // lunate sigma (drawn like C)
         ("\u{4d9}li", "\u{259}li"),             // Cyrillic / Latin schwa
         ("\u{30ab}\u{30bc}", "\u{529b}\u{30bc}"), // カ / 力
         ("\u{30ed}\u{30a4}", "\u{53e3}\u{30a4}"), // ロ / 口
@@ -471,6 +471,66 @@ fn names_round4() {
     }
     // ordinary different names stay apart
     for (a, b) in [("Kai", "Kei"), ("\u{529b}\u{4e5f}", "\u{529b}\u{58eb}"), ("\u{3086}\u{3046}", "\u{30e6}\u{30a6}\u{30ad}")] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        add(a);
+        assert_eq!(add(b), b, "{b:?} got a suffix next to {a:?}");
+    }
+}
+
+/// Fifth review: twins with no Latin look-alike share a key, and scripts
+/// that only copy kana and kanji (Bopomofo, CJK strokes) are not kept.
+#[test]
+fn names_round5() {
+    for (a, b) in [
+        ("\u{41f}\u{410}\u{412}\u{415}\u{41b}", "\u{3a0}\u{410}\u{412}\u{415}\u{41b}"), // ПАВЕЛ / ΠАВЕЛ
+        ("\u{413}\u{415}\u{41d}\u{410}", "\u{393}\u{415}\u{41d}\u{410}"),               // ГЕНА / ΓЕНА
+        ("\u{470}\u{418}", "\u{3a8}\u{418}"),                                           // ѰИ / ΨИ
+        ("L33T", "L\u{417}\u{417}T"),                                                   // digit 3 / З
+        ("Ace3", "Ace\u{437}"),                                                         // digit 3 / з
+        ("MAX", "\u{3fa}AX"),                                                           // Ϻ
+        ("\u{4e8}MAR", "\u{19f}MAR"),                                                   // Ө / Ɵ
+        ("\u{4e8}MAR", "\u{3f4}MAR"),                                                   // Ө / ϴ
+        ("\u{4e8}MAR", "\u{472}MAR"),                                                   // Ө / Ѳ
+        ("\u{418}\u{412}\u{410}\u{41d}", "\u{376}\u{412}\u{410}\u{41d}"),               // И / Ͷ
+        ("\u{127}axx", "\u{45b}axx"),                                                   // ħ / ћ
+        ("\u{3b7}oe", "\u{19e}oe"),                                                     // η / ƞ
+        ("Ma\u{292}x", "Ma\u{4e1}x"),                                                   // ʒ / ӡ
+        ("\u{c6}SIR", "\u{4d4}SIR"),                                                    // Æ / Ӕ
+        ("Ma\u{254}x", "Ma\u{37b}x"),                                                   // ɔ / ͻ
+        ("\u{639}\u{644}\u{6cc}", "\u{639}\u{644}\u{649}"),                             // علی / على
+        ("\u{394}NA", "\u{2206}NA"),                                                    // Δ / ∆
+        ("a\u{b7}b", "a\u{2027}b"),                                                     // · / ‧
+        ("cat", "\u{3f2}at"),                                                           // c / ϲ
+        ("\u{e7}an", "\u{4ab}an"),                                                      // ç / ҫ
+        ("\u{30e0}\u{30e9}", "\u{53b6}\u{30e9}"),                                       // ム / 厶
+        ("\u{30d2}\u{30ed}", "\u{5315}\u{30ed}"),                                       // ヒ / 匕
+        ("\u{30c1}\u{30ab}", "\u{5343}\u{30ab}"),                                       // チ / 千
+        ("\u{30eb}\u{30fc}", "\u{30eb}\u{3161}"),                                       // ー / ㅡ
+    ] {
+        let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
+        let mut add = |s: &str| {
+            let id = m.add_human(s.as_bytes()).unwrap();
+            m.players[id as usize].name.clone()
+        };
+        let na = add(a);
+        let nb = add(b);
+        assert_eq!(na, a, "{a:?} was changed to {na:?}");
+        assert!(nb.contains('#'), "{b:?} ({nb:?}) is accepted next to {a:?}");
+    }
+    let mut m = Match::new(1, 32, FLAG_OFFLINE, 7);
+    let mut add = |s: &str| {
+        let id = m.add_human(s.as_bytes()).unwrap();
+        m.players[id as usize].name.clone()
+    };
+    // Bopomofo and CJK strokes copy kanji / kana: dropped
+    assert_eq!(add("\u{312a}\u{91cc}"), "\u{91cc}");
+    assert_eq!(add("\u{31d0}\u{90ce}"), "\u{90ce}");
+    // ordinary names stay apart
+    for (a, b) in [("\u{41f}\u{430}\u{448}\u{430}", "\u{41c}\u{430}\u{448}\u{430}"), ("Ivan", "Iwan"), ("\u{5343}\u{5c0b}", "\u{5343}\u{6075}")] {
         let mut m = Match::new(1, 4, FLAG_OFFLINE, 7);
         let mut add = |s: &str| {
             let id = m.add_human(s.as_bytes()).unwrap();

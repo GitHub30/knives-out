@@ -220,8 +220,17 @@ fn indoor_case(m: &Match, dist: f32) -> Option<(u16, V3, V3)> {
     None
 }
 
+/// A viewer's snapshot, with item ids mapped back from the wire (a secret
+/// permutation) to the match's own.
 fn snap(m: &mut Match, pid: u8) -> Snap {
-    let s = parse(&m.snapshot(pid).to_vec());
+    let mut s = parse(&m.snapshot(pid).to_vec());
+    for e in s.events.iter_mut() {
+        match e {
+            Ev::Item { id, .. } | Ev::Idel { id } => *id = m.item_from_wire(*id),
+            Ev::Chunk { ids, .. } => ids.iter_mut().for_each(|id| *id = m.item_from_wire(*id)),
+            _ => {}
+        }
+    }
     s
 }
 
@@ -1124,4 +1133,104 @@ fn own_item_changes_do_not_redraw_the_quiet_period() {
         cases += 1;
     }
     assert!(cases >= 3, "only {cases} cases");
+}
+
+// ---------------------------------------------------------------------------
+// Fifth adversarial review
+
+/// Bot matches seen by a stationary viewer: a hidden shooter's exact wall
+/// hits are only ever ones far from its cell that the viewer can see (an
+/// impact out of sight, intersected with the map's lines of sight, narrows
+/// the shooter down inside its cell).
+#[test]
+fn hidden_shooters_unseen_impacts_are_coarse() {
+    let (mut anon, mut exact) = (0, 0);
+    for seed in [5u32, 42] {
+        let mut m = Match::new(seed, 30, FLAG_OFFLINE, 0xA11CE + seed as u64);
+        let v = m.add_human(b"V").unwrap();
+        let _ = m.welcome(v);
+        m.step();
+        let spot = {
+            let (x, z) = (MAP * 0.5, MAP * 0.5);
+            V3::new(x, m.w.ground_below(x, z, 300.0, P_RADIUS), z)
+        };
+        for _ in 0..(30 * 200) {
+            {
+                let p = &mut m.players[v as usize];
+                p.ms = MoveState { pos: spot, mode: MODE_GROUND, on_ground: true, ..Default::default() };
+                p.health = 100.0;
+            }
+            m.step();
+            if m.phase != PH_PLAY {
+                break;
+            }
+            let s = snap(&mut m, v);
+            m.flush();
+            let eye = spot + V3::new(0.0, eye_h(false), 0.0);
+            for e in &s.events {
+                if let Ev::Shot { shooter: 255, from, end, kind, .. } = e {
+                    anon += 1;
+                    if *kind != 3 {
+                        continue;
+                    }
+                    exact += 1;
+                    let g = [8.0f32, 16.0, 32.0].into_iter().find(|&g| ((from.x / g) - 0.5).fract().abs() < 1e-4 && ((from.z / g) - 0.5).fract().abs() < 1e-4).unwrap_or(8.0);
+                    assert!((*end - *from).len() >= g + 8.0, "seed {seed}: an exact wall hit {:.2} m from the cell centre", (*end - *from).len());
+                    let dv = *end - eye;
+                    let l = dv.len();
+                    assert!(l <= 0.5 || m.w.raycast(eye, dv * (1.0 / l), (l - 0.3).max(0.0)).is_none(), "seed {seed}: an exact wall hit the viewer cannot see, {l:.1} m away");
+                }
+            }
+        }
+    }
+    eprintln!("{anon} anonymised shots heard, {exact} exact (visible, far) wall hits");
+    assert!(anon > 50, "only {anon} anonymised shots heard");
+}
+
+/// Item ids are handed out in creation order inside the match. On the wire
+/// they are permuted with a secret, so the ids of a viewer's own drops (and
+/// of the items a resync brings) do not count the items created meanwhile.
+#[test]
+fn item_ids_on_the_wire_do_not_count_creations() {
+    let (mut m, ids) = setup(42, 2);
+    let v = ids[0];
+    for k in 0..4096u16 {
+        assert_eq!(m.item_from_wire(m.item_wire_id(k)), k);
+    }
+    let spot = {
+        let (x, z) = (MAP * 0.5, MAP * 0.5);
+        V3::new(x, m.w.ground_below(x, z, 300.0, P_RADIUS), z)
+    };
+    place(&mut m, v, spot);
+    {
+        let p = &mut m.players[v as usize];
+        p.slots = [(W_PISTOL, 10), (W_SMG, 10)];
+        p.cur = 0;
+    }
+    let gun = m.items.iter().position(|it| it.alive && it.kind == W_AR).unwrap();
+    m.items[gun].pos = spot + V3::new(0.4, 0.05, 0.0);
+    let mut seq = m.players[v as usize].last_seq;
+    let mut wire: Vec<u16> = vec![];
+    for k in 0..400u32 {
+        m.players[v as usize].ms.pos = spot;
+        seq += 1;
+        m.on_message(v, &cmd_bytes(&[(seq, m.tick * 256, 0, 0, 0, 0, if k % 10 == 0 { B_PICKUP } else { 0 })]));
+        m.step();
+        // the raw wire ids, as a client sees them
+        let s = parse(&m.snapshot(v).to_vec());
+        m.flush();
+        for e in &s.events {
+            if let Ev::Item { id, .. } = e {
+                if !wire.contains(id) {
+                    wire.push(*id);
+                }
+            }
+        }
+    }
+    assert!(wire.len() >= 30, "only {} new items seen", wire.len());
+    let internal: Vec<u16> = wire.iter().map(|&w| m.item_from_wire(w)).collect();
+    assert!(internal.windows(2).all(|p| p[1] > p[0]), "the match's own ids are not in creation order");
+    let up = wire.windows(2).filter(|p| p[1] > p[0]).count() as f32 / (wire.len() - 1) as f32;
+    eprintln!("{} drops, wire ids ascending between consecutive drops {:.0}% of the time", wire.len(), up * 100.0);
+    assert!((0.2..=0.8).contains(&up), "wire ids follow the creation order ({:.0}% ascending)", up * 100.0);
 }

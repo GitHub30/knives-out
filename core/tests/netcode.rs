@@ -701,3 +701,92 @@ fn uplink_stalls_do_not_snap_the_prediction() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fifth adversarial review
+
+/// A server hitch: the Room loop runs the missed ticks late, up to 5 per
+/// callback. The commands simulated in those catch-up steps carry views made
+/// in real time, so they look less rewound than they are; they must not pull
+/// an honest high-latency player's rewind floor down.
+#[test]
+fn server_hitch_catch_up_keeps_rewind() {
+    for hitch in [5u32, 10, 12, 15, 18] {
+        let (mut m, a, _) = two_humans(42);
+        let start = open_run(&m);
+        place(&mut m, a, start);
+        let mut w = m.tick; // wall-clock tick
+        let mut seq = m.players[a as usize].last_seq;
+        let (mut out, mut held): (Vec<Q>, Vec<Vec<u8>>) = (vec![], vec![]);
+        let h0 = w + 120;
+        let (mut rmin, mut fmin) = (f32::MAX, f32::MAX);
+        let mut applied = m.players[a as usize].cmds_applied;
+        for _ in 0..400 {
+            w += 1;
+            seq += 1;
+            // the client renders 9 ticks behind real time
+            out.push((seq, w.saturating_sub(9) * 256, 0, 0, 0, 0, 0));
+            if out.len() == 2 {
+                held.push(cmd_bytes(&out));
+                out.clear();
+            }
+            if w >= h0 && w < h0 + hitch {
+                continue; // the server stands still
+            }
+            for msg in held.drain(..) {
+                m.on_message(a, &msg);
+            }
+            let mut steps = 0;
+            while m.tick < w && steps < 5 {
+                m.catch_up = w - m.tick > 1;
+                m.step();
+                steps += 1;
+                let p = &m.players[a as usize];
+                if p.cmds_applied != applied {
+                    applied = p.cmds_applied;
+                    if w >= h0 {
+                        rmin = rmin.min(m.tick as f32 - p.last_cmd.view as f32 / 256.0);
+                        fmin = fmin.min(p.rew_floor);
+                    }
+                }
+            }
+        }
+        m.catch_up = false;
+        eprintln!("{} ms hitch: min applied rewind {rmin:.2}, min floor {fmin:.2}", hitch * 100 / 3);
+        assert!(rmin >= 8.5 && fmin >= 8.5, "{} ms hitch: rewind cut to {rmin:.2} ticks (floor {fmin:.2})", hitch * 100 / 3);
+    }
+}
+
+/// The floor falls at most one tick per command: a client that keeps a high
+/// floor cannot take a 15-tick shot and a 1-tick shot back to back (a target
+/// behind cover and a fresh peeker), and an honest latency drop still
+/// converges within a few hundred milliseconds.
+#[test]
+fn rewind_cannot_drop_from_floor_to_one_tick() {
+    let (mut m, a, _) = two_humans(42);
+    let start = open_run(&m);
+    place(&mut m, a, start);
+    for _ in 0..20 {
+        m.step();
+    }
+    let mut seq = m.players[a as usize].last_seq;
+    let mut claim = |m: &mut Match, ticks: u32| -> f32 {
+        seq += 1;
+        let v = (m.tick + 1 - ticks) * 256;
+        m.on_message(a, &cmd_bytes(&[(seq, v, 0, 0, 0, 0, 0)]));
+        m.step();
+        m.tick as f32 - m.players[a as usize].last_cmd.view as f32 / 256.0
+    };
+    for _ in 0..40 {
+        claim(&mut m, 15);
+    }
+    assert!((claim(&mut m, 15) - 15.0).abs() < 0.01);
+    let r = claim(&mut m, 1);
+    assert!(r >= 13.9, "a 1-tick claim right after 15-tick ones was applied at {r:.2} ticks");
+    // an honest latency drop from 15 to 3 ticks converges in 12 commands
+    let mut last = 0.0;
+    for _ in 0..12 {
+        last = claim(&mut m, 3);
+    }
+    assert!((last - 3.0).abs() < 0.01, "still rewound {last:.2} ticks after the drop");
+}

@@ -142,7 +142,8 @@ export class Game {
   private pingSent = 0;
   private rtt = 0;
   /** Recent ping samples: a ping that waited out an uplink stall inflates the
-   * smoothed rtt, so the path's rtt is the smallest of them. */
+   * smoothed rtt, so the path's rtt is their median (one stalled sample is
+   * ignored, and a real change of route is taken within two pings). */
   private rttSamples: number[] = [];
   private fps = 60;
   private lastHealth = 100;
@@ -229,7 +230,7 @@ export class Game {
       const sample = (now - sent) >>> 0;
       this.rtt = lerp(this.rtt || sample, sample, 0.3);
       this.rttSamples.push(sample);
-      if (this.rttSamples.length > 5) this.rttSamples.shift();
+      if (this.rttSamples.length > 3) this.rttSamples.shift();
     } else if (type === P.S_ERROR) {
       const code = new Uint8Array(buf)[1];
       const msg =
@@ -558,7 +559,8 @@ export class Game {
     // the oldest when they arrive, so they must not be replayed. Only commands old
     // enough to be late count: a client that skipped time (frame hitch, hidden tab)
     // has a debt on the server but no late commands.
-    const pathRtt = this.rttSamples.length ? Math.min(...this.rttSamples) : this.rtt;
+    const sorted = [...this.rttSamples].sort((x, y) => x - y);
+    const pathRtt = sorted.length ? sorted[(sorted.length - 1) >> 1] : this.rtt;
     const late = performance.now() - (pathRtt + 100);
     let skip = 0;
     while (skip < me.debt && skip < this.pending.length && this.pending[skip].at < late) skip++;

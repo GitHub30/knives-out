@@ -87,6 +87,27 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Item ids on the wire: a secret permutation of the internal ones (a
+/// four-round Feistel network on 16 bits keyed by the match salt). Internal
+/// ids count up as items are created, so ids a viewer is sent (its own
+/// drops, a chunk resync) would otherwise date the changes it is not sent.
+fn item_wire(salt: u64, k: u16) -> u16 {
+    let (mut l, mut r) = ((k >> 8) as u8, k as u8);
+    for i in 0..4u64 {
+        let f = mix64(salt ^ 0x17E4_1D00 ^ (i << 8) ^ r as u64) as u8;
+        (l, r) = (r, l ^ f);
+    }
+    ((l as u16) << 8) | r as u16
+}
+fn item_unwire(salt: u64, w: u16) -> u16 {
+    let (mut l, mut r) = ((w >> 8) as u8, w as u8);
+    for i in (0..4u64).rev() {
+        let f = mix64(salt ^ 0x17E4_1D00 ^ (i << 8) ^ l as u64) as u8;
+        (l, r) = (r ^ f, l);
+    }
+    ((l as u16) << 8) | r as u16
+}
+
 /// Centre of the `g`-sized world-aligned cell holding `v`.
 #[inline]
 fn cell_c(v: f32, g: f32) -> f32 {
@@ -129,6 +150,10 @@ pub struct HistE {
     pub pitch: f32,
     pub sprint: bool,
     pub mode: u8,
+    /// The held weapon and the snapshot flags that move the drawn arms:
+    /// bit 0 ADS, 1 firing, 2 healing, 3 reloading, 4 vest.
+    pub weapon: u8,
+    pub gear: u8,
 }
 
 impl HistE {
@@ -141,7 +166,13 @@ impl HistE {
             pitch: p.pitch,
             sprint: p.draw_speed > SPRINT_DRAW_SPEED,
             mode: p.ms.mode,
+            weapon: p.weapon(),
+            gear: (p.ads as u8) | (((p.firing_t > 0.0) as u8) << 1) | (((p.heal_t > 0.0) as u8) << 2) | (((p.reload_t > 0.0) as u8) << 3) | (((p.vest > 0) as u8) << 4),
         }
+    }
+    fn gear(&self) -> Gear {
+        let g = self.gear;
+        Gear { weapon: self.weapon, ads: g & 1 != 0, firing: g & 2 != 0, healing: g & 4 != 0, reloading: g & 8 != 0, vest: g & 16 != 0 }
     }
 }
 
@@ -263,6 +294,9 @@ pub struct Player {
     /// Last tick each other player was visible to this viewer / was checked.
     pub seen_tick: [u32; MAX_PLAYERS],
     pub vis_check: [u32; MAX_PLAYERS],
+    /// Per other player: the snapshot tick since which this viewer has been
+    /// sent it without a gap (0 = not in the last snapshot).
+    pub sent_from: [u32; MAX_PLAYERS],
 }
 
 impl Player {
@@ -388,6 +422,10 @@ pub struct Match {
     pub flags: u32,
     pub slots: usize,
     pub snap_every: u32,
+    /// The host is running this step late, catching up on ticks it fell
+    /// behind (a hitch): commands carry views made in real time, ahead of
+    /// the simulation, so they say nothing about the clients' latency.
+    pub catch_up: bool,
     pub players: Vec<Player>,
     pub items: Vec<Item>,
     free_items: Vec<u16>,
@@ -445,6 +483,7 @@ impl Match {
             flags,
             slots,
             snap_every: if flags & FLAG_OFFLINE != 0 { 1 } else { 2 },
+            catch_up: false,
             players: vec![Player::default(); MAX_PLAYERS],
             items: Vec::new(),
             free_items: Vec::new(),
@@ -1021,7 +1060,8 @@ impl Match {
     // ------------------------------------------------------------------
     // Combat
     // ------------------------------------------------------------------
-    fn rewound(&self, j: usize, view: u32) -> Option<HistE> {
+    /// Player `j` as viewer `i`'s client drew it at `view`.
+    fn rewound(&self, i: usize, j: usize, view: u32) -> Option<HistE> {
         let now = self.tick as f32;
         // Clients render ~4.5 ticks behind + latency + command queueing;
         // 15 ticks (500 ms) covers RTTs up to ~250 ms. Commands run before
@@ -1048,12 +1088,32 @@ impl Match {
         let sa = ((t0u / se) * se).min(latest);
         let sb = (sa + se).min(latest);
         let (pa, pb) = (self.hist[sa as usize % HIST][j], self.hist[sb as usize % HIST][j]);
-        let f = if sb > sa { clampf((vt - sa as f32) / (sb - sa) as f32, 0.0, 1.0) } else { 0.0 };
+        let mut f = if sb > sa { clampf((vt - sa as f32) / (sb - sa) as f32, 0.0, 1.0) } else { 0.0 };
+        // A player missing from the older snapshot (it just came into view)
+        // is drawn at the newer one, without interpolation.
+        let from = self.players[i].sent_from[j];
+        if from > sa && from <= sb {
+            f = 1.0;
+        }
+        // Yaw and pitch exactly as the client computes them: from the
+        // snapshot's quantised values, in f64 (src/protocol.ts, lerpAngle in
+        // src/render/math.ts). A half turn between snapshots is a tie that
+        // f32 and f64 rounding would break in opposite directions.
+        let tau = std::f64::consts::PI * 2.0;
+        let (ya, yb) = (q_yaw(pa.yaw) as f64 * tau / 65536.0, q_yaw(pb.yaw) as f64 * tau / 65536.0);
+        let mut dy = (yb - ya) % tau;
+        if dy > std::f64::consts::PI {
+            dy -= tau;
+        } else if dy <= -std::f64::consts::PI {
+            dy += tau;
+        }
+        let (qa, qb) = (q_pitch(pa.pitch) as f64 * 1.5 / 32767.0, q_pitch(pb.pitch) as f64 * 1.5 / 32767.0);
+        let f64f = f as f64;
         Some(HistE {
             pos: pa.pos.lerp(pb.pos, f),
             alive: true,
-            yaw: pa.yaw + wrap_angle(pb.yaw - pa.yaw) * f,
-            pitch: pa.pitch + (pb.pitch - pa.pitch) * f,
+            yaw: (ya + dy * f64f) as f32,
+            pitch: (qa + (qb - qa) * f64f) as f32,
             ..pb
         })
     }
@@ -1071,7 +1131,7 @@ impl Match {
                 continue;
             }
             let h = if self.players[shooter].bot { HistE::of(q) } else {
-                match self.rewound(j, view) {
+                match self.rewound(shooter, j, view) {
                     Some(h) => h,
                     None => continue,
                 }
@@ -1089,26 +1149,23 @@ impl Match {
             }
             // head sphere on the rendered head; the body capsule reaches the
             // shoulders. A ray that reaches both is a body hit only if it
-            // enters the capsule below the neck (along the body axis, which
-            // is tilted in free fall) and either at the legs or through the
-            // drawn torso before the head: the capsule is fatter than the
-            // torso, and a ray rising past the chest to the chin is drawn
-            // hitting the head.
+            // enters the capsule at the legs (below the hip along the body
+            // axis, which is tilted in free fall) or passes a drawn part of
+            // the upper body (torso, arms, weapon, medkit) before the head:
+            // the capsule is fatter than the drawn body, and a ray that rises
+            // past the chest to the chin is drawn hitting the head.
             let pose = body_pose(p, h.yaw, h.pitch, h.crouch, h.sprint, h.mode);
             let head_c = pose.head;
             let th = ray_sphere(o, d, head_c, 0.2, lim);
             let upright = h.mode != MODE_FALL;
             let tb = if upright { ray_capsule(o, d, p.x, p.z, pose.a.y, pose.b.y, 0.33, lim) } else { ray_capsule_seg(o, d, pose.a, pose.b, 0.33, lim) };
-            let body_first = |tb: f32, th: f32| {
+            let legs = |tb: f32| {
                 let ax = (pose.b - pose.a).norm();
-                let along = |q: V3| (q - pose.a).dot(ax);
-                let e = along(o + d * tb);
-                // between the rendered torso top and head bottom
-                let neck = along(head_c) - 0.15;
-                e < neck && (e < along(pose.hip) || pose.ray_torso(o, d, th).is_some())
+                (o + d * tb - pose.a).dot(ax) < (pose.hip - pose.a).dot(ax)
             };
             let hit = match (th, tb) {
-                (Some(th), Some(tb)) if tb < th && body_first(tb, th) => Some((tb, false)),
+                (Some(th), Some(tb)) if tb < th && legs(tb) => Some((tb, false)),
+                (Some(th), tb) if pose.ray_upper(o, d, th, h.gear()) => Some((tb.map_or(th, |tb| tb.min(th)), false)),
                 (Some(th), _) => Some((th, true)),
                 (None, Some(tb)) => Some((tb, false)),
                 (None, None) => None,
@@ -1875,22 +1932,24 @@ impl Match {
                 p.lag -= 1;
                 c.buttons = Self::with_carry(c.buttons, p.carry);
                 p.carry = 0;
-                // The view tick (lag compensation) is client-claimed: allow at
-                // most REWIND_MARGIN ticks above this player's recent minimum,
-                // so a low-latency client cannot rewind selectively.
+                // The view tick (lag compensation) is client-claimed. The
+                // applied rewind always lies within [floor, floor + 4], where
+                // the floor follows the client's lowest recent claim: down at
+                // most one tick per command, up 0.08. So a low-latency client
+                // cannot rewind one shot much further than the others, nor a
+                // high-latency one a shot much less (15 ticks, then 1).
                 let raw = now - c.view as f32 / 256.0;
-                let r = if raw >= 1.0 {
-                    let r = clampf(raw, 1.0, REWIND_MAX);
-                    p.rew_floor = if r < p.rew_floor { r } else { (p.rew_floor + 0.08).min(r) };
-                    r.min(p.rew_floor + REWIND_MARGIN)
+                let fl = p.rew_floor;
+                let r = if raw < 1.0 || self.catch_up {
+                    // A view at or ahead of the server tick (a forged view), or
+                    // one made in real time while the server catches up on a
+                    // hitch, says nothing about this client's latency: keep
+                    // the floor, and never rewind less than it.
+                    clampf(raw, fl.max(1.0), (fl + REWIND_MARGIN).min(REWIND_MAX))
                 } else {
-                    // A view at or ahead of the server tick (catch-up ticks
-                    // after a server hitch, or a forged view) says nothing
-                    // about this client's latency: simulate it at the floor.
-                    // It must neither pull the floor down nor rewind less than
-                    // it, or a client could keep a high floor for the shots it
-                    // chooses while its other shots are not rewound at all.
-                    clampf(p.rew_floor, 1.0, REWIND_MAX)
+                    let r = clampf(raw, 1.0, REWIND_MAX);
+                    p.rew_floor = if r < fl { (fl - 1.0).max(r) } else { (fl + 0.08).min(r) };
+                    clampf(r, p.rew_floor, (p.rew_floor + REWIND_MARGIN).min(REWIND_MAX))
                 };
                 c.view = ((now - r) * 256.0).max(0.0) as u32;
                 p.acked_seq = c.seq;
@@ -2091,7 +2150,7 @@ impl Match {
         w.u16(alive.len() as u16);
         for &k in &alive {
             let it = &self.items[k];
-            w.u16(k as u16);
+            w.u16(item_wire(self.salt, k as u16));
             w.u8(it.kind);
             w.u16(it.amount);
             w.f32(it.pos.x);
@@ -2110,6 +2169,14 @@ impl Match {
         &self.out
     }
 
+    /// The id an item is sent with (see `item_wire`), and back.
+    pub fn item_wire_id(&self, k: u16) -> u16 {
+        item_wire(self.salt, k)
+    }
+    pub fn item_from_wire(&self, w: u16) -> u16 {
+        item_unwire(self.salt, w)
+    }
+
     /// Quiet period before a chunk with withheld changes is resynced to
     /// viewer `i`: 10-15 s, secret per viewer, chunk and change (its chunk
     /// version), so the resync's arrival does not date the hidden change.
@@ -2125,6 +2192,7 @@ impl Match {
             return &self.out;
         }
         let me = self.players[i].clone();
+        let salt = self.salt;
         // interest center: me, or who I spectate
         let mut center = me.ms.pos;
         if !me.alive && (me.spect as usize) < MAX_PLAYERS && self.players[me.spect as usize].used {
@@ -2256,6 +2324,12 @@ impl Match {
             let seen = self.players[i].seen_tick[j];
             send[j] = seen != 0 && tick.wrapping_sub(seen) <= 30;
         }
+        {
+            let pv = &mut self.players[i];
+            for j in 0..MAX_PLAYERS {
+                pv.sent_from[j] = if !send[j] { 0 } else if pv.sent_from[j] == 0 { tick.max(1) } else { pv.sent_from[j] };
+            }
+        }
         let mut w = Wr::new(&mut self.out);
         let count_pos = w.len();
         w.u8(0);
@@ -2360,13 +2434,21 @@ impl Match {
                     // A miss ends exactly `range` from the aim origin, and a
                     // wall hit near the cell is the cover the shooter stands
                     // at (or where the eye-obstruction rule stopped the
-                    // shot): either would locate the shooter. Send only a
-                    // coarse direction, drawn from the coarse origin. Whether
-                    // a wall hit counts as near depends on public values only
-                    // (the end it would carry vs the cell centre), so the
-                    // choice itself tells nothing.
-                    let near_wall = b[27] == 3 && (get_v3(&b, 15) - from).len() < g + 8.0;
-                    if b[27] == 0 || near_wall {
+                    // shot): either would locate the shooter. So would a wall
+                    // hit the viewer cannot see, intersected with the map's
+                    // lines of sight (the shooter's eye sees every impact).
+                    // Send only a coarse direction, drawn from the coarse
+                    // origin. The choice depends on values the viewer would
+                    // be sent (the end, the cell centre) and its own eye, so
+                    // it tells nothing about the shooter.
+                    let endp = get_v3(&b, 15);
+                    let near_wall = b[27] == 3 && (endp - from).len() < g + 8.0;
+                    let unseen = b[27] == 3 && {
+                        let dv = endp - ceye;
+                        let l = dv.len();
+                        l > 0.5 && self.w.raycast(ceye, dv * (1.0 / l), (l - 0.3).max(0.0)).is_some()
+                    };
+                    if b[27] == 0 || near_wall || unseen {
                         let dir = if e.dir.len() > 0.5 { e.dir } else { (get_v3(&b, 15) - m).norm() };
                         let q = |v: f32| (v * 16.0).round() / 16.0;
                         let dq = V3::new(q(dir.x), q(dir.y), q(dir.z)).norm();
@@ -2448,7 +2530,7 @@ impl Match {
                 let mut w = Wr::new(&mut self.out);
                 if e.it.alive {
                     w.u8(E_ITEM);
-                    w.u16(e.id);
+                    w.u16(item_wire(salt, e.id));
                     w.u8(e.it.kind);
                     w.u16(e.it.amount);
                     w.f32(e.it.pos.x);
@@ -2456,7 +2538,7 @@ impl Match {
                     w.f32(e.it.pos.z);
                 } else {
                     w.u8(E_IDEL);
-                    w.u16(e.id);
+                    w.u16(item_wire(salt, e.id));
                 }
                 ecount += 1;
             }
@@ -2510,7 +2592,7 @@ impl Match {
                 w.u16(ids.len() as u16);
                 for &k in &ids {
                     let it = &self.items[k];
-                    w.u16(k as u16);
+                    w.u16(item_wire(salt, k as u16));
                     w.u8(it.kind);
                     w.u16(it.amount);
                     w.f32(it.pos.x);
