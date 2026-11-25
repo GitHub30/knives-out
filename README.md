@@ -32,7 +32,8 @@ three.js などのエンジンは使わず、**Rust → WebAssembly** のシミ�
 
 ### 3D モデル
 - 町に停まっているパトカー: [`police_crown_osaka_game.glb`](https://github.com/GitHub30/gpt62-astra-vs-fable52/blob/main/police_crown_3d_fable52/export/game/police_crown_osaka_game.glb)（`src/assets/` に収録。Web 配信用にテクスチャを 1024 px の JPEG に縮小: `python3 scripts/optimize-glb.py 元.glb 出力.glb 1024`）。車には当たり判定があり、遮蔽物として使えます。
-- キャラクター・銃・木・岩・建物は手続き生成（滑らかなカプセル・楕円体・面取りボックス）。キャラクターの各パーツの位置と大きさはサーバーの当たり判定と共通です。
+- キャラクター: **Unitree G1**（[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/main/unitree_g1) 収録の公式メッシュ、BSD-3-Clause, © Unitree Robotics）。`scripts/build-g1.py` がリンクを胴体・頭・上腕・前腕・腿・脛の 10 部位にまとめ、身長を 1.4 倍（1.32 m → 1.85 m）にして約 1 万ポリゴンに削減し、`src/assets/unitree_g1.bin` を出力します。各部位はサーバーの当たり判定と同じ関節に取り付けています（判定の形は従来のまま）。
+- 銃・木・岩・建物は手続き生成（滑らかなカプセル・楕円体・面取りボックス）。
 
 ## アーキテクチャ
 

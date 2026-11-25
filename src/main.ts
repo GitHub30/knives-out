@@ -2,6 +2,8 @@ import './style.css';
 import { Core, coreModule } from './core';
 import { Renderer, QUALITY_PRESETS, type Quality } from './render/renderer';
 import carModelUrl from './assets/police_crown_osaka_game.glb?url';
+import g1Url from './assets/unitree_g1.bin?url';
+import { setG1Shapes } from './render/models';
 import { add, dirFrom, invert, lookAt, mul, perspectiveRZ, type V3 } from './render/math';
 import { Instances } from './render/instances';
 import { emitPlane } from './render/models';
@@ -361,6 +363,23 @@ async function boot() {
   }
   try {
     renderer = await Renderer.create(canvas, pickQuality(settings), new URLSearchParams(location.search).has('offscreen'));
+    // characters are drawn as Unitree G1 robots once the parts have loaded
+    fetch(new URL(g1Url, document.baseURI).href)
+      .then((r) => r.arrayBuffer())
+      .then((buf) => {
+        const dv = new DataView(buf);
+        if (dv.getUint32(0, true) !== 0x31503147) throw new Error('bad G1 parts file');
+        const n = dv.getUint32(4, true);
+        let off = 8 + n * 4;
+        const meshes: Float32Array[] = [];
+        for (let k = 0; k < n; k++) {
+          const verts = dv.getUint32(8 + k * 4, true);
+          meshes.push(new Float32Array(buf.slice(off, off + verts * 24)));
+          off += verts * 24;
+        }
+        setG1Shapes(renderer.addShapes(meshes));
+      })
+      .catch((e) => console.warn('G1 model:', e));
     // the parked cars appear once their model has loaded
     renderer.loadCarModel(new URL(carModelUrl, document.baseURI).href).catch((e) => console.warn('car model:', e));
   } catch (e) {

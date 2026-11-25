@@ -90,6 +90,27 @@ export interface CharState {
   t: number;
 }
 
+// ---- Unitree G1 body parts (see scripts/build-g1.py): shape ids of the dark
+// and light mesh of each segment, in the builder's order.
+let G1 = -1;
+const G1_TORSO = 0, G1_HEAD = 1, G1_ARM = 2, G1_FORE = 4, G1_THIGH = 6, G1_SHIN = 8;
+const G1_DARK = rgba(0x25272b), G1_LIGHT = 0xb4b9bf;
+const G1_SURF = surf(0.42, 0.45), G1_SURF_DARK = surf(0.5, 0.2);
+const ONE: V3 = [1, 1, 1];
+/** The first shape id of the G1 parts once the renderer has them (-1: use the simple figure). */
+export function setG1Shapes(first: number) {
+  G1 = first;
+}
+/** Blend a colour toward the robot's light grey (painted panels keep the player's colour readable). */
+function tint(hex: number, k: number): number {
+  const m = (a: number, b: number) => Math.round(a + (b - a) * k);
+  return rgba((m((G1_LIGHT >> 16) & 255, (hex >> 16) & 255) << 16) | (m((G1_LIGHT >> 8) & 255, (hex >> 8) & 255) << 8) | m(G1_LIGHT & 255, hex & 255));
+}
+function g1part(I: Instances, t: T, seg: number, light: number) {
+  I.push(t.p, t.q, ONE, G1_DARK, G1 + seg * 2, G1_SURF_DARK);
+  I.push(t.p, t.q, ONE, light, G1 + seg * 2 + 1, G1_SURF);
+}
+
 export function emitGun(I: Instances, t: T, wk: number, s = 1) {
   for (const [cx, cy, cz, sx, sy, sz, col] of GUNS[wk] ?? []) {
     // long thin parts along the bore are barrels
@@ -135,28 +156,39 @@ export function emitCharacter(I: Instances, c: CharState) {
 
   const hips = child(T0, [0, hipH, 0], qIdent());
   const torso = child(hips, [0, 0.02, 0], qX(lean));
-  box(I, torso, [0, 0.3, 0], [0.46, 0.56, 0.26], shirt);
-  // collar and belt (inside the torso volume)
-  box(I, torso, [0, 0.03, 0], [0.47, 0.07, 0.27], rgba(0x2a2622), SHAPE_BOX, GEAR);
+  const g1 = G1 >= 0;
+  const panel = tint(SHIRTS[c.color % SHIRTS.length], 0.75);
+  const silver = rgba(G1_LIGHT);
+  if (g1) {
+    g1part(I, torso, G1_TORSO, panel);
+  } else {
+    box(I, torso, [0, 0.3, 0], [0.46, 0.56, 0.26], shirt);
+    // collar and belt (inside the torso volume)
+    box(I, torso, [0, 0.03, 0], [0.47, 0.07, 0.27], rgba(0x2a2622), SHAPE_BOX, GEAR);
+  }
   if (c.vest > 0) {
     const vc = c.vest === 3 ? rgba(0x3d3550) : c.vest === 2 ? rgba(0x2f4a5f) : rgba(0x6b6650);
     box(I, torso, [0, 0.27, 0], [0.5, 0.42, 0.31], vc, SHAPE_BOX, GEAR);
     box(I, torso, [0, 0.33, 0.14], [0.3, 0.2, 0.03], rgba(0x1c1f22), SHAPE_BOX, GEAR);
   }
-  box(I, torso, [0, 0.32, -0.2], [0.34, 0.42, 0.14], rgba(0x4d4a3a), SHAPE_BOX, GEAR);
+  box(I, torso, [0, 0.32, g1 ? -0.17 : -0.2], [0.34, 0.42, g1 ? 0.2 : 0.14], rgba(0x4d4a3a), SHAPE_BOX, GEAR);
   // head
   const headPitch = dead ? 0 : -pitch * 0.55 - lean * 0.6;
   const head = child(torso, [0, 0.6, 0], qX(headPitch));
-  box(I, head, [0, 0.14, 0.01], [0.25, 0.27, 0.27], skin, SHAPE_SPHERE, SKINM);
-  // neck
-  box(I, head, [0, -0.01, 0], [0.12, 0.1, 0.12], skin, SHAPE_PILL, SKINM);
-  box(I, head, [0.065, 0.16, 0.125], [0.045, 0.03, 0.02], rgba(0x111111), SHAPE_SPHERE, surf(0.2, 0));
-  box(I, head, [-0.065, 0.16, 0.125], [0.045, 0.03, 0.02], rgba(0x111111), SHAPE_SPHERE, surf(0.2, 0));
+  if (g1) {
+    g1part(I, head, G1_HEAD, silver);
+  } else {
+    box(I, head, [0, 0.14, 0.01], [0.25, 0.27, 0.27], skin, SHAPE_SPHERE, SKINM);
+    // neck
+    box(I, head, [0, -0.01, 0], [0.12, 0.1, 0.12], skin, SHAPE_PILL, SKINM);
+    box(I, head, [0.065, 0.16, 0.125], [0.045, 0.03, 0.02], rgba(0x111111), SHAPE_SPHERE, surf(0.2, 0));
+    box(I, head, [-0.065, 0.16, 0.125], [0.045, 0.03, 0.02], rgba(0x111111), SHAPE_SPHERE, surf(0.2, 0));
+  }
   if (c.helm > 0) {
     const hc = c.helm === 3 ? rgba(0x2b2f2a) : c.helm === 2 ? rgba(0x45503a) : rgba(0x6a6a5a);
     box(I, head, [0, 0.22, 0], [0.3, 0.19, 0.31], hc, SHAPE_SPHERE, surf(0.45, 0.25));
   } else {
-    box(I, head, [0, 0.235, -0.015], [0.26, 0.12, 0.27], rgba(0x2a1d14), SHAPE_SPHERE, surf(0.8, 0));
+    if (!g1) box(I, head, [0, 0.235, -0.015], [0.26, 0.12, 0.27], rgba(0x2a1d14), SHAPE_SPHERE, surf(0.8, 0));
   }
 
   // legs
@@ -181,8 +213,13 @@ export function emitCharacter(I: Instances, c: CharState) {
       knee = Math.max(0, -Math.cos(ph)) * amp * 1.4;
     }
     const L = child(hips, [0.12 * s, 0, 0], qX(thigh));
-    box(I, L, [0, -0.23, 0], [0.17, 0.5, 0.19], pants, SHAPE_PILL);
     const K = child(L, [0, -0.46, 0], qX(knee));
+    if (g1) {
+      g1part(I, L, G1_THIGH + (s > 0 ? 0 : 1), silver);
+      g1part(I, K, G1_SHIN + (s > 0 ? 0 : 1), silver);
+      continue;
+    }
+    box(I, L, [0, -0.23, 0], [0.17, 0.5, 0.19], pants, SHAPE_PILL);
     box(I, K, [0, -0.23, 0], [0.15, 0.5, 0.17], pants, SHAPE_PILL);
     // knee pad
     box(I, K, [0, -0.02, 0.06], [0.13, 0.12, 0.08], rgba(0x26282b), SHAPE_SPHERE, GEAR);
@@ -223,8 +260,13 @@ export function emitCharacter(I: Instances, c: CharState) {
       elbow = -0.35 - (moving ? 0.25 : 0);
     }
     const A = child(torso, [0.29 * s, 0.5, 0], q);
-    box(I, A, [0, -0.15, 0], [0.13, 0.36, 0.13], shirt, SHAPE_PILL);
     const E = child(A, [0, -0.3, 0], qX(elbow));
+    if (g1) {
+      g1part(I, A, G1_ARM + (s > 0 ? 0 : 1), panel);
+      g1part(I, E, G1_FORE + (s > 0 ? 0 : 1), silver);
+      continue;
+    }
+    box(I, A, [0, -0.15, 0], [0.13, 0.36, 0.13], shirt, SHAPE_PILL);
     box(I, E, [0, -0.14, 0], [0.11, 0.32, 0.11], shirt, SHAPE_PILL);
     box(I, E, [0, -0.31, 0], [0.1, 0.11, 0.1], skin, SHAPE_SPHERE, SKINM);
   }

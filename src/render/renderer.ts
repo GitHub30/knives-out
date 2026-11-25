@@ -4,7 +4,7 @@
 
 import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, type M4, type V3 } from './math';
-import { Instances, INSTANCE_STRIDE, SHAPE_COUNT } from './instances';
+import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
 import { loadGlb, type GltfModel } from './gltf';
 
@@ -565,6 +565,19 @@ export class Renderer {
     return { vb, ib, parts };
   }
 
+  /** Register extra instanced shapes (pos + normal, unindexed). Returns the first new shape id. */
+  addShapes(meshes: Float32Array[]): number {
+    const first = this.shapeVB.length;
+    if (first + meshes.length > MAX_SHAPES) throw new Error('too many shapes');
+    for (const m of meshes) {
+      const data = m.length ? m : new Float32Array(18);
+      const buf = this.device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      this.device.queue.writeBuffer(buf, 0, data);
+      this.shapeVB.push({ buf, count: m.length / 6 });
+    }
+    return first;
+  }
+
   /** Load the parked-car model (drawn at the world's car spots once it is ready). */
   async loadCarModel(url: string): Promise<void> {
     const m = await loadGlb(url);
@@ -662,7 +675,7 @@ export class Renderer {
   }
 
   private shapeBuffers(name: string, inst: Instances): (GPUBuffer | null)[] {
-    return inst.lists.map((l, k) => this.instBuffer(`${name}${k}`, l.buf, l.count * INSTANCE_STRIDE));
+    return inst.lists.map((l, k) => (k < this.shapeVB.length ? this.instBuffer(`${name}${k}`, l.buf, l.count * INSTANCE_STRIDE) : null));
   }
 
   private lightMatrix(center: V3, R: number): M4 {
@@ -774,9 +787,9 @@ export class Renderer {
         sp.setVertexBuffer(0, this.propVB);
         for (const c of this.pChunks) if (aabbVisible(lp, c.min, c.max)) sp.draw(c.count, 1, c.first);
         sp.setPipeline(this.pipes.boxShadow);
-        for (let s = 0; s < SHAPE_COUNT; s++) {
+        for (let s = 0; s < this.shapeVB.length; s++) {
           const b = boxBufs[s];
-          if (!b) continue;
+          if (!b || (s >= 4 && this.shapeVB[s].count === 0)) continue;
           // plain cubes are enough for box shadows
           const mesh = s === 0 ? { buf: this.cubeVB, count: 36 } : this.shapeVB[s];
           sp.setVertexBuffer(0, mesh.buf);
@@ -846,9 +859,9 @@ export class Renderer {
     }
     const drawShapes = (pipe: GPURenderPipeline, bufs: (GPUBuffer | null)[], inst: Instances, cubes = false) => {
       pass.setPipeline(pipe);
-      for (let s = 0; s < SHAPE_COUNT; s++) {
+      for (let s = 0; s < this.shapeVB.length; s++) {
         const b = bufs[s];
-        if (!b) continue;
+        if (!b || (s >= 4 && this.shapeVB[s].count === 0)) continue;
         const mesh = cubes ? { buf: this.cubeVB, count: 36 } : this.shapeVB[s];
         pass.setVertexBuffer(0, mesh.buf);
         pass.setVertexBuffer(1, b);

@@ -14,6 +14,8 @@ export const SHAPE_SPHERE = 1; // ellipsoid
 export const SHAPE_PILL = 2; // capsule along Y
 export const SHAPE_ROD = 3; // cylinder along Z
 export const SHAPE_COUNT = 4;
+/** Shapes registered at run time (model parts) follow the built-in ones. */
+export const MAX_SHAPES = 32;
 
 /** Pack 0xRRGGBB + alpha byte (lit factor / opacity) into little-endian RGBA. */
 export function rgba(hex: number, a = 255): number {
@@ -74,7 +76,7 @@ export class Instances {
   readonly lists: List[] = [];
 
   constructor(cap = 1024) {
-    for (let k = 0; k < SHAPE_COUNT; k++) this.lists.push(new List(k === 0 ? cap : 256));
+    for (let k = 0; k < MAX_SHAPES; k++) this.lists.push(new List(k === 0 ? cap : k < SHAPE_COUNT ? 256 : 32));
   }
 
   reset() {
