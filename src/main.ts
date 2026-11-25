@@ -176,6 +176,7 @@ async function loadBackdropWorld() {
     waterLevel: 0,
     cars: core.f32(8),
     carKinds: core.bytes(9),
+    grass: core.bytes(11),
   });
   core.freeMeshes();
 }

@@ -625,6 +625,138 @@ fn qrot(q: vec4f, v: vec3f) -> vec3f {
 }
 `;
 
+// ---------------------------------------------------------------- grass
+// Blades of grass around the camera, placed and shaped in the vertex shader:
+// no buffers. Instances index the cells of a grid snapped to the world, so a
+// blade is always the same blade wherever the camera is. Ranges of the
+// instance index select the ring:
+//   [0, 65536)        far ring (bigger, sparser blades), hollow in the middle
+//   [65536, 131072)   near ring (fine blades)
+//   [200000, 265536)  far ring without the hole (when the near ring is off)
+export const GRASS_FAR = 256;
+export const GRASS_NEAR = 256;
+export const GRASS_WGSL = /* wgsl */ `
+${COMMON}
+@group(1) @binding(0) var heightTex: texture_2d<f32>;
+@group(1) @binding(1) var maskTex: texture_2d<f32>;
+struct VOut {
+  @builtin(position) clip: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) n: vec3f,
+  @location(2) tv: vec3f,    // height along the blade, per-blade tint, dryness
+};
+// the terrain exactly as the simulation has it: 4 m cells split into two triangles
+fn groundH(p: vec2f) -> f32 {
+  let f = clamp(p / 4.0, vec2f(0.0), vec2f(255.999));
+  let i = vec2i(floor(f));
+  let t = f - floor(f);
+  let h00 = textureLoad(heightTex, i, 0).r;
+  let h10 = textureLoad(heightTex, i + vec2i(1, 0), 0).r;
+  let h01 = textureLoad(heightTex, i + vec2i(0, 1), 0).r;
+  let h11 = textureLoad(heightTex, i + vec2i(1, 1), 0).r;
+  if (t.x + t.y <= 1.0) { return h00 + (h10 - h00) * t.x + (h01 - h00) * t.y; }
+  return h11 + (h01 - h11) * (1.0 - t.x) + (h10 - h11) * (1.0 - t.y);
+}
+fn grassAt(p: vec2f) -> f32 {
+  let f = clamp(p - 0.5, vec2f(0.0), vec2f(1022.999));
+  let i = vec2i(floor(f));
+  let t = f - floor(f);
+  let a = mix(textureLoad(maskTex, i, 0).r, textureLoad(maskTex, i + vec2i(1, 0), 0).r, t.x);
+  let b = mix(textureLoad(maskTex, i + vec2i(0, 1), 0).r, textureLoad(maskTex, i + vec2i(1, 1), 0).r, t.x);
+  return mix(a, b, t.y);
+}
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+  var o: VOut;
+  o.clip = vec4f(2.0, 2.0, 2.0, 1.0);   // culled unless a blade grows here
+  // which ring
+  var k = ii;
+  var cell = 0.5;
+  var n = ${GRASS_FAR}u;
+  var hole = 17.5;
+  var hmul = 1.35;
+  var wmul = 2.6;
+  if (ii >= 200000u) { k = ii - 200000u; hole = 0.0; }
+  else if (ii >= 65536u) { k = ii - 65536u; cell = 0.14; n = ${GRASS_NEAR}u; hole = -1.0; hmul = 1.0; wmul = 1.7; }
+  let reach = f32(n) * cell * 0.5;
+  let c = floor(F.camPos.xz / cell) - f32(n / 2u) + vec2f(f32(k % n), f32(k / n));
+  let r1 = hash2(c + cell * 13.7);
+  let r2 = hash2(c.yx * 1.31 + 71.9);
+  let r3 = hash2(c + 191.3);
+  let r4 = hash2(c * 0.77 + 37.1);
+  let p = (c + vec2f(r1, r2)) * cell;
+  let dist = length(p - F.camPos.xz);
+  var fade = 1.0 - smoothstep(reach * 0.78, reach * 0.98, dist);
+  if (hole > 0.0) { fade *= smoothstep(hole * 0.82, hole, dist); }
+  if (hole < 0.0) { fade *= 1.0; }
+  let mask = grassAt(p);
+  // tufts and bare patches
+  let clump = vnoise(p * 0.45);
+  let patchy = vnoise(p * 0.11 + 40.0);
+  if (fade <= 0.01 || r3 > mask * (0.82 + 0.4 * patchy)) { return o; }
+  let hgt = (0.2 + 0.34 * r4) * (0.55 + 0.95 * clump) * hmul * fade * (0.5 + 0.5 * mask);
+
+  // the blade: three quads narrowing to a point
+  var idx = array<u32, 15>(0u, 1u, 2u, 1u, 3u, 2u, 2u, 3u, 4u, 3u, 5u, 4u, 4u, 5u, 6u);
+  let v = idx[vi];
+  let level = v / 2u;
+  let side = f32(v % 2u) * 2.0 - 1.0;
+  var ts = array<f32, 4>(0.0, 0.36, 0.7, 1.0);
+  var ws = array<f32, 4>(1.0, 0.82, 0.5, 0.0);
+  let t = ts[level];
+  let ang = r2 * 6.2831853 + r1 * 3.0;
+  let dir = vec2f(cos(ang), sin(ang));
+  let across = vec2f(-dir.y, dir.x);
+  let halfW = (0.011 + 0.008 * r3) * wmul * ws[level] * select(side, 0.0, level == 3u);
+  // it arcs over under its own weight, the taller the more
+  let droop = (0.18 + 0.5 * r1) * hgt;
+  var off = dir * droop * t * t + across * halfW;
+  var y = hgt * t * (1.0 - 0.22 * t * t);
+  // wind: slow gusts rolling across the field, a quick shiver on top
+  let tm = F.camPos.w;
+  let gust = vnoise(p * 0.07 + vec2f(tm * 0.35, tm * 0.21));
+  let sway = (sin(tm * 1.9 + p.x * 0.37 + p.y * 0.29) * 0.5 + sin(tm * 3.7 + p.x * 0.91 - p.y * 0.73 + r1 * 6.0) * 0.18) * (0.35 + 1.1 * gust);
+  off += vec2f(0.86, 0.5) * sway * hgt * 0.42 * t * t;
+  // pressed down around the player's feet
+  if (F.focus.w > 0.5) {
+    let d = p - F.focus.xz;
+    let l = length(d);
+    let near = 1.0 - smoothstep(0.25, 1.05, l);
+    if (near > 0.0 && abs(F.focus.y - groundH(p)) < 2.5) {
+      off += d / max(l, 0.05) * near * 0.4 * hgt * t;
+      y *= 1.0 - 0.55 * near;
+    }
+  }
+  let wp = vec3f(p.x + off.x, groundH(p) + y - 0.02, p.y + off.y);
+  o.wp = wp;
+  o.clip = F.viewProj * vec4f(wp, 1.0);
+  // rounded shading: mostly up, a little along the lean and across the width
+  o.n = normalize(vec3f(dir.x * 0.5 * t + across.x * side * 0.35, 1.0, dir.y * 0.5 * t + across.y * side * 0.35));
+  o.tv = vec3f(t, r4, smoothstep(0.55, 0.85, vnoise(p * 0.05 + 9.0)) * (0.4 + 0.6 * r1));
+  return o;
+}
+@fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  let t = i.tv.x;
+  // dark and damp at the root, brighter and yellower towards the tip
+  var albedo = mix(vec3f(0.03, 0.075, 0.015), vec3f(0.13, 0.27, 0.045), pow(t, 0.8));
+  albedo = mix(albedo, albedo * vec3f(1.3, 1.1, 0.65), i.tv.y * 0.5);
+  // dry straw-coloured stretches
+  albedo = mix(albedo, vec3f(0.36, 0.31, 0.12) * (0.35 + 0.75 * t), i.tv.z * 0.75);
+  // a pale midrib
+  var s: Surface;
+  s.albedo = albedo;
+  var n = normalize(i.n);
+  if (!front) { n = vec3f(-n.x, n.y, -n.z); }
+  s.n = n;
+  s.rough = 0.72;
+  s.metal = 0.0;
+  s.ao = mix(0.22, 1.0, smoothstep(0.0, 0.7, t));
+  s.trans = 1.0;
+  var c = shade(s, i.wp);
+  c = applyFog(c, i.wp);
+  return vec4f(c, 1.0);
+}
+`;
+
 // ---------------------------------------------------------------- soft particles
 // Camera-facing puffs of smoke and fire. The shape comes from animated noise
 // (no flat faces, no hard edges); smoke is lit by the sun, fire is emissive.

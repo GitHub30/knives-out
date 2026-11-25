@@ -1533,6 +1533,54 @@ impl World {
         obj
     }
 
+    /// Where grass grows, one byte per square metre of the map (255 = thick):
+    /// not on sand, roads or town paving, steep rock, nor under anything built.
+    pub fn grass_mask(&self) -> Vec<u8> {
+        let n = MAP as usize;
+        let mut m = vec![0u8; n * n];
+        for j in 0..n {
+            for i in 0..n {
+                let (x, z) = (i as f32 + 0.5, j as f32 + 0.5);
+                let y = self.height(x, z);
+                if y < 1.7 {
+                    continue;
+                }
+                let mut pave = 0.0f32;
+                for t in &self.towns {
+                    let d = dist_xz(x, z, t.x, t.z);
+                    if d < t.r + 8.0 {
+                        pave = pave.max(smoothstep(t.r + 8.0, t.r - 6.0, d) * 0.75);
+                    }
+                }
+                if pave < 0.6 {
+                    let rd = self.road_dist(x, z);
+                    if rd < 4.8 {
+                        pave = pave.max(smoothstep(4.8, 2.4, rd) * 0.85);
+                    }
+                }
+                let g = smoothstep(1.7, 3.0, y) * (1.0 - clampf(pave * 1.7, 0.0, 1.0)) * smoothstep(0.7, 0.86, self.normal(x, z).y);
+                m[j * n + i] = (g * 255.0) as u8;
+            }
+        }
+        for b in &self.boxes {
+            if b.min.y > self.height((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5) + 2.5 {
+                continue; // well above the ground (an upper floor, a roof)
+            }
+            let (i0, i1) = (((b.min.x - 0.6).max(0.0)) as usize, ((b.max.x + 0.6).min(MAP - 1.0)) as usize);
+            let (j0, j1) = (((b.min.z - 0.6).max(0.0)) as usize, ((b.max.z + 0.6).min(MAP - 1.0)) as usize);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    m[j * n + i] = 0;
+                }
+            }
+        }
+        for c in &self.cyls {
+            let (i, j) = ((c.x as usize).min(n - 1), (c.z as usize).min(n - 1));
+            m[j * n + i] = m[j * n + i].min(90);
+        }
+        m
+    }
+
     /// First car hit along a normalized ray: (distance, normal, car index).
     pub fn ray_cars(&self, o: V3, d: V3, maxt: f32) -> Option<(f32, V3, usize)> {
         let mut best: Option<(f32, V3, usize)> = None;

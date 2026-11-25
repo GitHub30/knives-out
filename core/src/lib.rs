@@ -39,6 +39,7 @@ struct ClientState {
     wdefs: Vec<f32>,
     towns: Vec<f32>,
     ray_kind: u32,
+    grass: Vec<u8>,
 }
 
 #[inline]
@@ -195,16 +196,17 @@ pub extern "C" fn cli_init(seed: u32) -> u32 {
     for t in &world.towns {
         towns.extend_from_slice(&[t.x, t.z, t.r, t.name as f32, t.kind as f32, t.y]);
     }
+    let grass = world.grass_mask();
     let checksum = world.checksum;
     unsafe {
-        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0 }));
+        *addr_of_mut!(CLIENT) = Some(Box::new(ClientState { world, meshes, pred: [0.0; 32], wdefs, towns, ray_kind: 0, grass }));
     }
     checksum
 }
 
 /// kind: 0 terrain verts(u32) 1 terrain indices(u32) 2 terrain chunks(f32)
 ///       3 prop verts(u32) 4 prop chunks(f32) 5 minimap rgba(u8) 6 weapon defs(f32) 7 towns(f32) 8 cars(f32 x4: x y z yaw) 9 car kinds(u8: 0 police car, 1 fire truck)
-///       10 window panes(f32 x6: min xyz, max xyz)
+///       10 window panes(f32 x6: min xyz, max xyz) 11 grass mask(u8, 1024 x 1024, one per m2)
 #[no_mangle]
 pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
     let Some(c) = client() else { return std::ptr::null() };
@@ -220,6 +222,7 @@ pub extern "C" fn cli_mesh_ptr(kind: u32) -> *const u8 {
         8 => c.world.cars.as_ptr() as *const u8,
         9 => c.world.car_kind.as_ptr(),
         10 => c.world.glass.as_ptr() as *const u8,
+        11 => c.grass.as_ptr(),
         _ => std::ptr::null(),
     }
 }
@@ -240,6 +243,7 @@ pub extern "C" fn cli_mesh_len(kind: u32) -> u32 {
         8 => c.world.cars.len() * 16,
         9 => c.world.car_kind.len(),
         10 => c.world.glass.len() * 24,
+        11 => c.grass.len(),
         _ => 0,
     }) as u32
 }

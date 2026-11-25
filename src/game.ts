@@ -344,6 +344,7 @@ export class Game {
       waterLevel: 0,
       cars: core.f32(8),
       carKinds: core.bytes(9),
+      grass: core.bytes(11),
     });
     this.d.hud.setMap(core.bytes(5), 512);
     this.glassPanes = core.f32(10);

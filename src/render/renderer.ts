@@ -2,7 +2,7 @@
 // models, sky, water, zone wall) lit by a sun with two shadow cascades, then
 // bloom + tonemap + FXAA into the swap chain.
 
-import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
 import { pill, rod, roundedBox, sphere } from './shapes';
@@ -15,15 +15,17 @@ export interface Quality {
   /** Upper bound of rendered pixels (the internal resolution never exceeds it). */
   maxPixels: number;
   drawDist: number;
+  /** Grass: 0 off, 1 a single coarse ring, 2 coarse and fine rings. */
+  grass: number;
   bloom: boolean;
   ao: boolean;
 }
 
 export const QUALITY_PRESETS: Record<'low' | 'medium' | 'high', Quality> = {
-  low: { shadowSize: 1024, scale: 0.8, maxDpr: 1.25, maxPixels: 1280 * 720, drawDist: 380, bloom: false, ao: false },
-  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true },
+  low: { shadowSize: 1024, scale: 0.8, maxDpr: 1.25, maxPixels: 1280 * 720, drawDist: 380, bloom: false, ao: false, grass: 0 },
+  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true, grass: 1 },
   // 1920 x 1080 internal resolution at most
-  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true },
+  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true, grass: 2 },
 };
 
 export interface WorldMeshes {
@@ -38,6 +40,8 @@ export interface WorldMeshes {
   /** Parked cars: x, y, z, yaw per car, and the vehicle kind of each. */
   cars?: Float32Array;
   carKinds?: Uint8Array;
+  /** Where grass grows: 1024 x 1024 bytes, one per square metre. */
+  grass?: Uint8Array;
 }
 
 export interface FrameView {
@@ -207,6 +211,9 @@ export class Renderer {
   private aniso: GPUSampler;
   private depthTex: GPUTexture | null = null;
   private bglDepth!: GPUBindGroupLayout;
+  private bglGrass!: GPUBindGroupLayout;
+  private bgGrass: GPUBindGroup | null = null;
+  private grassTex: GPUTexture | null = null;
   private bgDepth: GPUBindGroup | null = null;
   private hdrTex: GPUTexture | null = null;
   private bloomTex: GPUTexture[] = [];
@@ -394,6 +401,13 @@ export class Renderer {
     const layoutMain = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain] });
     this.bglDepth = d.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } }] });
     const layoutPuff = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglDepth] });
+    this.bglGrass = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, texture: { sampleType: 'float' } },
+      ],
+    });
+    const layoutGrass = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglGrass] });
     const layoutShadow = d.createPipelineLayout({ bindGroupLayouts: [this.bglShadow] });
     const layoutWater = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglWater] });
     const layoutModel = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglMat] });
@@ -523,6 +537,13 @@ export class Renderer {
         primitive: tri,
         depthStencil: depthMain(false),
       }),
+      grass: d.createRenderPipeline({
+        layout: layoutGrass,
+        vertex: { module: mod(GRASS_WGSL), entryPoint: 'vs' },
+        fragment: { module: mod(GRASS_WGSL), entryPoint: 'fs', targets: target() },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depthMain(true),
+      }),
       glass: d.createRenderPipeline({
         layout: layoutMain,
         vertex: { module: box, entryPoint: 'vs', buffers: boxVB },
@@ -614,6 +635,14 @@ export class Renderer {
     this.heightTex = d.createTexture({ size: [257, 257], format: 'r32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     d.queue.writeTexture({ texture: this.heightTex }, w.heights.buffer, { offset: w.heights.byteOffset, bytesPerRow: 257 * 4, rowsPerImage: 257 }, [257, 257]);
     this.bgWater = d.createBindGroup({ layout: this.bglWater, entries: [{ binding: 0, resource: this.heightTex.createView() }] });
+    this.grassTex?.destroy();
+    this.grassTex = null;
+    this.bgGrass = null;
+    if (w.grass && w.grass.length === 1024 * 1024) {
+      this.grassTex = d.createTexture({ size: [1024, 1024], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      d.queue.writeTexture({ texture: this.grassTex }, w.grass.buffer as ArrayBuffer, { offset: w.grass.byteOffset, bytesPerRow: 1024, rowsPerImage: 1024 }, [1024, 1024]);
+      this.bgGrass = d.createBindGroup({ layout: this.bglGrass, entries: [{ binding: 0, resource: this.heightTex.createView() }, { binding: 1, resource: this.grassTex.createView() }] });
+    }
   }
 
   // ------------------------------------------------------------------ models
@@ -1023,6 +1052,20 @@ export class Renderer {
         tris += c.count / 3;
         draws++;
       }
+    }
+    // grass around the camera (from the air there is nothing to see of it)
+    if (this.bgGrass && this.quality.grass > 0 && cam[1] < 140) {
+      pass.setPipeline(this.pipes.grass);
+      pass.setBindGroup(1, this.bgGrass);
+      if (this.quality.grass >= 2) {
+        pass.draw(15, GRASS_FAR * GRASS_FAR, 0, 0);
+        pass.draw(15, GRASS_NEAR * GRASS_NEAR, 0, 65536);
+        tris += 5 * (GRASS_FAR * GRASS_FAR + GRASS_NEAR * GRASS_NEAR);
+      } else {
+        pass.draw(15, GRASS_FAR * GRASS_FAR, 0, 200000);
+        tris += 5 * GRASS_FAR * GRASS_FAR;
+      }
+      draws += 2;
     }
     const models: { m: ModelGpu; inst: GPUBuffer; n: number }[] = [];
     models.push(...carDraws);
