@@ -36,8 +36,8 @@ pub const CAR_SLIDE_HURT_V: f32 = 5.0;
 pub const HELI_NUDGE_V: f32 = 3.0;
 pub const HELI_SHOVE_V: f32 = HELI_STAND_V;
 pub const HELI_SHOVE_MIN: f32 = 2.5;
-pub const HELI_AMMO: u8 = 16;
-pub const MISSILE_CD: f32 = 0.8;
+pub const HELI_AMMO: u8 = 200;
+pub const MISSILE_CD: f32 = 0.1;
 pub const MISSILE_SPEED: f32 = 95.0;
 pub const MISSILE_LIFE: u32 = 120;
 /// A missile's blast: radius, damage to a player / a vehicle at its centre.

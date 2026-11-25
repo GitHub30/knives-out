@@ -1987,6 +1987,12 @@ export class Game {
     }
     // where the missiles would go
     const aim = flying ? this.missileAim() : null;
+    {
+      // where they will land, on the screen: a ring with the range
+      const sp = aim && heli ? this.project(aim) : null;
+      const range = aim ? Math.hypot(aim[0] - this.renderPos()[0], aim[1] - this.renderPos()[1] - 2, aim[2] - this.renderPos()[2]) : 0;
+      hud.setImpact(sp && heli ? { x: sp[0], y: sp[1], text: heli.ammo === 0 ? '弾切れ' : range > 375 ? '射程外' : `着弾 ${Math.round(range)} m`, live: heli.ammo > 0 && range <= 375 } : null);
+    }
     if (aim && heli) {
       const sz = Math.max(0.12, Math.hypot(aim[0] - eye[0], aim[1] - eye[1], aim[2] - eye[2]) * 0.004);
       const col = rgba(heli.ammo > 0 ? 0xff5a28 : 0x9a9a9a, 230);

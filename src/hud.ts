@@ -84,6 +84,8 @@ export class Hud {
   private toastT = 0;
   private hitT = 0;
   private noiseRing!: HTMLDivElement;
+  private impact!: HTMLDivElement;
+  private impactText!: HTMLElement;
   private noiseEls: HTMLDivElement[] = [];
   mapOpen = false;
   onSlot: (s: number) => void = () => {};
@@ -125,6 +127,10 @@ export class Hud {
     this.cross = el('div', 'crosshair', root);
     for (const c of ['t', 'b', 'l', 'r', 'd']) el('i', `ch-${c}`, this.cross);
     this.noiseRing = el('div', 'noise-ring', root);
+    this.impact = el('div', 'impact', root);
+    el('i', '', this.impact);
+    this.impactText = el('b', '', this.impact);
+    this.impact.style.display = 'none';
     this.hitm = el('div', 'hitmarker', root);
     for (let i = 0; i < 4; i++) el('i', '', this.hitm);
     this.dmgLayer = el('div', 'dmg-layer', root);
@@ -352,6 +358,18 @@ export class Hud {
     this.banner.textContent = text;
     this.banner.className = `banner show ${cls}`;
     this.bannerT = secs;
+  }
+
+  /** Where the helicopter's missiles will land (screen pixels), or null to hide the mark. */
+  setImpact(m: { x: number; y: number; text: string; live: boolean } | null) {
+    if (!m) {
+      if (this.impact.style.display !== 'none') this.impact.style.display = 'none';
+      return;
+    }
+    this.impact.style.display = '';
+    this.impact.style.transform = `translate(${m.x.toFixed(1)}px, ${m.y.toFixed(1)}px)`;
+    this.impact.classList.toggle('dead', !m.live);
+    if (this.impactText.textContent !== m.text) this.impactText.textContent = m.text;
   }
 
   /** Sounds heard, shown around the crosshair: `ang` is clockwise from straight ahead. */

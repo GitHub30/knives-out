@@ -484,7 +484,7 @@ fn ammunition_and_cooldown() {
     assert_eq!(m.helis[0].ammo, 0);
     for k in 1..launches.len() {
         let gap = launches[k] - launches[k - 1];
-        assert!((24..=25).contains(&gap), "launches {gap} ticks apart");
+        assert!((3..=4).contains(&gap), "launches {gap} ticks apart");
         assert!(sides[k] != sides[k - 1], "the pods do not take turns");
     }
     assert!(m.missiles.is_empty(), "missiles still flying after their run");
