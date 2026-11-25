@@ -321,7 +321,8 @@ fn quiet_chunks_are_resynced_eventually() {
         place(&mut m, b, loot);
         let mut got = None;
         let mut taken = None;
-        for t in 0..420u32 {
+        // (the quiet period is 300 ticks plus up to 150 of secret jitter)
+        for t in 0..520u32 {
             let s = tick(&mut m, &[a]);
             if taken.is_none() && !m.items[id as usize].alive {
                 taken = Some(t);

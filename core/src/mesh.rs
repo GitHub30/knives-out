@@ -15,6 +15,10 @@ pub const MAT_FLOOR: u8 = 245;
 pub const MAT_WOOD: u8 = 240;
 pub const MAT_METAL: u8 = 235;
 pub const MAT_CONCRETE: u8 = 230;
+pub const MAT_BRICK: u8 = 215;
+pub const MAT_STUCCO: u8 = 210;
+/// Painted or upholstered: smooth, no pattern.
+pub const MAT_PAINT: u8 = 205;
 pub const MAT_BARK: u8 = 225;
 pub const MAT_ROCK: u8 = 220;
 pub const MAT_LEAF: u8 = 128;
@@ -343,8 +347,8 @@ pub fn build(w: &World) -> Meshes {
     for b in &w.boxes {
         s.select((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5);
         let c = rgb(b.col);
-        if b.kind == BK_CAR {
-            continue; // drawn from the car model by the client
+        if b.kind == BK_CAR || b.kind == BK_HIDDEN {
+            continue; // drawn from the car model by the client / from their own shapes
         }
         let mat = match b.kind {
             BK_ROOF => MAT_ROOF,
@@ -352,6 +356,8 @@ pub fn build(w: &World) -> Meshes {
             BK_CRATE => MAT_WOOD,
             BK_CONTAINER => MAT_METAL,
             BK_CONCRETE => MAT_CONCRETE,
+            BK_BRICK => MAT_BRICK,
+            BK_STUCCO => MAT_STUCCO,
             _ => MAT_SOLID,
         };
         let col = pack_c(c, mat);
@@ -391,9 +397,37 @@ pub fn build(w: &World) -> Meshes {
         let mat = match b.kind {
             BK_METAL => MAT_METAL,
             BK_CONCRETE => MAT_CONCRETE,
-            _ => MAT_FLOOR,
+            BK_CRATE => MAT_WOOD,
+            _ => MAT_PAINT,
         };
-        s.cuboid(b.min, b.max, pack_c(rgb(b.col), mat), false, None);
+        s.cuboid(b.min, b.max, pack_c(rgb(b.col), mat), true, None);
+    }
+    // pitched roofs: two slopes with eaves, and the gable walls under them
+    for r in &w.roofs {
+        s.select((r.x0 + r.x1) * 0.5, (r.z0 + r.z1) * 0.5);
+        let col = pack_c(rgb(r.col), MAT_ROOF);
+        let wall = pack_c(rgb(r.wall_col), MAT_STUCCO);
+        let (ov, th) = (0.45f32, 0.12f32);
+        // across the ridge: p, along it: a
+        let (a0, a1, p0, p1) = if r.along_x { (r.x0, r.x1, r.z0, r.z1) } else { (r.z0, r.z1, r.x0, r.x1) };
+        let pm = (p0 + p1) * 0.5;
+        let slope = r.rise / (pm - p0);
+        let at = |a: f32, p: f32, y: f32| if r.along_x { V3::new(a, y, p) } else { V3::new(p, y, a) };
+        let c = at((a0 + a1) * 0.5, pm, r.y);
+        for (pe, sgn) in [(p0, -1.0f32), (p1, 1.0)] {
+            let eave = pe + sgn * ov;
+            let ye = r.y - ov * slope;
+            // top of the slope, its underside at the eaves, and the fascia
+            s.quad(at(a0 - ov, eave, ye + th), at(a1 + ov, eave, ye + th), at(a1 + ov, pm, r.y + r.rise + th), at(a0 - ov, pm, r.y + r.rise + th), c, col);
+            s.quad(at(a0 - ov, eave, ye), at(a1 + ov, eave, ye), at(a1 + ov, pe, r.y), at(a0 - ov, pe, r.y), at((a0 + a1) * 0.5, eave, ye + 1.0), col);
+            s.quad(at(a0 - ov, eave, ye), at(a1 + ov, eave, ye), at(a1 + ov, eave, ye + th), at(a0 - ov, eave, ye + th), c, col);
+            for ae in [a0 - ov, a1 + ov] {
+                s.quad(at(ae, eave, ye), at(ae, eave, ye + th), at(ae, pm, r.y + r.rise + th), at(ae, pm, r.y + r.rise), c, col);
+            }
+        }
+        for ae in [a0, a1] {
+            s.tri(at(ae, p0, r.y), at(ae, p1, r.y), at(ae, pm, r.y + r.rise), c, wall);
+        }
     }
     for t in &w.trees {
         s.select(t.x, t.z);

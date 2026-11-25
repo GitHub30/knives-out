@@ -352,8 +352,12 @@ fn cars_take_damage_and_blow_up() {
     padb.go(&mut m, b, 0, 0, 0.0, 0.0, B_USE);
     assert_eq!(m.players[b as usize].ms.mode, MODE_DRIVE);
     m.players[b as usize].health = 100000.0; // keep the driver alive until the car goes
-    place(&mut m, a, V3::new(o.x, o.y, o.z + 10.0));
-    let yaw = yaw_to(0.0, -1.0);
+    // (along the clear track, in front of the car)
+    place(&mut m, a, V3::new(o.x + 10.0, o.y, o.z));
+    let yaw = yaw_to(-1.0, 0.0);
+    // aim at the middle of the body, whatever the lie of the land
+    let pa = m.players[a as usize].ms.pos;
+    let aim = ((m.w.cars[0][1] + 0.75 - (pa.y + 1.55)) / 10.0).atan();
     let mut fired = 0u32;
     for _ in 0..400 {
         {
@@ -366,7 +370,7 @@ fn cars_take_damage_and_blow_up() {
             p.switch_t = 0.0;
         }
         let before = m.players[a as usize].slots[0].1;
-        pad.go(&mut m, a, 0, 0, yaw, -0.05, B_FIRE | B_ADS);
+        pad.go(&mut m, a, 0, 0, yaw, aim, B_FIRE | B_ADS);
         fired += (before - m.players[a as usize].slots[0].1.min(before)) as u32;
         if m.car_hp[0] <= 0.0 {
             break;

@@ -52,6 +52,9 @@ interface Anim {
   foot: number;
   wasAlive: boolean;
   seen: number;
+  /** When it last touched down (knees give for a moment) and last splashed. */
+  landAt: number;
+  splash: number;
 }
 
 interface Fx {
@@ -118,6 +121,7 @@ const CAR_KINDS = [
 ];
 
 const DT = 1 / 30;
+const DEBUG = typeof location !== 'undefined' && new URLSearchParams(location.search).has('debug');
 /** Seconds a tyre mark stays on the ground. */
 const TRACK_LIFE = 50;
 type Snap = P.Snapshot & { byId: Map<number, P.RemotePlayer> };
@@ -162,6 +166,9 @@ export class Game {
   private smoothYaw = 0;
   private lastLookAt = 0;
   private carPoses = new Float32Array(0);
+  private myLandAt = -9;
+  private glassPanes: Float32Array = new Float32Array(0);
+  private glass = new Instances(256);
   private tracks: Track[] = [];
   private pending: { cmd: P.CmdQ; shots: number; at: number }[] = [];
   private outbox: P.CmdQ[] = [];
@@ -339,6 +346,7 @@ export class Game {
       carKinds: core.bytes(9),
     });
     this.d.hud.setMap(core.bytes(5), 512);
+    this.glassPanes = core.f32(10);
     const c0 = core.f32(8);
     const kinds = core.bytes(9);
     this.cars = [];
@@ -527,6 +535,15 @@ export class Game {
         break;
       case 'land':
         if (e.id === this.myId) snd.ui('land');
+        else {
+          // someone else touching down: dust, and their knees give
+          const p = this.interpPlayer(e.id);
+          if (p && Math.hypot(p.x - this.camEye[0], p.z - this.camEye[2]) < 150) {
+            this.spawnDust([p.x, p.y, p.z]);
+            const a = this.anims.get(e.id);
+            if (a) a.landAt = this.time;
+          }
+        }
         break;
       case 'end':
         break;
@@ -620,6 +637,7 @@ export class Game {
       if (ev & 1) {
         this.d.sound.ui('land');
         this.spawnDust(p.pos);
+        this.myLandAt = this.time;
       }
     }
   }
@@ -1040,10 +1058,17 @@ export class Game {
       this.fx.push({ k: 'spark', t: 0, life: 0.35 + Math.random() * 0.3, p: [...p], v: [(Math.random() - 0.5) * 4, Math.random() * 3.5, (Math.random() - 0.5) * 4], d: [0, 0, 0], len: 0, col, size: 0.06 + Math.random() * 0.05 });
     }
   }
+  /** Touching down: a ring of dust rolls out along the ground and a little hangs in the air. */
   private spawnDust(p: V3) {
-    for (let i = 0; i < 8; i++) {
-      const a = (i / 8) * Math.PI * 2;
-      this.fx.push({ k: 'smoke', t: 0, life: 0.8 + Math.random() * 0.4, p: [p[0], p[1] + 0.1, p[2]], v: [Math.cos(a) * 2, 0.4, Math.sin(a) * 2], d: [0, 0, 0], len: 0, col: 0xb8a888, size: 0.5 });
+    if (this.d.core.height(p[0], p[2]) < -0.3) return; // into water: no dust
+    const n = 16;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 + Math.random() * 0.4;
+      const v = 2.2 + Math.random() * 1.8;
+      this.fx.push({ k: 'smoke', t: 0, life: 0.9 + Math.random() * 0.6, p: [p[0] + Math.cos(a) * 0.25, p[1] + 0.12, p[2] + Math.sin(a) * 0.25], v: [Math.cos(a) * v, 0.25 + Math.random() * 0.3, Math.sin(a) * v], d: [0, 0, 0], len: 0, col: i % 3 ? 0xb9a98c : 0xcfc3ab, size: 0.32 + Math.random() * 0.22 });
+    }
+    for (let i = 0; i < 5; i++) {
+      this.fx.push({ k: 'smoke', t: 0, life: 1.3 + Math.random() * 0.7, p: [p[0] + (Math.random() - 0.5) * 0.5, p[1] + 0.2, p[2] + (Math.random() - 0.5) * 0.5], v: [(Math.random() - 0.5) * 0.8, 0.9 + Math.random() * 0.8, (Math.random() - 0.5) * 0.8], d: [0, 0, 0], len: 0, col: 0xc7baa0, size: 0.4 + Math.random() * 0.3 });
     }
   }
   private spawnExplosion(p: V3) {
@@ -1247,6 +1272,12 @@ export class Game {
     const s = this.latest!;
     const core = this.d.core;
     const base = Math.min(75, Math.max(55, (2 * Math.atan(Math.tan((100 * Math.PI) / 360) / this.d.renderer.aspect) * 180) / Math.PI)) * (Math.PI / 180);
+    // debug (?debug=1): a fixed camera [x, y, z, yaw, pitch] for looking at the world up close
+    const dbg = DEBUG ? (window as unknown as { __zfCam?: number[] }).__zfCam : undefined;
+    if (dbg) {
+      const eye: V3 = [dbg[0], dbg[1], dbg[2]];
+      return { eye, dir: dirFrom(dbg[3], dbg[4]), vfov: base, scoped: true, pivot: eye };
+    }
     const d = dirFrom(this.yaw, this.pitch);
     const back = (pivot: V3, dist: number): V3 => {
       const t = core.ray(pivot, scale(d, -1), dist + 0.3);
@@ -1320,7 +1351,7 @@ export class Game {
       seen.add(p.id);
       const a = this.anim(p.id, p.x, p.z, p.alive, dt, p.onGround && !p.inWater && !p.crouch, Math.hypot(dx, p.y - eye[1], dz));
       emitCharacter(this.boxes, {
-        x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch, mode: p.alive ? p.mode : 4, crouch: p.crouch, speed: a.speed, phase: a.phase,
+        x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch, mode: p.alive ? p.mode : 4, crouch: p.crouch || this.time - a.landAt < 0.22, speed: a.speed, phase: a.phase,
         weapon: p.weapon, ads: p.ads, firing: p.firing, deadT: p.alive ? -1 : tsec - a.deadAt, color: this.players.get(p.id)?.color ?? p.id,
         vest: p.vest, helm: p.helm, healing: p.healing, reloading: p.reloading, inWater: p.inWater, onGround: p.onGround, t: tsec,
       });
@@ -1333,7 +1364,7 @@ export class Game {
       const a = this.anim(this.myId, pos[0], pos[2], true, dt, this.pred.onGround && !this.pred.inWater && !this.pred.crouch, 0);
       const weapon = this.displayCur < 2 ? s.self.slots[this.displayCur].kind : 0;
       emitCharacter(this.boxes, {
-        x: pos[0], y: pos[1], z: pos[2], yaw: this.yaw, pitch: this.pitch, mode: this.pred.mode, crouch: this.pred.crouch, speed: a.speed, phase: a.phase,
+        x: pos[0], y: pos[1], z: pos[2], yaw: this.yaw, pitch: this.pitch, mode: this.pred.mode, crouch: this.pred.crouch || this.time - this.myLandAt < 0.22, speed: a.speed, phase: a.phase,
         weapon, ads: this.d.input.ads && weapon > 0, firing: this.d.input.fire, deadT: -1, color: this.players.get(this.myId)?.color ?? 0,
         vest: s.self.vest, helm: s.self.helm, healing: s.self.healT > 0, reloading: s.self.reloadT > 0, inWater: this.pred.inWater, onGround: this.pred.onGround, t: tsec,
       });
@@ -1362,6 +1393,28 @@ export class Game {
     }
     this.updateFx(dt);
     this.drawCars(eye, dt);
+    // window glass near the camera
+    this.glass.reset();
+    const gp = this.glassPanes;
+    for (let i = 0; i + 6 <= gp.length; i += 6) {
+      const gx = (gp[i] + gp[i + 3]) * 0.5, gz = (gp[i + 2] + gp[i + 5]) * 0.5;
+      if ((gx - eye[0]) ** 2 + (gz - eye[2]) ** 2 > 170 * 170) continue;
+      this.glass.push([gx, (gp[i + 1] + gp[i + 4]) * 0.5, gz], qIdent(), [gp[i + 3] - gp[i], gp[i + 4] - gp[i + 1], gp[i + 5] - gp[i + 2]], rgba(0x9cc0d2, 255));
+    }
+    // swimmers churn up the water
+    for (const p of this.interpAll()) {
+      if (!p.alive || !p.inWater || p.mode !== P.MODE_GROUND) continue;
+      const me = p.id === this.myId;
+      const a = this.anims.get(p.id);
+      if (!a || a.speed < 0.6) continue;
+      a.splash -= dt;
+      if (a.splash > 0) continue;
+      a.splash = 0.16;
+      const pos: V3 = me && this.pred ? this.renderPos() : [p.x, p.y, p.z];
+      const yaw = me ? this.yaw : p.yaw;
+      const side = Math.random() < 0.5 ? 0.45 : -0.45;
+      this.fx.push({ k: 'smoke', t: 0, life: 0.45 + Math.random() * 0.25, p: [pos[0] + Math.sin(yaw) * 0.6 + Math.cos(yaw) * side, 0.08, pos[2] + Math.cos(yaw) * 0.6 - Math.sin(yaw) * side], v: [(Math.random() - 0.5) * 0.8, 0.9 + Math.random() * 0.6, (Math.random() - 0.5) * 0.8], d: [0, 0, 0], len: 0, col: 0xeef6fb, size: 0.16 + Math.random() * 0.12 });
+    }
 
     const me = this.myPos();
     const shadowCenter: V3 = this.pred ? this.renderPos() : cam.pivot;
@@ -1378,6 +1431,7 @@ export class Game {
       glow: this.glow,
       smoke: this.smoke,
       puffs: this.puffs,
+      glass: this.glass,
     });
 
     // ---- audio loops
@@ -1611,7 +1665,7 @@ export class Game {
   private anim(id: number, x: number, z: number, alive: boolean, dt: number, stepping: boolean, dist: number): Anim {
     let a = this.anims.get(id);
     if (!a || a.seen > 2) {
-      a = { phase: Math.random() * 6, x, z, speed: 0, deadAt: alive ? -1 : this.time - 5, foot: 0, wasAlive: alive, seen: 0 };
+      a = { phase: Math.random() * 6, x, z, speed: 0, deadAt: alive ? -1 : this.time - 5, foot: 0, wasAlive: alive, seen: 0, landAt: -9, splash: 0 };
       this.anims.set(id, a);
     }
     a.seen = 0;

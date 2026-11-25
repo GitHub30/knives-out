@@ -56,7 +56,7 @@ fn every_staircase_leads_to_every_floor() {
                     // flights alternate lane and direction; start a step before the first tread
                     let up = (f - 1) % 2 == 0;
                     let start = if up { a_lo + 0.9 } else { a_lo + 1.35 + 4.2 + 0.45 };
-                    let s = walk(&w, at(start, lane((f - 1) % 2), y), if up { yaw_up } else { yaw_down }, 75);
+                    let s = walk(&w, at(start, lane((f - 1) % 2), y), if up { yaw_up } else { yaw_down }, 36);
                     let want = b.y + STOREY * f as f32;
                     if (s.pos.y - want).abs() > 0.02 || !s.on_ground {
                         break;

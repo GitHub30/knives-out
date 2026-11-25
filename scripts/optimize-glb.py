@@ -2,6 +2,7 @@
 """Shrink a GLB for the web: embedded textures are scaled down and re-encoded as JPEG.
 
 usage: optimize-glb.py in.glb out.glb [max_texture_size=1024]
+Body colour maps (the ones with lettering) are kept at twice that size.
 Geometry, materials and node transforms are kept as they are.
 """
 import io, json, struct, sys
@@ -23,8 +24,11 @@ for i, bv in enumerate(gltf['bufferViews']):
     chunk = bin_[bv.get('byteOffset', 0):bv.get('byteOffset', 0) + bv['byteLength']]
     if i in image_views:
         img = Image.open(io.BytesIO(chunk)).convert('RGB')
-        if max(img.size) > max_size:
-            k = max_size / max(img.size)
+        # lettering lives in the body colour maps: those keep twice the size
+        name = image_views[i].get('name', '')
+        limit = max_size * 2 if 'BaseColor' in name and 'Wheel' not in name else max_size
+        if max(img.size) > limit:
+            k = limit / max(img.size)
             img = img.resize((round(img.width * k), round(img.height * k)), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, 'JPEG', quality=84, optimize=True)

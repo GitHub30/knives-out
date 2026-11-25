@@ -25,6 +25,28 @@ pub const BK_CAR: u8 = 6;
 /// Decoration only (`World::deco`): painted trim and metalwork.
 pub const BK_TRIM: u8 = 7;
 pub const BK_METAL: u8 = 8;
+/// Solid but not drawn as a box: the steps under a pitched roof, furniture
+/// (both are drawn from their own shapes).
+pub const BK_HIDDEN: u8 = 9;
+/// Wall finishes besides lap siding (`BK_WALL`).
+pub const BK_BRICK: u8 = 11;
+pub const BK_STUCCO: u8 = 12;
+
+/// A pitched roof as it is drawn (it is solid as a stack of `BK_HIDDEN` steps).
+#[derive(Clone, Copy, Debug)]
+pub struct Roof {
+    pub x0: f32,
+    pub z0: f32,
+    pub x1: f32,
+    pub z1: f32,
+    /// Height of the eaves and of the ridge above them.
+    pub y: f32,
+    pub rise: f32,
+    /// The ridge runs along x.
+    pub along_x: bool,
+    pub col: u32,
+    pub wall_col: u32,
+}
 /// Storey height: walls plus the slab above them.
 pub const STOREY: f32 = WALL_H + 0.3;
 /// Car half width, half length and height (m).
@@ -133,6 +155,9 @@ pub struct World {
     /// Parked cars: x, y (ground), z, yaw (a multiple of a quarter turn).
     /// Drawn but not solid: window and door frames, sills, pipes, bands.
     pub deco: Vec<Bx>,
+    /// Window panes (min, max): drawn as glass, not solid.
+    pub glass: Vec<[f32; 6]>,
+    pub roofs: Vec<Roof>,
     pub cars: Vec<[f32; 4]>,
     /// Vehicle kind of each car (never changes during a match).
     pub car_kind: Vec<u8>,
@@ -198,6 +223,8 @@ impl World {
             gbox: Vec::new(),
             gcyl: Vec::new(),
             deco: Vec::new(),
+            glass: Vec::new(),
+            roofs: Vec::new(),
             cars: Vec::new(),
             car_kind: Vec::new(),
             checksum: 0,
@@ -650,7 +677,9 @@ impl World {
         let hgt = if kind == 1 { 4.4 } else { WALL_H };
         // the stairs need room: a long side of 7.6 m or more
         let floors = if (x1 - x0).max(z1 - z0) < 7.6 || kind == 1 || kind == 2 { 1 } else { floors.clamp(1, 4) };
-        let wall_kind = if apt { BK_CONCRETE } else { BK_WALL };
+        // houses: lap siding, brick or stucco
+        let wall_kind = if apt { BK_CONCRETE } else if kind == 0 { [BK_WALL, BK_BRICK, BK_STUCCO, BK_WALL][rng.below(4) as usize] } else { BK_WALL };
+        let wall_col = if wall_kind == BK_BRICK { [0x9A4A38, 0x8A4634, 0xA65C40, 0x7C4A3A][rng.below(4) as usize] } else { wall_col };
         let trim_col = if apt { 0x3E4348 } else { 0xECE9E2 };
 
         let first_box = self.boxes.len();
@@ -827,6 +856,22 @@ impl World {
         }
         // roof (an apartment block has a parapet and plant on it)
         self.boxes.push(Bx { min: V3::new(x0 - 0.3, top, z0 - 0.3), max: V3::new(x1 + 0.3, top + 0.3, z1 + 0.3), kind: BK_ROOF, col: roof_col });
+        if kind == 0 || kind == 2 {
+            // a gable roof: solid as a stack of low steps (so it can be walked
+            // and landed on), drawn as two smooth slopes
+            let (lo, hi) = if along { (z0 - 0.3, z1 + 0.3) } else { (x0 - 0.3, x1 + 0.3) };
+            let half = (hi - lo) * 0.5;
+            let rise = half * 0.42;
+            let n = (rise / 0.25).ceil().max(1.0) as usize;
+            let (r, run) = (rise / n as f32, half / n as f32);
+            for k in 0..n {
+                let (q0, q1) = (lo + run * k as f32, hi - run * k as f32);
+                let (ylo, yhi) = (top + 0.3 + r * k as f32, top + 0.3 + r * (k + 1) as f32);
+                let (mn, mx) = if along { (V3::new(x0 - 0.3, ylo, q0), V3::new(x1 + 0.3, yhi, q1)) } else { (V3::new(q0, ylo, z0 - 0.3), V3::new(q1, yhi, z1 + 0.3)) };
+                self.boxes.push(Bx { min: mn, max: mx, kind: BK_HIDDEN, col: roof_col });
+            }
+            self.roofs.push(Roof { x0: x0 - 0.3, z0: z0 - 0.3, x1: x1 + 0.3, z1: z1 + 0.3, y: top + 0.3, rise, along_x: along, col: roof_col, wall_col });
+        }
         if apt {
             let (rt, ph, pt) = (top + 0.3, 0.8f32, 0.2f32);
             for (px0, pz0, px1, pz1) in [(x0 - 0.3, z0 - 0.3, x1 + 0.3, z0 - 0.3 + pt), (x0 - 0.3, z1 + 0.3 - pt, x1 + 0.3, z1 + 0.3), (x0 - 0.3, z0 - 0.3, x0 - 0.3 + pt, z1 + 0.3), (x1 + 0.3 - pt, z0 - 0.3, x1 + 0.3, z1 + 0.3)] {
@@ -868,6 +913,33 @@ impl World {
             }
         }
 
+        // furniture (houses and flats), clear of the door and the stairs
+        if kind == 0 || apt {
+            let stairs = if floors > 1 {
+                let (q0, q1) = if far_side { (p_hi - sw * 2.0 - 0.9, p_hi) } else { (p_lo, p_lo + sw * 2.0 + 0.9) };
+                let (mn, mx) = rect(a_s - 1.6, a_s + rl + 1.9, q0, q1, 0.0, 0.0);
+                (mn.x, mn.z, mx.x, mx.z)
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+            for f in 0..floors as usize {
+                let fy = y + STOREY * f as f32;
+                let mut keep = vec![stairs];
+                if f == 0 {
+                    keep.push((door.2 - 2.0, door.3 - 2.0, door.2 + 2.0, door.3 + 2.0));
+                } else if apt {
+                    // the balcony doors
+                    keep.push(match side {
+                        0 => (x0, z0, x1, z0 + 1.6),
+                        2 => (x0, z1 - 1.6, x1, z1),
+                        1 => (x1 - 1.6, z0, x1, z1),
+                        _ => (x0, z0, x0 + 1.6, z1),
+                    });
+                }
+                self.furnish(x0 + t, z0 + t, x1 - t, z1 - t, fy, &keep, rng);
+            }
+        }
+
         // loot spots (never inside crates / interior walls of this building)
         let area = w_ * d_;
         let n = clampf(area / 22.0, 2.0, 8.0) as u32;
@@ -903,6 +975,10 @@ impl World {
     /// sill and glazing bars. Decoration only.
     #[allow(clippy::too_many_arguments)]
     fn frame(&mut self, along_x: bool, s0: f32, s1: f32, ylo: f32, yhi: f32, p0: f32, p1: f32, door: bool, col: u32) {
+        if !door {
+            let pc = (p0 + p1) * 0.5;
+            self.glass.push(if along_x { [s0, ylo, pc - 0.012, s1, yhi, pc + 0.012] } else { [pc - 0.012, ylo, s0, pc + 0.012, yhi, s1] });
+        }
         let mut bar = |a0: f32, a1: f32, y0: f32, y1: f32, q0: f32, q1: f32, kind: u8, col: u32| {
             let (mn, mx) = if along_x { (V3::new(a0, y0, q0), V3::new(a1, y1, q1)) } else { (V3::new(q0, y0, a0), V3::new(q1, y1, a1)) };
             self.deco.push(Bx { min: mn, max: mx, kind, col });
@@ -917,6 +993,124 @@ impl World {
             let (sm, ym) = ((s0 + s1) * 0.5, (ylo + yhi) * 0.5);
             bar(sm - 0.02, sm + 0.02, ylo, yhi, pm - 0.025, pm + 0.025, BK_TRIM, col);
             bar(s0, s1, ym - 0.02, ym + 0.02, pm - 0.025, pm + 0.025, BK_TRIM, col);
+        }
+    }
+
+    /// Furniture in the corners of a room (interior x0..x1, z0..z1, floor at
+    /// `y`), skipping what would stand in a `keep` rectangle. Each piece is a
+    /// simple hidden solid with its real shape as decoration.
+    #[allow(clippy::too_many_arguments)]
+    fn furnish(&mut self, x0: f32, z0: f32, x1: f32, z1: f32, y: f32, keep: &[(f32, f32, f32, f32)], rng: &mut Rng) {
+        let wood = [0x6B4A2E, 0x7E5B3A, 0x4E3828][rng.below(3) as usize];
+        let cloth = [0x55606B, 0x7A4B3A, 0x49604E, 0x6A6257][rng.below(4) as usize];
+        let first = rng.below(4);
+        for c in 0..4u32 {
+            if rng.chance(0.3) {
+                continue;
+            }
+            // corner c: which x wall and which z wall it sits against
+            let (wx, wz) = (c % 2 == 0, c < 2);
+            // long side along x or z, footprint (lx, lz) and height of the solid part
+            let item = (first + c) % 4;
+            let along_x = rng.chance(0.5);
+            let (l, d, h) = match item {
+                0 => (2.0, 1.05, 0.5),   // bed
+                1 => (1.3, 0.42, 1.8),   // shelf
+                2 => (1.3, 0.8, 0.76),   // table
+                _ => (1.9, 0.85, 0.42),  // sofa
+            };
+            let (lx, lz) = if along_x { (l, d) } else { (d, l) };
+            let g = 0.06;
+            let bx0 = if wx { x0 + g } else { x1 - g - lx };
+            let bz0 = if wz { z0 + g } else { z1 - g - lz };
+            let (bx1, bz1) = (bx0 + lx, bz0 + lz);
+            if bx1 > x1 - 0.8 && bx0 < x0 + 0.8 || bz1 > z1 - 0.8 && bz0 < z0 + 0.8 {
+                continue; // the room is too small for it
+            }
+            // (a table has a chair standing out from it)
+            let m = if item == 2 { 1.3 } else { 0.5 };
+            if keep.iter().any(|k| bx0 < k.2 + m && bx1 > k.0 - m && bz0 < k.3 + m && bz1 > k.1 - m) {
+                continue;
+            }
+            if self.boxes.iter().rev().take(400).any(|b| b.max.y > y + 0.05 && b.min.y < y + h && bx0 < b.max.x && bx1 > b.min.x && bz0 < b.max.z && bz1 > b.min.z) {
+                continue;
+            }
+            let solid = |boxes: &mut Vec<Bx>, a: (f32, f32, f32), b: (f32, f32, f32)| boxes.push(Bx { min: V3::new(a.0, a.1, a.2), max: V3::new(b.0, b.1, b.2), kind: BK_HIDDEN, col: 0 });
+            let mut part = |a: (f32, f32, f32), b: (f32, f32, f32), kind: u8, col: u32| self.deco.push(Bx { min: V3::new(a.0, a.1, a.2), max: V3::new(b.0, b.1, b.2), kind, col });
+            // the wall end of the long side (for headboards and backrests)
+            let head_lo = if along_x { wx } else { wz };
+            match item {
+                0 => {
+                    part((bx0, y, bz0), (bx1, y + 0.28, bz1), BK_CRATE, wood);
+                    part((bx0 + 0.03, y + 0.28, bz0 + 0.03), (bx1 - 0.03, y + 0.5, bz1 - 0.03), BK_TRIM, 0xE4E0D6);
+                    // headboard, pillow and a blanket over the foot end
+                    let (hb0, hb1, pl0, pl1, bl0, bl1) = if head_lo { (0.0, 0.08, 0.14, 0.6, 0.75, l) } else { (l - 0.08, l, l - 0.6, l - 0.14, 0.0, l - 0.75) };
+                    let seg = |a: f32, b: f32, y0: f32, y1: f32, inset: f32| if along_x { ((bx0 + a, y0, bz0 + inset), (bx0 + b, y1, bz1 - inset)) } else { ((bx0 + inset, y0, bz0 + a), (bx1 - inset, y1, bz0 + b)) };
+                    let (a, b) = seg(hb0, hb1, y, y + 0.95, 0.0);
+                    part(a, b, BK_CRATE, wood);
+                    let (a, b) = seg(pl0, pl1, y + 0.5, y + 0.62, 0.22);
+                    part(a, b, BK_TRIM, 0xF2F0EA);
+                    let (a, b) = seg(bl0, bl1, y + 0.5, y + 0.54, 0.0);
+                    part(a, b, BK_TRIM, cloth);
+                }
+                1 => {
+                    // carcass: sides, back, five shelves with a few books
+                    part((bx0, y, bz0), (bx1, y + 0.06, bz1), BK_CRATE, wood);
+                    for k in 1..=5 {
+                        let sy = y + 0.36 * k as f32;
+                        part((bx0, sy - 0.03, bz0), (bx1, sy, bz1), BK_CRATE, wood);
+                    }
+                    if along_x {
+                        part((bx0, y, bz0), (bx0 + 0.04, y + 1.8, bz1), BK_CRATE, wood);
+                        part((bx1 - 0.04, y, bz0), (bx1, y + 1.8, bz1), BK_CRATE, wood);
+                        let zb = if wz { bz0 } else { bz1 - 0.03 };
+                        part((bx0, y, zb), (bx1, y + 1.8, zb + 0.03), BK_CRATE, wood);
+                        for k in 0..3 {
+                            let (bx, by) = (bx0 + 0.12 + 0.36 * k as f32, y + 0.36 * (k + 1) as f32);
+                            part((bx, by, bz0 + 0.08), (bx + 0.26, by + 0.24, bz1 - 0.08), BK_TRIM, [0x8A3B32, 0x33506A, 0x4E6B45][k]);
+                        }
+                    } else {
+                        part((bx0, y, bz0), (bx1, y + 1.8, bz0 + 0.04), BK_CRATE, wood);
+                        part((bx0, y, bz1 - 0.04), (bx1, y + 1.8, bz1), BK_CRATE, wood);
+                        let xb = if wx { bx0 } else { bx1 - 0.03 };
+                        part((xb, y, bz0), (xb + 0.03, y + 1.8, bz1), BK_CRATE, wood);
+                        for k in 0..3 {
+                            let (bz, by) = (bz0 + 0.12 + 0.36 * k as f32, y + 0.36 * (k + 1) as f32);
+                            part((bx0 + 0.08, by, bz), (bx1 - 0.08, by + 0.24, bz + 0.26), BK_TRIM, [0x8A3B32, 0x33506A, 0x4E6B45][k]);
+                        }
+                    }
+                }
+                2 => {
+                    part((bx0, y + 0.71, bz0), (bx1, y + 0.76, bz1), BK_CRATE, wood);
+                    for (lx_, lz_) in [(bx0 + 0.05, bz0 + 0.05), (bx1 - 0.11, bz0 + 0.05), (bx0 + 0.05, bz1 - 0.11), (bx1 - 0.11, bz1 - 0.11)] {
+                        part((lx_, y, lz_), (lx_ + 0.06, y + 0.71, lz_ + 0.06), BK_CRATE, wood);
+                    }
+                    // a chair on the open long side
+                    let (cx, cz) = if along_x { ((bx0 + bx1) * 0.5, if wz { bz1 + 0.45 } else { bz0 - 0.45 }) } else { (if wx { bx1 + 0.45 } else { bx0 - 0.45 }, (bz0 + bz1) * 0.5) };
+                    part((cx - 0.22, y + 0.42, cz - 0.22), (cx + 0.22, y + 0.46, cz + 0.22), BK_CRATE, wood);
+                    for (sx, sz) in [(-0.2, -0.2), (0.16, -0.2), (-0.2, 0.16), (0.16, 0.16)] {
+                        part((cx + sx, y, cz + sz), (cx + sx + 0.04, y + 0.42, cz + sz + 0.04), BK_CRATE, wood);
+                    }
+                    let (b0, b1) = if along_x { let zb = if wz { cz + 0.18 } else { cz - 0.22 }; ((cx - 0.22, y + 0.46, zb), (cx + 0.22, y + 0.9, zb + 0.04)) } else { let xb = if wx { cx + 0.18 } else { cx - 0.22 }; ((xb, y + 0.46, cz - 0.22), (xb + 0.04, y + 0.9, cz + 0.22)) };
+                    part(b0, b1, BK_CRATE, wood);
+                    solid(&mut self.boxes, (cx - 0.22, y, cz - 0.22), (cx + 0.22, y + 0.46, cz + 0.22));
+                }
+                _ => {
+                    part((bx0, y + 0.08, bz0), (bx1, y + 0.42, bz1), BK_TRIM, cloth);
+                    // backrest against the wall, arms at the ends
+                    let (b0, b1) = if along_x { let zb = if wz { bz0 } else { bz1 - 0.22 }; ((bx0, y + 0.42, zb), (bx1, y + 0.86, zb + 0.22)) } else { let xb = if wx { bx0 } else { bx1 - 0.22 }; ((xb, y + 0.42, bz0), (xb + 0.22, y + 0.86, bz1)) };
+                    part(b0, b1, BK_TRIM, cloth);
+                    solid(&mut self.boxes, b0, b1);
+                    if along_x {
+                        part((bx0, y + 0.42, bz0), (bx0 + 0.16, y + 0.62, bz1), BK_TRIM, cloth);
+                        part((bx1 - 0.16, y + 0.42, bz0), (bx1, y + 0.62, bz1), BK_TRIM, cloth);
+                    } else {
+                        part((bx0, y + 0.42, bz0), (bx1, y + 0.62, bz0 + 0.16), BK_TRIM, cloth);
+                        part((bx0, y + 0.42, bz1 - 0.16), (bx1, y + 0.62, bz1), BK_TRIM, cloth);
+                    }
+                }
+            }
+            solid(&mut self.boxes, (bx0, y, bz0), (bx1, y + h, bz1));
         }
     }
 

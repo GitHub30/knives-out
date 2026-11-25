@@ -8,7 +8,7 @@ use crate::rng::Rng;
 use crate::world::*;
 use crate::names::{name_key, sanitize_name};
 
-pub const PROTO: u16 = 11;
+pub const PROTO: u16 = 12;
 pub const HIST: usize = 32;
 pub const MAX_ITEMS: usize = 4000;
 pub const INTEREST: f32 = 520.0;

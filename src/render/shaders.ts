@@ -334,6 +334,34 @@ fn sway(p: vec3f, m: f32) -> vec3f {
     }
     s.rough = 0.9;
     s.ao = 0.6 + 0.4 * h0;
+  } else if (mat == 215 && abs(n.y) < 0.5) {
+    // brick: running bond, every brick its own shade, recessed mortar
+    let ax = abs(n);
+    let u = select(wp.x, wp.z, ax.x > ax.z);
+    let row = floor(wp.y / 0.085);
+    let bu = u / 0.22 + 0.5 * (row - 2.0 * floor(row * 0.5));
+    let cell = vec2f(fract(bu), fract(wp.y / 0.085));
+    let id = vec2f(floor(bu), row);
+    let edge = min(min(cell.x, 1.0 - cell.x) * 0.22, min(cell.y, 1.0 - cell.y) * 0.085);
+    let mortar = 1.0 - smoothstep(0.004, 0.011, edge);
+    let tone = 0.72 + 0.5 * hash2(id) + (vnoise3(wp * 14.0) - 0.5) * 0.25;
+    let soot = fbm3(wp * vec3f(0.5, 0.3, 0.5));
+    albedo = mix(albedo * tone * (0.8 + 0.3 * soot), vec3f(0.62, 0.6, 0.56) * (0.8 + 0.3 * vnoise3(wp * 30.0)), mortar);
+    var g = vec3f(0.0);
+    let de = smoothstep(0.0, 0.011, edge);
+    // the brick faces stand a little proud of the joints
+    g.y = (smoothstep(0.0, 0.14, cell.y) - smoothstep(0.86, 1.0, cell.y)) * -(1.0 - de) * 2.5;
+    let gx = (smoothstep(0.0, 0.05, cell.x) - smoothstep(0.95, 1.0, cell.x)) * -(1.0 - de) * 2.5;
+    if (ax.x > ax.z) { g.z = gx; } else { g.x = gx; }
+    let gn = vnoise3(wp * 40.0);
+    g += (vec3f(vnoise3((wp + vec3f(0.01, 0.0, 0.0)) * 40.0), vnoise3((wp + vec3f(0.0, 0.01, 0.0)) * 40.0), vnoise3((wp + vec3f(0.0, 0.0, 0.01)) * 40.0)) - gn) * 6.0 * (1.0 - mortar);
+    n = bump(n, g, detail);
+    s.rough = mix(0.82, 0.95, mortar);
+    s.ao = mix(1.0, 0.7, mortar);
+  } else if (mat == 205) {
+    // paint and upholstery: even colour, a soft sheen
+    albedo *= 0.92 + 0.12 * vnoise3(wp * 9.0);
+    s.rough = 0.62;
   } else {
     // plaster, concrete, floors: stains, streaks under the eaves, fine grain
     let stain = fbm3(wp * vec3f(0.45, 0.25, 0.45));
@@ -350,6 +378,24 @@ fn sway(p: vec3f, m: f32) -> vec3f {
       let b = fract(wp.y / 0.22);
       albedo *= mix(0.62, 1.0, smoothstep(0.0, 0.12, b)) * (0.94 + 0.12 * hash2(vec2f(floor(wp.y / 0.22), 3.0)));
       g.y += (smoothstep(0.0, 0.12, b) - smoothstep(0.85, 1.0, b)) * -0.9;
+    }
+    if (mat == 210) {
+      // stucco: a rough trowelled coat, darker towards the ground where rain splashes
+      let h0 = fbm3(wp * 7.0);
+      let e2 = 0.02;
+      g += (vec3f(fbm3((wp + vec3f(e2, 0.0, 0.0)) * 7.0), fbm3((wp + vec3f(0.0, e2, 0.0)) * 7.0), fbm3((wp + vec3f(0.0, 0.0, e2)) * 7.0)) - h0) / e2 * 0.05;
+      albedo *= 0.9 + 0.25 * h0;
+    }
+    if (mat == 230 && abs(n.y) < 0.5) {
+      // cast concrete: formwork panel joints and tie holes, rain streaks
+      let ax = abs(n);
+      let u = select(wp.x, wp.z, ax.x > ax.z);
+      let pj = min(abs(fract(u / 2.4) - 0.5) * 2.4, abs(fract(wp.y / 1.2) - 0.5) * 1.2);
+      let joint = 1.0 - smoothstep(0.585, 0.6, pj);
+      albedo *= mix(0.72, 1.0, joint);
+      let hole = length(vec2f(fract(u / 1.2) - 0.5, fract(wp.y / 0.6) - 0.5) * vec2f(1.2, 0.6));
+      albedo *= mix(0.6, 1.0, smoothstep(0.018, 0.03, hole));
+      albedo *= 1.0 - 0.22 * smoothstep(0.5, 0.9, vnoise(vec2f(u * 3.0, wp.y * 0.18)));
     }
     n = bump(n, g, detail);
     s.rough = select(0.88, 0.8, mat == 245);
@@ -429,6 +475,24 @@ struct VOut {
   let d = distance(i.wp, F.camPos.xyz);
   let fade = exp(-d * 0.002);
   return vec4f(albedo, i.col.a * fade);
+}
+// Window glass: mostly clear, mirrors the sky at grazing angles, glints in the sun.
+@fragment fn fs_glass(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  var n = normalize(i.n);
+  let V = normalize(F.camPos.xyz - i.wp);
+  if (dot(n, V) < 0.0) { n = -n; }
+  let fres = 0.05 + 0.95 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
+  let R = reflect(-V, n);
+  let sky = mix(F.skyHorizon.rgb, F.skyTop.rgb, clamp(R.y * 1.3 + 0.15, 0.0, 1.0)) * (0.7 + 0.5 * fbm2(R.xz * 2.0 + R.y));
+  let ground = vec3f(0.12, 0.13, 0.11);
+  let env = mix(ground, sky, smoothstep(-0.15, 0.1, R.y));
+  let glint = pow(max(dot(R, F.sunDir.xyz), 0.0), 600.0) * 30.0 + pow(max(dot(R, F.sunDir.xyz), 0.0), 40.0) * 0.5;
+  // faint grime so the pane reads as a surface even head-on
+  let dirt = 0.04 + 0.05 * fbm2(i.wp.xy * 1.7 + i.wp.z * 1.7);
+  let a = clamp(0.08 + dirt + fres * 0.85 + glint, 0.0, 1.0);
+  var c = (pow(i.col.rgb, vec3f(2.2)) * (0.08 + dirt) + env * fres + F.sunColor.rgb * glint) / max(a, 0.001);
+  c = applyFog(c, i.wp);
+  return vec4f(c, a);
 }
 @fragment fn fs_smoke(i: VOut) -> @location(0) vec4f {
   let albedo = pow(i.col.rgb, vec3f(2.2));
@@ -579,7 +643,16 @@ struct VOut {
   @location(1) col: vec4f,
   @location(2) parm: vec3f,
   @location(3) wp: vec3f,
+  @location(4) soft: vec2f,   // near plane, fade distance
 };
+@group(1) @binding(0) var sceneDepth: texture_depth_2d;
+// 0 where the particle meets what is behind it, 1 well in front of it
+fn depthFade(i: VOut) -> f32 {
+  let d = textureLoad(sceneDepth, vec2i(i.clip.xy), 0);
+  let sceneZ = i.soft.x / max(d, 1e-7);
+  let partZ = 1.0 / i.clip.w;
+  return clamp((sceneZ - partZ) / i.soft.y, 0.0, 1.0);
+}
 @vertex fn vs(v: PIn) -> VOut {
   var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
   let c = corners[v.vi];
@@ -598,6 +671,8 @@ struct VOut {
   o.col = v.icol;
   o.parm = v.iparm;
   o.wp = wp;
+  // (reverse-Z with the far plane at infinity: clip z is the near distance)
+  o.soft = vec2f(o.clip.z, max(v.isize * 0.45, 0.15));
   return o;
 }
 fn heatRamp(h: f32) -> vec3f {
@@ -611,6 +686,7 @@ fn heatRamp(h: f32) -> vec3f {
   let r = length(i.uv);
   if (r > 1.0) { discard; }
   let kind = i.parm.z;
+  let df = depthFade(i);
   if (kind < 0.5) {
     // ---- smoke: billowing density with a ragged, wispy edge
     let p = vec3f(i.uv * 1.25 + vec2f(seed * 17.3, seed * 7.1), t * 0.22 + seed * 5.0);
@@ -631,7 +707,7 @@ fn heatRamp(h: f32) -> vec3f {
     var c = i.col.rgb * (sky * 0.9 + F.sunColor.rgb * (0.25 + 0.75 * ndl * ndl) * 0.55);
     // thick cores swallow light
     c *= 1.0 - 0.35 * dens;
-    let a = clamp(i.col.a * dens * 1.35, 0.0, 1.0);
+    let a = clamp(i.col.a * dens * 1.35 * df, 0.0, 1.0);
     c = applyFog(c, i.wp);
     return vec4f(c * a, a);
   }
@@ -645,7 +721,7 @@ fn heatRamp(h: f32) -> vec3f {
     let d = abs(i.uv.x + (n - 0.5) * 0.7 * y) / width;
     var heat = (1.0 - smoothstep(0.35, 1.0, d)) * (1.0 - smoothstep(0.55, 1.0, y + (lick - 0.5) * 0.8));
     heat *= smoothstep(0.0, 0.12, y) * (0.55 + 0.9 * lick);
-    heat = clamp(heat * i.col.a * 1.5, 0.0, 1.0);
+    heat = clamp(heat * i.col.a * 1.5 * df, 0.0, 1.0);
     let c = heatRamp(heat) * i.col.rgb * heat * 9.0;
     return vec4f(c, heat * 0.2);
   }
@@ -655,7 +731,7 @@ fn heatRamp(h: f32) -> vec3f {
   let n2 = fbm3(p * 2.6 + 4.0);
   var heat = smoothstep(1.0, 0.05, r + (n - 0.5) * 0.95);
   heat *= 0.6 + 0.8 * n2;
-  heat = clamp(heat * i.col.a * 1.4, 0.0, 1.0);
+  heat = clamp(heat * i.col.a * 1.4 * df, 0.0, 1.0);
   // as it cools the rim goes to dark soot
   let soot = smoothstep(0.55, 0.0, heat) * smoothstep(0.03, 0.3, heat);
   // (the faint rim adds almost nothing: no coloured halo against the sky)

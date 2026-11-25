@@ -146,13 +146,23 @@ export function emitCharacter(I: Instances, c: CharState) {
     const q = qMul(rootQ, qX(1.25));
     T0 = { p: add(hip, qRot(q, [0, -0.95, 0])), q };
   }
-  const moving = c.speed > 0.4 && c.onGround && !dead;
+  // swimming: the body lies forward in the water, head and shoulders at the
+  // surface (they stay where the upright body has them), legs trailing
+  const swim = c.inWater && c.mode === 3 && !dead;
+  const swimming = swim && c.speed > 0.5;
+  if (swim) {
+    const tilt = swimming ? 1.0 : 0.3;
+    const chest: V3 = [c.x, c.y + 1.32 + Math.sin(c.t * 2.3) * 0.035, c.z];
+    const q = qMul(qMul(rootQ, qX(tilt)), qZ(swimming ? Math.sin(c.t * 4.6) * 0.18 : 0));
+    T0 = { p: add(chest, qRot(q, [0, -1.32, 0])), q };
+  }
+  const moving = c.speed > 0.4 && c.onGround && !dead && !swim;
   const amp = moving ? Math.min(c.speed / 5, 1.35) * 0.62 : 0;
   const sprint = c.speed > 6.2;
   // crouched: knees bent, back nearly upright so the head stays over the
   // body axis where the server's head hitbox is
   let lean = crouch ? 0.15 : sprint ? 0.22 : 0.05;
-  if (dead || freefall || para) lean = 0;
+  if (dead || freefall || para || swim) lean = 0;
 
   const hips = child(T0, [0, hipH, 0], qIdent());
   const torso = child(hips, [0, 0.02, 0], qX(lean));
@@ -194,7 +204,12 @@ export function emitCharacter(I: Instances, c: CharState) {
   // legs
   for (const s of [1, -1]) {
     let thigh = 0, knee = 0;
-    if (crouch) {
+    if (swim) {
+      // flutter kick, or a slow scissor while treading water
+      const ph = c.t * (swimming ? 9.2 : 3.4) + (s > 0 ? 0 : Math.PI);
+      thigh = Math.sin(ph) * (swimming ? 0.38 : 0.3) + (swimming ? 0.1 : -0.15);
+      knee = (swimming ? 0.25 : 0.5) + Math.max(0, Math.sin(ph + 0.9)) * 0.45;
+    } else if (crouch) {
       thigh = -1.45;
       knee = 2.1;
       if (moving) thigh += Math.sin(c.phase + (s > 0 ? 0 : Math.PI)) * 0.25;
@@ -227,13 +242,24 @@ export function emitCharacter(I: Instances, c: CharState) {
   }
 
   // arms + weapon
-  const hasGun = c.weapon > 0 && !dead;
+  const hasGun = c.weapon > 0 && !dead && !swim;
   const armPitch = -Math.PI / 2 - pitch * 0.85 - lean;
   for (const s of [1, -1]) {
     let q: Q;
     let elbow = -0.25;
     if (dead) {
       q = qZ(s * 0.5);
+    } else if (swimming) {
+      // front crawl: one arm reaches forward and pulls through while the
+      // other swings back over the water
+      const a = c.t * 4.6 + (s > 0 ? 0 : Math.PI);
+      const reach = -Math.PI / 2 - 1.15 * Math.sin(a) - 0.75;
+      q = qMul(qZ(s * (0.15 + 0.35 * Math.max(0, Math.cos(a)))), qX(reach));
+      elbow = -0.15 - 0.75 * Math.max(0, Math.cos(a));
+    } else if (swim) {
+      // treading water: arms out, sculling
+      q = qMul(qZ(s * 1.05), qX(-0.75 + Math.sin(c.t * 3.4 + s) * 0.3));
+      elbow = -0.55;
     } else if (freefall) {
       q = qMul(qZ(s * 1.25), qX(-0.3));
       elbow = -0.2;

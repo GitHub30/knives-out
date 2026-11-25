@@ -55,6 +55,8 @@ export interface FrameView {
   smoke: Instances;
   /** Soft smoke and fire particles (optional). */
   puffs?: Puffs;
+  /** Window panes as thin boxes (optional). */
+  glass?: Instances;
 }
 
 /** Billboard particle kinds. */
@@ -204,6 +206,8 @@ export class Renderer {
   private linear: GPUSampler;
   private aniso: GPUSampler;
   private depthTex: GPUTexture | null = null;
+  private bglDepth!: GPUBindGroupLayout;
+  private bgDepth: GPUBindGroup | null = null;
   private hdrTex: GPUTexture | null = null;
   private bloomTex: GPUTexture[] = [];
   private offTex: GPUTexture | null = null;
@@ -388,6 +392,8 @@ export class Renderer {
     const bloom = mod(BLOOM_WGSL), post = mod(POST_WGSL), mip = mod(MIP_WGSL), ao = mod(AO_WGSL);
     const layoutAo = d.createPipelineLayout({ bindGroupLayouts: [this.bglAo] });
     const layoutMain = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain] });
+    this.bglDepth = d.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } }] });
+    const layoutPuff = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglDepth] });
     const layoutShadow = d.createPipelineLayout({ bindGroupLayouts: [this.bglShadow] });
     const layoutWater = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglWater] });
     const layoutModel = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglMat] });
@@ -517,8 +523,15 @@ export class Renderer {
         primitive: tri,
         depthStencil: depthMain(false),
       }),
-      puff: d.createRenderPipeline({
+      glass: d.createRenderPipeline({
         layout: layoutMain,
+        vertex: { module: box, entryPoint: 'vs', buffers: boxVB },
+        fragment: { module: box, entryPoint: 'fs_glass', targets: target(alpha) },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: depthMain(false),
+      }),
+      puff: d.createRenderPipeline({
+        layout: layoutPuff,
         vertex: {
           module: puff,
           entryPoint: 'vs',
@@ -750,6 +763,7 @@ export class Renderer {
     this.depthTex = d.createTexture({ size: [w, h], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     this.aoTex?.destroy();
     this.aoTex = d.createTexture({ size: [Math.max(1, w >> 1), Math.max(1, h >> 1)], format: 'r8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.bgDepth = d.createBindGroup({ layout: this.bglDepth, entries: [{ binding: 0, resource: this.depthTex.createView() }] });
     this.bgAo = d.createBindGroup({ layout: this.bglAo, entries: [{ binding: 0, resource: { buffer: this.uniform } }, { binding: 1, resource: this.depthTex.createView() }] });
     this.hdrTex = d.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     this.bloomTex = [];
@@ -1059,15 +1073,7 @@ export class Renderer {
       }
     }
     drawShapes(this.pipes.smoke, smokeBufs, v.smoke, true);
-    if (v.puffs && v.puffs.count) {
-      const pb = this.instBuffer('puffs', v.puffs.sorted(v.camPos), v.puffs.count * 32);
-      if (pb) {
-        pass.setPipeline(this.pipes.puff);
-        pass.setVertexBuffer(0, pb);
-        pass.draw(6, v.puffs.count);
-        draws++;
-      }
-    }
+    if (v.glass && v.glass.count) drawShapes(this.pipes.glass, this.shapeBuffers('glass', v.glass), v.glass, true);
     if (v.zone.visible) {
       pass.setPipeline(this.pipes.zone);
       pass.setVertexBuffer(0, this.zoneVB);
@@ -1075,6 +1081,24 @@ export class Renderer {
     }
     drawShapes(this.pipes.glow, glowBufs, v.glow, true);
     pass.end();
+    // ---------------- soft particles: their own pass, so they can read the
+    // scene depth and fade out where they meet the ground and the walls
+    if (v.puffs && v.puffs.count && this.bgDepth) {
+      const pb = this.instBuffer('puffs', v.puffs.sorted(v.camPos), v.puffs.count * 32);
+      if (pb) {
+        const pp = enc.beginRenderPass({
+          colorAttachments: [{ view: this.hdrTex.createView(), loadOp: 'load', storeOp: 'store' }],
+          depthStencilAttachment: { view: this.depthTex.createView(), depthReadOnly: true },
+        });
+        pp.setBindGroup(0, this.bgMain);
+        pp.setBindGroup(1, this.bgDepth);
+        pp.setPipeline(this.pipes.puff);
+        pp.setVertexBuffer(0, pb);
+        pp.draw(6, v.puffs.count);
+        pp.end();
+        draws++;
+      }
+    }
     this.stats = { tris: Math.round(tris), draws, width: this.width, height: this.height, scale: this.dyn };
 
     // ---------------- ambient occlusion (white when off)
