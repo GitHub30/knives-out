@@ -271,6 +271,13 @@ fn sway(p: vec3f, m: f32) -> vec3f {
   let pebble = smoothstep(0.62, 0.8, vnoise(p * 23.0 + 3.0)) * near;
   let grit = vec3f(0.27, 0.235, 0.175) * (0.7 + 0.5 * agg) * mix(1.0, 0.62, pebble * edge);
   asphalt = mix(asphalt, grit, dust * 0.62);
+  // rain water standing in the hollows of the paving, and the damp around it
+  let pudN = fbm2(p * 0.085 + 91.0) + (a1 - 0.5) * 0.012 * near;
+  let level = step(0.8, pv) * smoothstep(0.99, 0.998, n.y);
+  let damp = smoothstep(0.57, 0.64, pudN) * level;
+  let pud = smoothstep(0.65, 0.668, pudN) * level;
+  asphalt = mix(asphalt, asphalt * 0.5, damp * 0.8);
+  asphalt = mix(asphalt, asphalt * 0.55, pud);
   albedo = mix(albedo, asphalt, pv);
   // wet sand line + underwater darkening
   let wet = 1.0 - smoothstep(wl - 2.5, wl + 0.6, i.wp.y);
@@ -297,14 +304,19 @@ fn sway(p: vec3f, m: f32) -> vec3f {
   var s: Surface;
   s.albedo = albedo;
   s.n = n;
-  let paveRough = mix(mix(0.86 - 0.14 * stone, 0.62, tar * 0.6), 0.4, oil * 0.8) + dust * 0.1;
-  s.rough = mix(mix(0.92, 0.8, rock), paveRough, pv) - wet * 0.45;
+  let paveRough = mix(mix(mix(0.86 - 0.14 * stone, 0.62, tar * 0.6), 0.4, oil * 0.8) + dust * 0.1, 0.42, damp * 0.8);
+  s.rough = mix(mix(mix(0.92, 0.8, rock), paveRough, pv) - wet * 0.45, 0.03, pud);
+  // still water lies flat, with a breath of wind on it
+  let rip = vec2f(vnoise(p * 2.3 + F.camPos.w * 0.35), vnoise(p * 2.3 + 40.0 - F.camPos.w * 0.3)) - 0.5;
+  n = normalize(mix(n, vec3f(rip.x * 0.012, 1.0, rip.y * 0.012), pud));
+  s.n = n;
   s.metal = 0.0;
-  s.ao = mix(0.75 + 0.25 * fine, 1.0 - 0.55 * crack, pv);
+  s.ao = mix(mix(0.75 + 0.25 * fine, 1.0 - 0.55 * crack, pv), 1.0, pud);
   s.trans = 0.0;
   var c = shade(s, i.wp);
   c = applyFog(c, i.wp);
-  return vec4f(c, 1.0);
+  // (alpha below one marks mirror-like water for the reflection pass)
+  return vec4f(c, 1.0 - pud * (1.0 - smoothstep(90.0, 140.0, dist)));
 }
 
 @fragment fn fs_props(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
@@ -1257,6 +1269,68 @@ fn wpos(px: vec2i, dim: vec2f) -> vec4f {
   }
   let fade = 1.0 - smoothstep(60.0, 90.0, dist);
   return vec4f(1.0 - occ / 10.0 * 0.85 * fade);
+}
+`;
+
+/** Screen-space reflections on standing water: pixels whose alpha is below one
+ * mirror what the scene shows along the reflected ray (the sky is already there). */
+export const SSR_WGSL = /* wgsl */ `
+${FRAME}
+${FULLSCREEN}
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var depthTex: texture_depth_2d;
+@group(0) @binding(2) var src: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  let dim = vec2f(textureDimensions(depthTex));
+  let px = vec2i(i.uv * dim);
+  let me = textureLoad(src, px, 0);
+  let mask = clamp(1.0 - me.a, 0.0, 1.0);
+  let d0 = textureLoad(depthTex, px, 0);
+  if (mask < 0.02 || d0 <= 0.0) { discard; }
+  let w0 = F.invViewProj * vec4f(i.uv.x * 2.0 - 1.0, 1.0 - i.uv.y * 2.0, d0, 1.0);
+  let P = w0.xyz / w0.w;
+  let V = normalize(P - F.camPos.xyz);
+  let R = reflect(V, vec3f(0.0, 1.0, 0.0));
+  let fres = 0.02 + 0.98 * pow(1.0 - clamp(-V.y, 0.0, 1.0), 5.0);
+  var t = 0.25;
+  var prev = 0.0;
+  var hit = 0.0;
+  var huv = vec2f(0.0);
+  for (var k = 0; k < 28; k++) {
+    prev = t;
+    t = t * 1.27 + 0.05;
+    let cl = F.viewProj * vec4f(P + R * t, 1.0);
+    if (cl.w <= 0.0) { break; }
+    let ndc = cl.xyz / cl.w;
+    let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { break; }
+    let td = textureLoad(depthTex, vec2i(uv * dim), 0);
+    if (td > ndc.z) {
+      // the scene is in front of the ray here: close in on where it crossed
+      var lo = prev;
+      var hi = t;
+      for (var b = 0; b < 5; b++) {
+        let mid = (lo + hi) * 0.5;
+        let c2 = F.viewProj * vec4f(P + R * mid, 1.0);
+        let n2 = c2.xyz / c2.w;
+        let u2 = vec2f(n2.x * 0.5 + 0.5, 0.5 - n2.y * 0.5);
+        if (textureLoad(depthTex, vec2i(u2 * dim), 0) > n2.z) { hi = mid; } else { lo = mid; }
+      }
+      let c3 = F.viewProj * vec4f(P + R * hi, 1.0);
+      let n3 = c3.xyz / c3.w;
+      huv = vec2f(n3.x * 0.5 + 0.5, 0.5 - n3.y * 0.5);
+      let t3 = textureLoad(depthTex, vec2i(huv * dim), 0);
+      // not something far in front of the ray (it would be smeared down the water)
+      let gap = (1.0 / max(n3.z, 1e-7) - 1.0 / max(t3, 1e-7)) * max(n3.z, 1e-7);
+      hit = 1.0 - smoothstep(0.03, 0.12, gap);
+      break;
+    }
+  }
+  if (hit <= 0.01) { discard; }
+  let edge = smoothstep(0.0, 0.06, huv.x) * smoothstep(1.0, 0.94, huv.x) * smoothstep(0.0, 0.06, huv.y) * smoothstep(1.0, 0.94, huv.y);
+  let c = textureSampleLevel(src, samp, huv, 0.0).rgb;
+  return vec4f(c, mask * hit * edge * clamp(fres * 1.6 + 0.12, 0.0, 1.0));
 }
 `;
 

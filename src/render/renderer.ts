@@ -2,7 +2,7 @@
 // models, sky, water, zone wall) lit by a sun with two shadow cascades, then
 // bloom + tonemap + FXAA into the swap chain.
 
-import { AO_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_SHADOW_WGSL, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { AO_WGSL, SSR_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_SHADOW_WGSL, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { HELI_BLADE_CONE, HELI_BLADE_REST, HELI_GEAR, HELI_GEAR_TRAVEL, HELI_ROTORS, HELI_STRIDE } from './heli';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
@@ -212,6 +212,9 @@ export class Renderer {
   private bglPost: GPUBindGroupLayout;
   private bglAo: GPUBindGroupLayout;
   private bgAo: GPUBindGroup | null = null;
+  private bglSsr!: GPUBindGroupLayout;
+  private bgSsr: GPUBindGroup | null = null;
+  private hdrCopy: GPUTexture | null = null;
   private aoTex: GPUTexture | null = null;
   private bgShadow: GPUBindGroup[] = [];
   private bgMain!: GPUBindGroup;
@@ -420,6 +423,15 @@ export class Renderer {
     const puff = mod(PUFF_WGSL);
     const bloom = mod(BLOOM_WGSL), post = mod(POST_WGSL), mip = mod(MIP_WGSL), ao = mod(AO_WGSL);
     const layoutAo = d.createPipelineLayout({ bindGroupLayouts: [this.bglAo] });
+    this.bglSsr = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ],
+    });
+    const layoutSsr = d.createPipelineLayout({ bindGroupLayouts: [this.bglSsr] });
     const layoutMain = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain] });
     this.bglDepth = d.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } }] });
     const layoutPuff = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglDepth] });
@@ -663,6 +675,16 @@ export class Renderer {
       bloomDown: fullscreen(bloom, 'fs_down', layoutTex, HDR),
       post: fullscreen(post, 'fs', layoutPost, this.format),
       ao: fullscreen(ao, 'fs', layoutAo, 'r8unorm'),
+      ssr: d.createRenderPipeline({
+        layout: layoutSsr,
+        vertex: { module: mod(SSR_WGSL), entryPoint: 'vs' },
+        fragment: {
+          module: mod(SSR_WGSL),
+          entryPoint: 'fs',
+          targets: [{ format: HDR, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' } } }],
+        },
+        primitive: { topology: 'triangle-list' },
+      }),
       mipLinear: fullscreen(mip, 'fs', layoutTex, 'rgba8unorm'),
       mipSrgb: fullscreen(mip, 'fs', layoutTex, 'rgba8unorm-srgb'),
     };
@@ -963,7 +985,18 @@ export class Renderer {
     this.aoTex = d.createTexture({ size: [Math.max(1, w >> 1), Math.max(1, h >> 1)], format: 'r8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     this.bgDepth = d.createBindGroup({ layout: this.bglDepth, entries: [{ binding: 0, resource: this.depthTex.createView() }] });
     this.bgAo = d.createBindGroup({ layout: this.bglAo, entries: [{ binding: 0, resource: { buffer: this.uniform } }, { binding: 1, resource: this.depthTex.createView() }] });
-    this.hdrTex = d.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.hdrTex = d.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
+    this.hdrCopy?.destroy();
+    this.hdrCopy = d.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING });
+    this.bgSsr = d.createBindGroup({
+      layout: this.bglSsr,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniform } },
+        { binding: 1, resource: this.depthTex.createView() },
+        { binding: 2, resource: this.hdrCopy.createView() },
+        { binding: 3, resource: this.linear },
+      ],
+    });
     this.bloomTex = [];
     for (let l = 1; l <= 4; l++) {
       this.bloomTex.push(d.createTexture({ size: [Math.max(1, w >> l), Math.max(1, h >> l)], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }));
@@ -1342,6 +1375,16 @@ export class Renderer {
     }
     drawShapes(this.pipes.glow, glowBufs, v.glow, true);
     pass.end();
+    // ---------------- reflections on standing water (it mirrors the sky without this)
+    if (this.quality.ao && this.hdrCopy && this.bgSsr) {
+      enc.copyTextureToTexture({ texture: this.hdrTex }, { texture: this.hdrCopy }, [this.width, this.height]);
+      const rp = enc.beginRenderPass({ colorAttachments: [{ view: this.hdrTex.createView(), loadOp: 'load', storeOp: 'store' }] });
+      rp.setPipeline(this.pipes.ssr);
+      rp.setBindGroup(0, this.bgSsr);
+      rp.draw(3);
+      rp.end();
+      draws++;
+    }
     // ---------------- soft particles: their own pass, so they can read the
     // scene depth and fade out where they meet the ground and the walls
     if (v.puffs && v.puffs.count && this.bgDepth) {
