@@ -27,9 +27,9 @@ export interface Quality {
 
 export const QUALITY_PRESETS: Record<'low' | 'medium' | 'high', Quality> = {
   low: { shadowSize: 1024, scale: 0.8, maxDpr: 1.25, maxPixels: 1280 * 720, drawDist: 380, bloom: false, ao: false, taa: false, grass: 0 },
-  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true, taa: true, grass: 1 },
+  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true, taa: false, grass: 1 },
   // 1920 x 1080 internal resolution at most
-  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true, taa: true, grass: 2 },
+  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true, taa: false, grass: 2 },
 };
 
 export interface WorldMeshes {
