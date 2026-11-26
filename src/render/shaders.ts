@@ -290,7 +290,9 @@ fn sway(p: vec3f, m: f32) -> vec3f {
   n = bump(n, vec3f((hx - h0) / e, 0.0, (hz - h0) / e), 0.09 * detail * (1.0 - 0.9 * pv));
   // the paving's own relief: stones stand proud, cracks and seams cut in
   {
-    let ph = (agg * 0.5 + stone * 0.35 + pebble * dust * 0.5 - crack * 1.6 - tar * 0.1) * 0.012;
+    // (close up only: further off it would only glitter)
+    let near2 = 1.0 - smoothstep(5.0, 22.0, dist);
+    let ph = (agg * 0.5 + stone * 0.35 + pebble * dust * 0.5 - crack * 1.6 - tar * 0.1) * 0.007 * near2;
     let dpx = dpdx(i.wp);
     let dpy = dpdy(i.wp);
     let dhx = dpdx(ph);
@@ -304,7 +306,7 @@ fn sway(p: vec3f, m: f32) -> vec3f {
   var s: Surface;
   s.albedo = albedo;
   s.n = n;
-  let paveRough = mix(mix(mix(0.86 - 0.14 * stone, 0.62, tar * 0.6), 0.4, oil * 0.8) + dust * 0.1, 0.42, damp * 0.8);
+  let paveRough = mix(mix(mix(0.88 - 0.1 * stone * near, 0.66, tar * 0.6), 0.4, oil * 0.8) + dust * 0.1, 0.42, damp * 0.8);
   s.rough = mix(mix(mix(0.92, 0.8, rock), paveRough, pv) - wet * 0.45, 0.03, pud);
   // still water lies flat, with a breath of wind on it
   let rip = vec2f(vnoise(p * 2.3 + F.camPos.w * 0.35), vnoise(p * 2.3 + 40.0 - F.camPos.w * 0.3)) - 0.5;
@@ -1334,6 +1336,62 @@ ${FULLSCREEN}
 }
 `;
 
+/** Temporal anti-aliasing: the frame is drawn a fraction of a pixel off each
+ * time, and blended with the last result where that shows the same surface
+ * (found again through the depth buffer, kept honest by the colours around). */
+export const TAA_WGSL = /* wgsl */ `
+${FRAME}
+${FULLSCREEN}
+struct Prev { viewProj: mat4x4f, info: vec4f };
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var depthTex: texture_depth_2d;
+@group(0) @binding(2) var cur: texture_2d<f32>;
+@group(0) @binding(3) var hist: texture_2d<f32>;
+@group(0) @binding(4) var samp: sampler;
+@group(0) @binding(5) var<uniform> P: Prev;
+fn squash(c: vec3f) -> vec3f { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+fn unsquash(c: vec3f) -> vec3f { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-3); }
+@fragment fn fs(i: VOut) -> @location(0) vec4f {
+  let dim = vec2i(textureDimensions(cur));
+  let px = clamp(vec2i(i.uv * vec2f(dim)), vec2i(0), dim - vec2i(1));
+  let c = squash(max(textureLoad(cur, px, 0).rgb, vec3f(0.0)));
+  if (P.info.x < 0.5) { return vec4f(unsquash(c), 1.0); }
+  // what the neighbours show bounds what this pixel can have been
+  var mn = c;
+  var mx = c;
+  var nearest = textureLoad(depthTex, px, 0);
+  for (var y = -1; y <= 1; y++) {
+    for (var x = -1; x <= 1; x++) {
+      if (x == 0 && y == 0) { continue; }
+      let q = clamp(px + vec2i(x, y), vec2i(0), dim - vec2i(1));
+      let s = squash(max(textureLoad(cur, q, 0).rgb, vec3f(0.0)));
+      mn = min(mn, s);
+      mx = max(mx, s);
+      nearest = max(nearest, textureLoad(depthTex, q, 0));
+    }
+  }
+  // where this surface was on the screen a frame ago (edges follow the nearer side)
+  // (the result lives on the unshifted pixel grid: undo this frame's shift before looking back)
+  let w = F.invViewProj * vec4f(i.uv.x * 2.0 - 1.0 + P.info.y, 1.0 - i.uv.y * 2.0 + P.info.z, max(nearest, 1e-6), 1.0);
+  let pc = P.viewProj * vec4f(w.xyz / w.w, 1.0);
+  let puv = vec2f(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+  if (pc.w <= 0.0 || puv.x < 0.0 || puv.y < 0.0 || puv.x > 1.0 || puv.y > 1.0) { return vec4f(unsquash(c), 1.0); }
+  // pull the history towards what is there now along a straight line (clamping
+  // each channel on its own would invent colours)
+  let h0 = squash(max(textureSampleLevel(hist, samp, puv, 0.0).rgb, vec3f(0.0)));
+  let mid = (mn + mx) * 0.5;
+  let ext = (mx - mn) * 0.5 + vec3f(1e-4);
+  let off = h0 - mid;
+  let q3 = abs(off) / ext;
+  let over = max(q3.x, max(q3.y, q3.z));
+  let h = mid + off / max(over, 1.0);
+  // trust the past less the faster the image moves
+  let speed = length((puv - i.uv) * vec2f(dim));
+  let k = mix(0.1, 0.3, clamp(speed / 24.0, 0.0, 1.0));
+  return vec4f(unsquash(mix(h, c, k)), 1.0);
+}
+`;
+
 export const POST_WGSL = /* wgsl */ `
 ${FRAME}
 ${FULLSCREEN}
@@ -1364,8 +1422,11 @@ fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
   let ts = F.post.xy;
   let uv = i.uv;
+  // (ten is added to the bloom strength when the frame is already temporally anti-aliased)
+  let taaOn = F.post.z >= 10.0;
+  let bloomK = F.post.z - select(0.0, 10.0, taaOn);
   let glow = (textureSampleLevel(b0, samp, uv, 0.0).rgb * 0.3 + textureSampleLevel(b1, samp, uv, 0.0).rgb * 0.3
-    + textureSampleLevel(b2, samp, uv, 0.0).rgb * 0.25 + textureSampleLevel(b3, samp, uv, 0.0).rgb * 0.15) * F.post.z;
+    + textureSampleLevel(b2, samp, uv, 0.0).rgb * 0.25 + textureSampleLevel(b3, samp, uv, 0.0).rgb * 0.15) * bloomK;
   // ambient occlusion (half resolution; four taps blur its sampling pattern)
   let at = ts * 1.5;
   let ao = (textureSampleLevel(aoTex, samp, uv + at * vec2f(-1.0, -1.0), 0.0).r + textureSampleLevel(aoTex, samp, uv + at * vec2f(1.0, -1.0), 0.0).r
@@ -1385,7 +1446,10 @@ fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
   let lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
   let lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
   var c = cM;
-  if (lMax - lMin > max(0.04, lMax * 0.125)) {
+  if (taaOn) {
+    // no second blur on top: give back a little of the crispness instead
+    c = clamp(cM + (cM - (cNW + cNE + cSW + cSE) * 0.25) * 0.2, vec3f(0.0), vec3f(1.0));
+  } else if (lMax - lMin > max(0.04, lMax * 0.125)) {
     var dir = vec2f(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
     let reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
     let rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);

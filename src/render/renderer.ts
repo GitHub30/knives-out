@@ -2,7 +2,7 @@
 // models, sky, water, zone wall) lit by a sun with two shadow cascades, then
 // bloom + tonemap + FXAA into the swap chain.
 
-import { AO_WGSL, SSR_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_SHADOW_WGSL, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
+import { AO_WGSL, SSR_WGSL, TAA_WGSL, BLOOM_WGSL, BOX_SHADOW_WGSL, BOX_WGSL, LIT_SHADOW_WGSL, LIT_WGSL, MIP_WGSL, MODEL_SHADOW_WGSL, GRASS_FAR, GRASS_NEAR, GRASS_SHADOW_WGSL, GRASS_WGSL, MODEL_WGSL, POST_WGSL, PUFF_WGSL, SKY_WGSL, WATER_WGSL, ZONE_WGSL } from './shaders';
 import { HELI_BLADE_CONE, HELI_BLADE_REST, HELI_GEAR, HELI_GEAR_TRAVEL, HELI_ROTORS, HELI_STRIDE } from './heli';
 import { aabbVisible, cross, frustumPlanes, lookAt, mul, norm, ortho, qAxis, qMul, qRot, type M4, type Q, type V3 } from './math';
 import { Instances, INSTANCE_STRIDE, MAX_SHAPES } from './instances';
@@ -21,13 +21,15 @@ export interface Quality {
   grass: number;
   bloom: boolean;
   ao: boolean;
+  /** Temporal anti-aliasing. */
+  taa: boolean;
 }
 
 export const QUALITY_PRESETS: Record<'low' | 'medium' | 'high', Quality> = {
-  low: { shadowSize: 1024, scale: 0.8, maxDpr: 1.25, maxPixels: 1280 * 720, drawDist: 380, bloom: false, ao: false, grass: 0 },
-  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true, grass: 1 },
+  low: { shadowSize: 1024, scale: 0.8, maxDpr: 1.25, maxPixels: 1280 * 720, drawDist: 380, bloom: false, ao: false, taa: false, grass: 0 },
+  medium: { shadowSize: 2048, scale: 1, maxDpr: 1.5, maxPixels: 1600 * 900, drawDist: 520, bloom: true, ao: true, taa: true, grass: 1 },
   // 1920 x 1080 internal resolution at most
-  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true, grass: 2 },
+  high: { shadowSize: 2048, scale: 1, maxDpr: 2, maxPixels: 1920 * 1080, drawDist: 640, bloom: true, ao: true, taa: true, grass: 2 },
 };
 
 export interface WorldMeshes {
@@ -215,6 +217,18 @@ export class Renderer {
   private bglSsr!: GPUBindGroupLayout;
   private bgSsr: GPUBindGroup | null = null;
   private hdrCopy: GPUTexture | null = null;
+  // temporal anti-aliasing: two results that take turns as history and target
+  private bglTaa!: GPUBindGroupLayout;
+  private taaTex: GPUTexture[] = [];
+  private bgTaa: GPUBindGroup[] = [];
+  private bgBloomTaa: GPUBindGroup[] = [];
+  private bgPostTaa: GPUBindGroup[] = [];
+  private taaPrev!: GPUBuffer;
+  private taaData = new Float32Array(20);
+  private taaValid = false;
+  private taaFrame = 0;
+  private taaCam: V3 = [0, 0, 0];
+  private taaTime = 0;
   private aoTex: GPUTexture | null = null;
   private bgShadow: GPUBindGroup[] = [];
   private bgMain!: GPUBindGroup;
@@ -432,6 +446,17 @@ export class Renderer {
       ],
     });
     const layoutSsr = d.createPipelineLayout({ bindGroupLayouts: [this.bglSsr] });
+    this.bglTaa = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      ],
+    });
+    this.taaPrev = d.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const layoutMain = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain] });
     this.bglDepth = d.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } }] });
     const layoutPuff = d.createPipelineLayout({ bindGroupLayouts: [this.bglMain, this.bglDepth] });
@@ -675,6 +700,7 @@ export class Renderer {
       bloomDown: fullscreen(bloom, 'fs_down', layoutTex, HDR),
       post: fullscreen(post, 'fs', layoutPost, this.format),
       ao: fullscreen(ao, 'fs', layoutAo, 'r8unorm'),
+      taa: fullscreen(mod(TAA_WGSL), 'fs', d.createPipelineLayout({ bindGroupLayouts: [this.bglTaa] }), HDR),
       ssr: d.createRenderPipeline({
         layout: layoutSsr,
         vertex: { module: mod(SSR_WGSL), entryPoint: 'vs' },
@@ -1014,6 +1040,36 @@ export class Renderer {
         { binding: 7, resource: this.aoTex.createView() },
       ],
     });
+    for (const t of this.taaTex) t.destroy();
+    this.taaTex = [0, 1].map(() => d.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }));
+    this.taaValid = false;
+    // [k]: history is taaTex[k], the result goes to taaTex[1 - k]
+    this.bgTaa = [0, 1].map((k) =>
+      d.createBindGroup({
+        layout: this.bglTaa,
+        entries: [
+          { binding: 0, resource: { buffer: this.uniform } },
+          { binding: 1, resource: this.depthTex!.createView() },
+          { binding: 2, resource: this.hdrTex!.createView() },
+          { binding: 3, resource: this.taaTex[k].createView() },
+          { binding: 4, resource: this.linear },
+          { binding: 5, resource: { buffer: this.taaPrev } },
+        ],
+      }),
+    );
+    this.bgBloomTaa = this.taaTex.map((t) => texBg(t));
+    this.bgPostTaa = this.taaTex.map((t) =>
+      d.createBindGroup({
+        layout: this.bglPost,
+        entries: [
+          { binding: 0, resource: { buffer: this.uniform } },
+          { binding: 1, resource: t.createView() },
+          { binding: 2, resource: this.linear },
+          ...this.bloomTex.map((b, i) => ({ binding: 3 + i, resource: b.createView() })),
+          { binding: 7, resource: this.aoTex!.createView() },
+        ],
+      }),
+    );
   }
 
   get aspect() {
@@ -1097,9 +1153,34 @@ export class Renderer {
     const lightVP = [this.lightMatrix(v.shadowCenter, CASCADE_R[0]), this.lightMatrix(v.shadowCenter, CASCADE_R[1])];
     const u = this.uData;
     u.set(v.viewProj, 0);
+    // temporal anti-aliasing: draw a fraction of a pixel off, differently each frame
+    const taa = this.quality.taa;
+    let jx = 0, jy = 0;
+    if (taa) {
+      const halton = (i: number, b: number) => {
+        let f = 1, r = 0;
+        while (i > 0) {
+          f /= b;
+          r += f * (i % b);
+          i = Math.floor(i / b);
+        }
+        return r;
+      };
+      const n = (this.taaFrame++ % 8) + 1;
+      jx = ((halton(n, 2) - 0.5) * 2) / this.width;
+      jy = ((halton(n, 3) - 0.5) * 2) / this.height;
+      for (let c = 0; c < 4; c++) {
+        u[c * 4] += jx * u[c * 4 + 3];
+        u[c * 4 + 1] += jy * u[c * 4 + 3];
+      }
+    }
     u.set(lightVP[0], 16);
     u.set(lightVP[1], 32);
     u.set(v.invViewProj, 48);
+    if (taa) {
+      // (the inverse of the shifted matrix: un-shift first)
+      for (let r = 0; r < 4; r++) u[48 + 12 + r] -= jx * u[48 + r] + jy * u[48 + 4 + r];
+    }
     u.set([v.camPos[0], v.camPos[1], v.camPos[2], v.time], 64);
     u.set([SUN[0], SUN[1], SUN[2], shadowsOn ? 1 : 0], 68);
     const lin = (c: number) => Math.pow(c, 2.2);
@@ -1110,7 +1191,7 @@ export class Renderer {
     u.set([1 / Math.max(1, this.quality.shadowSize), this.mapSize, v.hurt, this.waterLevel], 88);
     u.set([v.zone.cx, v.zone.cz, Math.max(0.01, v.zone.r), v.zone.visible ? 1 : 0], 92);
     u.set(v.focus ? [v.focus[0], v.focus[1], v.focus[2], 1] : [0, 0, 0, 0], 96);
-    u.set([1 / this.width, 1 / this.height, this.quality.bloom ? 0.55 : 0, 0.62], 100);
+    u.set([1 / this.width, 1 / this.height, (this.quality.bloom ? 0.55 : 0) + (this.quality.taa ? 10 : 0), 0.62], 100);
     // view rays for the sky, worked out here in double precision (the shader
     // would lose them to cancellation next to the camera)
     {
@@ -1405,6 +1486,29 @@ export class Renderer {
     }
     this.stats = { tris: Math.round(tris), draws, width: this.width, height: this.height, scale: this.dyn };
 
+    // ---------------- temporal anti-aliasing: blend with the last result
+    const tk = this.taaFrame & 1;
+    if (taa && this.bgTaa.length === 2) {
+      // a cut to another view (or a long gap) starts afresh
+      const now = performance.now();
+      const cut = Math.hypot(v.camPos[0] - this.taaCam[0], v.camPos[1] - this.taaCam[1], v.camPos[2] - this.taaCam[2]) > 6 || now - this.taaTime > 1500;
+      this.taaCam = [v.camPos[0], v.camPos[1], v.camPos[2]];
+      this.taaTime = now;
+      if (cut) this.taaValid = false;
+      this.taaData.set(this.taaValid ? this.taaData.subarray(0, 16) : v.viewProj, 0);
+      this.taaData[16] = this.taaValid ? 1 : 0;
+      this.taaData[17] = jx;
+      this.taaData[18] = jy;
+      d.queue.writeBuffer(this.taaPrev, 0, this.taaData);
+      const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.taaTex[1 - tk].createView(), loadOp: 'clear', storeOp: 'store' }] });
+      tp.setPipeline(this.pipes.taa);
+      tp.setBindGroup(0, this.bgTaa[tk]);
+      tp.draw(3);
+      tp.end();
+      this.taaData.set(v.viewProj, 0);
+      this.taaValid = true;
+    } else this.taaValid = false;
+
     // ---------------- ambient occlusion (white when off)
     {
       const ap = enc.beginRenderPass({ colorAttachments: [{ view: this.aoTex!.createView(), clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
@@ -1421,7 +1525,7 @@ export class Renderer {
       for (let l = 0; l < 4; l++) {
         const bp = enc.beginRenderPass({ colorAttachments: [{ view: this.bloomTex[l].createView(), loadOp: 'clear', storeOp: 'store' }] });
         bp.setPipeline(l === 0 ? this.pipes.bloomFirst : this.pipes.bloomDown);
-        bp.setBindGroup(0, this.bgBloom[l]);
+        bp.setBindGroup(0, l === 0 && taa && this.taaValid ? this.bgBloomTaa[1 - tk] : this.bgBloom[l]);
         bp.draw(3);
         bp.end();
       }
@@ -1437,7 +1541,7 @@ export class Renderer {
     const swap = capTex ? capTex.createView() : this.ctx ? this.ctx.getCurrentTexture().createView() : this.offTex!.createView();
     const pp = enc.beginRenderPass({ colorAttachments: [{ view: swap, loadOp: 'clear', storeOp: 'store' }] });
     pp.setPipeline(this.pipes.post);
-    pp.setBindGroup(0, this.bgPost!);
+    pp.setBindGroup(0, taa && this.taaValid ? this.bgPostTaa[1 - tk] : this.bgPost!);
     pp.draw(3);
     pp.end();
 
