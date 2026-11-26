@@ -190,8 +190,12 @@ export class Hud {
     this.zoneV = el('div', 'zone-vignette', root);
     this.fullmap = el('div', 'fullmap', root);
     this.fullCanvas = el('canvas', '', this.fullmap);
-    const closeBtn = el('button', 'fullmap-close', this.fullmap, '✕');
-    closeBtn.addEventListener('click', () => this.onMapClose());
+    // a tap anywhere on the map screen closes it
+    this.fullmap.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.onMapClose();
+    });
     this.spect = el('div', 'spect', root);
     el('span', 'spect-k', this.spect, '観戦中');
     this.spectName = el('span', 'spect-name', this.spect);
