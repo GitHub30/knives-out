@@ -2243,6 +2243,29 @@ export class Game {
       S.push(t.p, t.q, [t.w, 0.02, t.len], rgba(0x0b0b0c, Math.round(255 * t.a * Math.min(1, (TRACK_LIFE - age) / 12))));
     }
     this.tracks = keep.length > 1600 ? keep.slice(keep.length - 1600) : keep;
+    // contact shade under whatever stands on the ground (the sun's shadow alone leaves it floating)
+    const BLOB = surf(0, 1);
+    const blob = (x: number, y: number, z: number, yaw: number, w: number, l: number, a: number) => {
+      if ((x - eye[0]) ** 2 + (z - eye[2]) ** 2 > 100 * 100) return;
+      S.push([x, y + 0.035, z], qY(yaw), [w, 0.02, l], rgba(0, Math.round(255 * a)), undefined, BLOB);
+    };
+    for (let k = 0; k < this.cars.length; k++) {
+      const c = this.cars[k];
+      const dim = CAR_KINDS[c.kind];
+      const tr = trailAt(c.h, this.renderTick);
+      blob(lerp(tr.a.x, tr.b.x, tr.f), lerp(tr.a.y, tr.b.y, tr.f), lerp(tr.a.z, tr.b.z, tr.f), tr.b.yaw, dim.hw * 2 + 0.9, dim.hl * 2 + 0.7, 0.62);
+    }
+    for (const k of this.props) {
+      if (k.moving) continue;
+      blob(k.b.x, k.b.y, k.b.z, 0, k.hx * 2 + 0.7, k.hz * 2 + 0.7, 0.5);
+    }
+    for (const h of this.helis) {
+      if (h.b.y - Math.max(0, this.d.core.height(h.b.x, h.b.z)) < 1.2) blob(h.b.x, h.b.y, h.b.z, h.b.yaw, 6.5, 19, 0.5);
+    }
+    for (const q of this.interpAll()) {
+      if (!q.alive || q.mode !== P.MODE_GROUND || q.inWater) continue;
+      blob(q.x, q.y, q.z, 0, 1.25, 1.25, 0.5);
+    }
   }
 
   /** Smoke from a damaged engine, fire and black smoke from a wreck. */

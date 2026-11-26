@@ -231,10 +231,47 @@ fn sway(p: vec3f, m: f32) -> vec3f {
   let rock = smoothstep(0.24, 0.5, slope + (rk - 0.5) * 0.2) * (1.0 - pave);
   albedo = mix(albedo, vec3f(0.26, 0.25, 0.23) * (0.6 + 0.8 * rk), rock * 0.8);
   // paved ground: asphalt / packed dirt with fine grain and cracks
-  let grain = vnoise(p * 14.0);
-  let crack = mix(1.0, smoothstep(0.485, 0.5, abs(fbm2(p * 1.9) - 0.5) * 2.0 + 0.485 - 0.012 * grain), 0.55 * detail);
-  let asphalt = vec3f(0.085, 0.083, 0.08) * (0.8 + 0.4 * grain) * mix(0.55, 1.0, crack) * (0.85 + 0.3 * mvar);
-  albedo = mix(albedo, asphalt, clamp(pave * 1.25, 0.0, 1.0));
+  // paved ground: worn asphalt. Stone aggregate, tar patches, cracks, oil
+  // stains and drifted dust, each at its own scale so nothing repeats.
+  let near = 1.0 - smoothstep(14.0, 55.0, dist);
+  let pv = clamp(pave * 1.25, 0.0, 1.0);
+  let a1 = vnoise(p * 43.0);
+  let a2 = vnoise(p * 97.0 + 7.0);
+  let agg = mix(0.5, a1 * 0.55 + a2 * 0.45, near);
+  let wear = fbm2(p * 0.13 + 11.0);
+  var asphalt = vec3f(0.078, 0.077, 0.075) * (0.74 + 0.52 * agg) * mix(0.8, 1.25, wear);
+  // pale stones showing through the binder
+  let stone = smoothstep(0.7, 0.9, a2) * near;
+  asphalt = mix(asphalt, vec3f(0.2, 0.195, 0.18), stone * 0.4);
+  // squared-off repair patches of fresher, darker tar
+  let cellp = p / 9.0;
+  let cid = floor(cellp);
+  let ch = hash2(cid);
+  let cq = abs(fract(cellp) - (0.3 + 0.4 * vec2f(hash2(cid + 3.1), hash2(cid + 7.7)))) - (0.1 + 0.16 * vec2f(hash2(cid + 1.7), hash2(cid + 5.3)));
+  let patchEdge = max(cq.x, cq.y) * 9.0;
+  let tar = step(0.7, ch) * (1.0 - smoothstep(-0.03, 0.03, patchEdge + (a1 - 0.5) * 0.05));
+  let seam = step(0.7, ch) * (1.0 - smoothstep(0.0, 0.05, abs(patchEdge))) * near;
+  asphalt = mix(asphalt, vec3f(0.047, 0.047, 0.048) * (0.8 + 0.4 * agg), tar * 0.8);
+  // long cracks, and crazed areas where the surface is breaking up
+  let warp = vec2f(fbm2(p * 0.7 + 3.0), fbm2(p * 0.7 + 51.0)) * 1.6;
+  let c1 = abs(vnoise(p * 0.33 + warp) - 0.5);
+  let w1 = max(0.0022, fwidth(c1) * 1.2);
+  let long_ = (1.0 - smoothstep(w1, w1 * 2.2, c1 + (a1 - 0.5) * 0.002)) * min(1.0, 0.006 / w1) * smoothstep(0.35, 0.55, vnoise(p * 0.045 + 9.0));
+  let c2 = abs(fbm2(p * 3.7 + 17.0) - 0.5);
+  let w2 = max(0.007, fwidth(c2) * 1.2);
+  let crazed = (1.0 - smoothstep(w2, w2 * 2.2, c2)) * min(1.0, 0.014 / w2) * smoothstep(0.56, 0.7, fbm2(p * 0.06 + 23.0));
+  let crack = clamp(max(max(long_, crazed * 0.65), seam * 0.6), 0.0, 1.0) * (1.0 - tar * 0.7);
+  asphalt = mix(asphalt, vec3f(0.018, 0.018, 0.017), crack * 0.9);
+  // oil and tyre-polished stains: darker and smoother
+  let oil = smoothstep(0.66, 0.8, fbm2(p * 0.45 + 40.0)) * smoothstep(0.42, 0.6, vnoise(p * 0.09 + 5.0));
+  asphalt = mix(asphalt, asphalt * 0.5, oil * 0.75);
+  // dust and sand: blown into drifts, and thick where the paving runs out
+  let edge = smoothstep(0.95, 0.35, pv);
+  let dust = clamp(smoothstep(0.56, 0.8, fbm2(p * 0.21 + 70.0)) * 0.6 + edge * (0.45 + 0.55 * vnoise(p * 1.7)) + crack * 0.12, 0.0, 1.0);
+  let pebble = smoothstep(0.62, 0.8, vnoise(p * 23.0 + 3.0)) * near;
+  let grit = vec3f(0.27, 0.235, 0.175) * (0.7 + 0.5 * agg) * mix(1.0, 0.62, pebble * edge);
+  asphalt = mix(asphalt, grit, dust * 0.62);
+  albedo = mix(albedo, asphalt, pv);
   // wet sand line + underwater darkening
   let wet = 1.0 - smoothstep(wl - 2.5, wl + 0.6, i.wp.y);
   albedo *= mix(1.0, 0.5, wet);
@@ -243,13 +280,27 @@ fn sway(p: vec3f, m: f32) -> vec3f {
   let h0 = fine + rk * rock * 2.0;
   let hx = (vnoise((p + vec2f(e, 0.0)) * 3.1) * 0.6 + vnoise((p + vec2f(e, 0.0)) * 9.7 + 31.0) * 0.4) + fbm2((p + vec2f(e, 0.0)) * 0.35 + i.wp.y * 0.2) * rock * 2.0;
   let hz = (vnoise((p + vec2f(0.0, e)) * 3.1) * 0.6 + vnoise((p + vec2f(0.0, e)) * 9.7 + 31.0) * 0.4) + fbm2((p + vec2f(0.0, e)) * 0.35 + i.wp.y * 0.2) * rock * 2.0;
-  n = bump(n, vec3f((hx - h0) / e, 0.0, (hz - h0) / e), 0.09 * detail * (1.0 - 0.6 * pave));
+  n = bump(n, vec3f((hx - h0) / e, 0.0, (hz - h0) / e), 0.09 * detail * (1.0 - 0.9 * pv));
+  // the paving's own relief: stones stand proud, cracks and seams cut in
+  {
+    let ph = (agg * 0.5 + stone * 0.35 + pebble * dust * 0.5 - crack * 1.6 - tar * 0.1) * 0.012;
+    let dpx = dpdx(i.wp);
+    let dpy = dpdy(i.wp);
+    let dhx = dpdx(ph);
+    let dhy = dpdy(ph);
+    let r1 = cross(dpy, n);
+    let r2 = cross(n, dpx);
+    let det = dot(dpx, r1);
+    let grad = (r1 * dhx + r2 * dhy) / select(det, 1.0, abs(det) < 1e-9);
+    n = normalize(n - clamp(grad, vec3f(-1.5), vec3f(1.5)) * pv * near * step(1e-9, abs(det)));
+  }
   var s: Surface;
   s.albedo = albedo;
   s.n = n;
-  s.rough = mix(mix(0.92, 0.8, rock), 0.72, pave) - wet * 0.45;
+  let paveRough = mix(mix(0.86 - 0.14 * stone, 0.62, tar * 0.6), 0.4, oil * 0.8) + dust * 0.1;
+  s.rough = mix(mix(0.92, 0.8, rock), paveRough, pv) - wet * 0.45;
   s.metal = 0.0;
-  s.ao = 0.75 + 0.25 * fine;
+  s.ao = mix(0.75 + 0.25 * fine, 1.0 - 0.55 * crack, pv);
   s.trans = 0.0;
   var c = shade(s, i.wp);
   c = applyFog(c, i.wp);
@@ -443,6 +494,7 @@ struct VOut {
   @location(2) col: vec4f,
   @location(3) mat: vec2f,
   @location(4) lp: vec3f,
+  @location(5) bp: vec3f,
 };
 @vertex fn vs(v: BIn) -> VOut {
   var o: VOut;
@@ -453,6 +505,7 @@ struct VOut {
   o.col = v.icol;
   o.mat = v.imat.xy;
   o.lp = v.pos * v.iscale;
+  o.bp = v.pos;
   return o;
 }
 @fragment fn fs(i: VOut) -> @location(0) vec4f {
@@ -497,6 +550,13 @@ struct VOut {
   return vec4f(c, a);
 }
 @fragment fn fs_smoke(i: VOut) -> @location(0) vec4f {
+  if (i.mat.x < 0.004 && i.mat.y > 0.99) {
+    // contact shade: a soft dark pool under something standing on the ground
+    let q = abs(i.bp.xz) * 2.0;
+    let k = mix(length(q), max(q.x, q.y), 0.45);
+    let f = 1.0 - smoothstep(0.3, 1.0, k);
+    return vec4f(applyFog(vec3f(0.0), i.wp) * 0.0, i.col.a * f * f * (1.0 - smoothstep(70.0, 110.0, distance(i.wp, F.camPos.xyz))));
+  }
   let albedo = pow(i.col.rgb, vec3f(2.2));
   var c = albedo * (0.55 + 0.45 * max(dot(normalize(i.n), F.sunDir.xyz), 0.0)) * F.sunColor.rgb;
   c = applyFog(c, i.wp);

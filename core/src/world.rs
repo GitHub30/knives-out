@@ -1741,6 +1741,45 @@ impl World {
                 m[j * n + i] = (g * 255.0) as u8;
             }
         }
+        // weeds on the paving: scattered patches where it is breaking up, and
+        // along the foot of walls
+        let wh = |i: usize, j: usize, k: u32| -> f32 {
+            let mut h = (i as u32).wrapping_mul(0x9E37_79B1) ^ (j as u32).wrapping_mul(0x85EB_CA6B) ^ k.wrapping_mul(0xC2B2_AE35);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x2C1B_3C6D);
+            h ^= h >> 12;
+            (h & 0xFFFF) as f32 / 65535.0
+        };
+        for t in &self.towns {
+            let (i0, i1) = (((t.x - t.r).max(0.0)) as usize, ((t.x + t.r).min(MAP - 1.0)) as usize);
+            let (j0, j1) = (((t.z - t.r).max(0.0)) as usize, ((t.z + t.r).min(MAP - 1.0)) as usize);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    if dist_xz(i as f32 + 0.5, j as f32 + 0.5, t.x, t.z) > t.r - 2.0 || self.road_dist(i as f32 + 0.5, j as f32 + 0.5) < 3.2 {
+                        continue;
+                    }
+                    // patches a few metres across (a coarse cell picks, a fine one thins)
+                    if wh(i / 5, j / 5, 1) > 0.88 && wh(i, j, 2) > 0.45 {
+                        m[j * n + i] = m[j * n + i].max(26 + (wh(i, j, 3) * 34.0) as u8);
+                    }
+                }
+            }
+        }
+        for b in &self.boxes {
+            let wall = matches!(b.kind, BK_WALL | BK_BRICK | BK_STUCCO | BK_CONCRETE);
+            if !wall || b.min.y > self.height((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5) + 1.0 {
+                continue;
+            }
+            let (i0, i1) = (((b.min.x - 1.5).max(0.0)) as usize, ((b.max.x + 1.5).min(MAP - 1.0)) as usize);
+            let (j0, j1) = (((b.min.z - 1.5).max(0.0)) as usize, ((b.max.z + 1.5).min(MAP - 1.0)) as usize);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    if wh(i, j, 4) > 0.6 && self.road_dist(i as f32 + 0.5, j as f32 + 0.5) > 3.2 {
+                        m[j * n + i] = m[j * n + i].max(36 + (wh(i, j, 5) * 50.0) as u8);
+                    }
+                }
+            }
+        }
         for b in &self.boxes {
             if b.min.y > self.height((b.min.x + b.max.x) * 0.5, (b.min.z + b.max.z) * 0.5) + 2.5 {
                 continue; // well above the ground (an upper floor, a roof)
