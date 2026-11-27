@@ -31,6 +31,7 @@ const DEFAULTS: Settings = {
   volume: 0.7,
   quality: 'auto',
   autoFire: true,
+  aimAssist: true,
   showFps: false,
   invertY: false,
   adsToggle: false,
@@ -364,7 +365,7 @@ function bindSettings() {
   bindRange('s-touch', 'touchSens', (v) => v.toFixed(2));
   bindRange('s-vol', 'volume', (v) => `${Math.round(v * 100)}%`);
   bindRange('s-bots', 'bots', (v) => `${v + 1} 人`);
-  const bindCheck = (id: string, key: 'autoFire' | 'showFps' | 'invertY' | 'adsToggle') => {
+  const bindCheck = (id: string, key: 'autoFire' | 'aimAssist' | 'showFps' | 'invertY' | 'adsToggle') => {
     const el = $(id) as HTMLInputElement;
     el.checked = settings[key];
     el.addEventListener('change', () => {
@@ -374,6 +375,7 @@ function bindSettings() {
     });
   };
   bindCheck('s-autofire', 'autoFire');
+  bindCheck('s-aimassist', 'aimAssist');
   bindCheck('s-fps', 'showFps');
   bindCheck('s-invert', 'invertY');
   bindCheck('s-adstoggle', 'adsToggle');

@@ -24,6 +24,8 @@ export interface Settings {
   volume: number;
   quality: 'auto' | 'low' | 'medium' | 'high';
   autoFire: boolean;
+  /** The aim is slowed over an enemy in view and drawn towards them. */
+  aimAssist: boolean;
   showFps: boolean;
   invertY: boolean;
   adsToggle: boolean;
@@ -1333,6 +1335,40 @@ export class Game {
     }
   }
 
+  /**
+   * The enemy the aim is closest to, if one is in plain view inside a small
+   * cone around the crosshair: how far to turn to be on them, and how strongly
+   * to help (1 on target, fading to 0 at the edge of the cone).
+   */
+  private aimAssistTarget(weapon: number, zoom: number): { dyaw: number; dpitch: number; w: number } | null {
+    const def = this.d.core.wdefs[weapon];
+    const o = this.camEye;
+    const range = Math.min(def.range, 120);
+    let best: { dyaw: number; dpitch: number; w: number } | null = null;
+    let bestAng = 1e9;
+    for (const p of this.interpAll()) {
+      if (!p.alive || p.id === this.myId || p.mode === P.MODE_PLANE || p.mode === P.MODE_FLY || p.mode === P.MODE_DRIVE) continue;
+      const c: V3 = [p.x, p.y + (p.crouch ? 0.8 : 1.15), p.z];
+      const to = sub(c, o);
+      const dist = Math.hypot(to[0], to[1], to[2]);
+      if (dist < 1.5 || dist > range) continue;
+      const dyaw = wrapAngle(Math.atan2(to[0], to[2]) - this.yaw);
+      const dpitch = Math.atan2(to[1], Math.hypot(to[0], to[2])) - this.pitch;
+      const ang = Math.hypot(dyaw * Math.cos(this.pitch), dpitch);
+      // a few degrees, a little wider up close, narrower through a scope
+      const cone = (0.085 + 0.9 / dist) / Math.sqrt(zoom);
+      if (ang > cone || ang >= bestAng) continue;
+      // only somebody actually in sight (nearby players are known through walls)
+      const dir: V3 = [to[0] / dist, to[1] / dist, to[2] / dist];
+      const hit = this.d.core.ray(o, dir, dist);
+      if (hit >= 0 && hit < dist - 0.6) continue;
+      bestAng = ang;
+      const t = ang / cone;
+      best = { dyaw, dpitch, w: 1 - t * t };
+    }
+    return best;
+  }
+
   private autoFireTarget(weapon: number): boolean {
     const def = this.d.core.wdefs[weapon];
     const o = this.camEye;
@@ -1680,7 +1716,18 @@ export class Game {
       const me = s.self;
       const weapon = this.displayCur < 2 ? me.slots[this.displayCur].kind : 0;
       const zoom = inp.ads && weapon > 0 ? this.d.core.wdefs[weapon].zoom : 1;
-      const sens = (this.d.settings.sens * 0.0022 * (zoom > 1 ? this.d.settings.adsSens : 1)) / zoom;
+      let sens = (this.d.settings.sens * 0.0022 * (zoom > 1 ? this.d.settings.adsSens : 1)) / zoom;
+      // aim assist: slower over an enemy in view, and drawn towards them
+      const aid = this.d.settings.aimAssist && me.alive && this.pred?.mode === P.MODE_GROUND && weapon > 0 ? this.aimAssistTarget(weapon, zoom) : null;
+      if (aid) {
+        sens *= 1 - 0.45 * aid.w;
+        const touch = matchMedia('(pointer: coarse)').matches;
+        // stronger while shooting or aiming down the sights, and on a touch screen
+        const rate = (inp.fire || inp.ads || this.fireCd > 0 ? 7 : 2.5) * (touch ? 1 : 0.45);
+        const k = (1 - Math.exp(-dt * rate)) * aid.w;
+        this.yaw = wrapAngle(this.yaw + aid.dyaw * k);
+        this.pitch = clamp(this.pitch + aid.dpitch * k, -1.45, 1.45);
+      }
       this.yaw = wrapAngle(this.yaw - lx * sens);
       this.pitch = clamp(this.pitch - ly * sens * (this.d.settings.invertY ? -1 : 1), -1.45, 1.45);
       if (lx !== 0 || ly !== 0) this.lastLookAt = this.time;
